@@ -1,0 +1,1592 @@
+{
+  "analytics": {
+    "analyticsPage": {
+      "actions": {
+        "refresh": "Làm mới",
+        "retry": "Thử lại"
+      },
+      "alertSeverity": {
+        "acknowledged": "Đã xác nhận",
+        "critical": "Nghiêm trọng",
+        "high": "Cao",
+        "low": "Thấp",
+        "medium": "Trung bình"
+      },
+      "customRangeIncomplete": "Chọn ngày bắt đầu và kết thúc, bắt đầu trước và cách nhau tối đa 366 ngày, để áp dụng khoảng tùy chỉnh.",
+      "dashboardOptions": {
+        "capacity": "Hoạch định năng lực",
+        "operations": "Tổng quan vận hành",
+        "sla": "Tuân thủ SLA"
+      },
+      "dateRangeSelectLabel": "Khoảng thời gian",
+      "dateRanges": {
+        "customRange": "Tùy chỉnh",
+        "last24Hours": "24 giờ qua",
+        "last30Days": "30 ngày qua",
+        "last7Days": "7 ngày qua"
+      },
+      "errors": {
+        "failedToLoadAnalytics": "Không thể tải dữ liệu phân tích",
+        "unableToLoad": "Không thể tải: {{sources}}"
+      },
+      "lastUpdated": "Đã cập nhật {{time}}",
+      "subtitle": "Thông tin chi tiết về hệ thống và dịch vụ của bạn",
+      "title": "Phân tích",
+      "trend": {
+        "operationalHealth": "Trạng thái vận hành",
+        "weekOf": "Tuần {{date}}"
+      },
+      "widgets": {
+        "alertTable": {
+          "count": "Số lượng",
+          "severity": "Mức độ nghiêm trọng",
+          "title": "Thống kê cảnh báo"
+        },
+        "capacity": {
+          "title": "Dự báo dung lượng ổ đĩa"
+        },
+        "complianceGauge": {
+          "policiesEvaluated": "{{count}} chính sách đã đánh giá",
+          "title": "Tuân thủ chính sách"
+        },
+        "osBreakdown": {
+          "subtitle": "Tỷ lệ thiết bị quản lý",
+          "title": "Phân bố hệ điều hành"
+        },
+        "performance": {
+          "cpu": "CPU",
+          "memory": "Bộ nhớ",
+          "subtitle": "Mức sử dụng CPU và bộ nhớ",
+          "title": "Xu hướng hiệu suất"
+        },
+        "remoteSessions": {
+          "label": "Phiên trong khoảng thời gian",
+          "title": "Phiên từ xa"
+        },
+        "uptime": {
+          "label": "Đang trực tuyến",
+          "title": "Thời gian hoạt động"
+        }
+      }
+    },
+    "capacityForecast": {
+      "actual": "Thực tế",
+      "critical": "Nghiêm trọng",
+      "criticalValue": "Nghiêm trọng {{value}}{{unit}}",
+      "current": "Hiện tại",
+      "description": "Dự báo năng lực dựa trên mức sử dụng gần đây",
+      "trend": "Xu hướng",
+      "warnValue": "Cảnh báo {{value}}{{unit}}",
+      "warning": "Cảnh báo"
+    },
+    "chartWidget": {
+      "noData": "Không có dữ liệu"
+    },
+    "dashboardGrid": {
+      "drag": "Kéo",
+      "errors": {
+        "failedToLoadDashboard": "Không thể tải bảng điều khiển"
+      },
+      "retry": "Thử lại"
+    },
+    "executiveSummary": {
+      "alertSummary": "Tóm tắt cảnh báo",
+      "critical": "Nghiêm trọng",
+      "criticalAndWarningAlerts": "Cảnh báo nghiêm trọng và cảnh báo",
+      "deviceOverview": "Tổng quan thiết bị",
+      "fleetAvailabilitySummary": "Tóm tắt khả năng sẵn sàng của hệ thống",
+      "last12Weeks": "12 tuần qua",
+      "offline": "Ngoại tuyến",
+      "online": "Trực tuyến",
+      "operationalHealth": "Trạng thái vận hành",
+      "totalDevices": "Tổng số thiết bị",
+      "uptime": "Thời gian hoạt động",
+      "warnings": "Cảnh báo",
+      "weeklyTrend": "Xu hướng hàng tuần"
+    },
+    "gaugeWidget": {
+      "criticalValue": "Nghiêm trọng {{value}}",
+      "noData": "Không có kiểm tra tuân thủ để đánh giá",
+      "warnValue": "Cảnh báo {{value}}"
+    },
+    "queryBuilder": {
+      "aggregations": {
+        "average": "Trung bình",
+        "maximum": "Tối đa",
+        "minimum": "Tối thiểu",
+        "p95": "P95",
+        "sum": "Tổng"
+      },
+      "coverageNote": "Truy vấn chỉ bao gồm {{count}} thiết bị trực tuyến đầu tiên. Các thiết bị ngoại tuyến và phần còn lại của hệ thống lớn hơn không được bao gồm.",
+      "description": "Chọn một chỉ số và phép tổng hợp để truy vấn trên các thiết bị trực tuyến của bạn",
+      "errors": {
+        "failedToExecuteQuery": "Không thể thực thi truy vấn",
+        "noDevicesSelected": "Chưa chọn thiết bị nào cho truy vấn"
+      },
+      "labels": {
+        "aggregation": "Phép tổng hợp",
+        "endDate": "Ngày kết thúc",
+        "metricName": "Tên chỉ số",
+        "metricType": "Loại chỉ số",
+        "startDate": "Ngày bắt đầu",
+        "timeRange": "Khoảng thời gian"
+      },
+      "metricNames": {
+        "cpuUtilization": "Mức sử dụng CPU",
+        "diskUsage": "Mức sử dụng ổ đĩa",
+        "memoryUtilization": "Mức sử dụng bộ nhớ",
+        "networkThroughput": "Lưu lượng mạng"
+      },
+      "metricTypes": {
+        "performance": "Hiệu suất"
+      },
+      "runQuery": "Chạy truy vấn",
+      "running": "Đang chạy...",
+      "timeRanges": {
+        "customRange": "Tùy chỉnh",
+        "last1Hour": "1 giờ qua",
+        "last24Hours": "24 giờ qua",
+        "last30Days": "30 ngày qua",
+        "last7Days": "7 ngày qua"
+      },
+      "title": "Trình tạo truy vấn"
+    },
+    "slaComplianceCard": {
+      "defaultPeriodLabel": "30 ngày qua",
+      "downtime": "Thời gian ngừng hoạt động {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Đã loại trừ thời gian bảo trì",
+        "maintenanceSkipped": "Chưa loại trừ thời gian bảo trì: quá nhiều thiết bị cần kiểm tra",
+        "maintenanceUnavailable": "Chưa loại trừ thời gian bảo trì: trạng thái không khả dụng",
+        "none": "Không có ngoại lệ",
+        "title": "Ngoại lệ",
+        "weekends": "Đã loại trừ cuối tuần"
+      },
+      "incidents": "{{count}} sự cố",
+      "noDevices": "Chưa đo đạc thiết bị nào",
+      "status": {
+        "atRisk": "Có nguy cơ",
+        "breach": "Vi phạm",
+        "compliant": "Tuân thủ"
+      },
+      "targetUptime": "Mục tiêu hoạt động {{target}}%",
+      "title": "Tuân thủ SLA"
+    },
+    "slaEmptyState": {
+      "create": "Tạo định nghĩa SLA",
+      "created": "Đã tạo định nghĩa SLA",
+      "description": "Định nghĩa SLA thiết lập mục tiêu thời gian hoạt động mà tab này dùng để đo lường các thiết bị của bạn. Hãy tạo một định nghĩa để bắt đầu theo dõi độ tuân thủ.",
+      "errors": {
+        "create": "Không thể tạo định nghĩa SLA"
+      },
+      "form": {
+        "cancel": "Hủy",
+        "excludeMaintenance": "Loại trừ thiết bị trong thời gian bảo trì",
+        "excludeWeekends": "Loại trừ cuối tuần",
+        "measurementWindow": "Thời gian đo đạc",
+        "name": "Tên",
+        "organization": "Tổ chức",
+        "scopeNote": "Đo lường mọi thiết bị trong tổ chức.",
+        "selectOrganization": "Chọn một tổ chức",
+        "submit": "Tạo",
+        "uptimeTarget": "Mục tiêu hoạt động (%)",
+        "uptimeTargetInvalid": "Nhập giá trị từ 0 đến 100.",
+        "windows": {
+          "daily": "Hàng ngày",
+          "monthly": "Hàng tháng",
+          "weekly": "Hàng tuần"
+        }
+      },
+      "noPermission": "Yêu cầu quản trị viên có quyền quản lý tổ chức tạo định nghĩa SLA.",
+      "title": "Chưa có định nghĩa SLA nào"
+    },
+    "tableWidget": {
+      "filterPlaceholder": "Lọc",
+      "noMatchingRecords": "Không có bản ghi phù hợp"
+    },
+    "widgetRenderer": {
+      "unsupportedWidget": "Tiện ích không được hỗ trợ"
+    }
+  },
+  "reports": {
+    "dashboardWidgets": {
+      "accessDenied": "Bạn không có quyền xem dữ liệu tổng quan này.",
+      "activeAlerts": "Cảnh báo đang hoạt động",
+      "averages": "Trung bình",
+      "complianceScore": "Điểm tuân thủ",
+      "cpu": "CPU",
+      "criticalCount": "{{count}} nghiêm trọng",
+      "disk": "Ổ đĩa",
+      "errors": {
+        "loadDashboardData": "Không thể tải dữ liệu tổng quan"
+      },
+      "issueCount": "{{count}} vấn đề",
+      "issueCount_one": "{{count}} vấn đề",
+      "issueCount_other": "{{count}} vấn đề",
+      "lastUpdated": "Cập nhật lần cuối: {{time}}",
+      "memory": "Bộ nhớ",
+      "onlinePercent": "{{percent}} trực tuyến",
+      "refresh": "Làm mới",
+      "retry": "Thử lại",
+      "topCpuUsage": "CPU sử dụng cao nhất",
+      "topDiskUsage": "Ổ đĩa sử dụng cao nhất",
+      "topMemoryUsage": "Bộ nhớ sử dụng cao nhất",
+      "totalDevices": "Tổng số thiết bị"
+    },
+    "postureOptions": {
+      "requireBackupCoverage": "Yêu cầu phạm vi sao lưu",
+      "requireBackupCoverageHelp": "Khi không bắt buộc, bản sao lưu vẫn hiển thị dưới dạng bằng chứng trung lập và không tạo ra đề xuất.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "lifecycleOptions": {
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo",
+      "includeManualAssets": "Bao gồm tài sản nhập thủ công",
+      "includeManualAssetsHelp": "Tài sản thủ công có ngày mua hoặc bảo hành xuất hiện cùng với thiết bị có agent.",
+      "includeOtherEquipment": "Liệt kê thiết bị khác",
+      "includeOtherEquipmentHelp": "Máy in, phần cứng mạng và IoT được liệt kê không có mốc thời gian thay thế.",
+      "replaceAgeYears": "Lên kế hoạch thay thế sau (năm)",
+      "replaceAgeYearsHelp": "Máy tính đến hạn thay thế sau số năm này kể từ khi mua, hoặc khi hết hạn bảo hành nếu vẫn được bảo hành và thời gian đó dài hơn.",
+      "serverReplaceAgeYears": "Lên kế hoạch thay thế máy chủ sau (năm)",
+      "serverReplaceAgeYearsHelp": "Máy chủ tuân theo mốc thời gian riêng và được liệt kê trong một phần riêng của báo cáo."
+    },
+    "backupStatusOptions": {
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo",
+      "includeDevicesWithoutBackup": "Bao gồm thiết bị không có bản sao lưu",
+      "includeDevicesWithoutBackupHelp": "Tắt, báo cáo chỉ liệt kê các thiết bị có một số bằng chứng sao lưu, như email tóm tắt của nhà cung cấp.",
+      "sources": "Nguồn sao lưu",
+      "sourcesHelp": "Chọn nguồn sao lưu nào để đưa vào báo cáo.",
+      "sourceBreeze": "Sao lưu Breeze",
+      "sourceProvider": "Nhà cung cấp sao lưu đã kết nối"
+    },
+    "vulnerabilityManagementOptions": {
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo",
+      "includeAccepted": "Bao gồm rủi ro đã chấp nhận và ngoại lệ",
+      "includeAcceptedHelp": "Liệt kê các phát hiện đã chấp nhận và giảm thiểu, gắn cờ những phát hiện sắp hết hạn chấp nhận trong kỳ tới.",
+      "severity": {
+        "critical": "Nghiêm trọng",
+        "high": "Cao",
+        "low": "Thấp",
+        "medium": "Trung bình"
+      },
+      "severityFloor": "Mức độ nghiêm trọng tối thiểu để liệt kê",
+      "severityFloorHelp": "Các phát hiện dưới mức nghiêm trọng này bị loại khỏi bảng. Không bao giờ ẩn phát hiện bị khai thác tích cực (KEV) hoặc EPSS cao — những phát hiện đó luôn được tính và liệt kê.",
+      "topN": "Độ dài danh sách khắc phục",
+      "topNHelp": "Bảng ưu tiên khắc phục chứa bao nhiêu phát hiện có thể vá. Báo cáo nêu rõ số lượng đã giữ lại thay vì cắt bớt âm thầm."
+    },
+    "reportBuilderPage": {
+      "configurationTitle": "Cấu hình báo cáo",
+      "description": "Tạo báo cáo dùng một lần mà không lưu lại.",
+      "errors": {
+        "exportFailed": "Xuất thất bại. Vui lòng thử lại.",
+        "generatePreview": "Không thể tạo bản xem trước",
+        "generateReportPreview": "Không thể tạo bản xem trước báo cáo"
+      },
+      "title": "Trình tạo báo cáo tùy chỉnh"
+    },
+    "reportEditPage": {
+      "backToReports": "Quay lại Báo cáo",
+      "backupPreview": {
+        "title": "Xem trước",
+        "description": "Tạo snapshot sao lưu hiện tại với các tùy chọn trên. Chỉ chạy khi bạn yêu cầu.",
+        "run": "Tạo bản xem trước",
+        "error": "Không thể tạo bản xem trước."
+      },
+      "description": "Cập nhật cấu hình cho \"{{name}}\".",
+      "errors": {
+        "fetchReport": "Không thể lấy báo cáo",
+        "generic": "Đã xảy ra lỗi"
+      },
+      "loading": "Đang tải báo cáo...",
+      "notFound": "Không tìm thấy báo cáo",
+      "reportsBreadcrumb": "Báo cáo",
+      "title": "Sửa báo cáo"
+    },
+    "reportPreview": {
+      "charts": {
+        "alertsBySeverity": "Cảnh báo theo mức độ",
+        "avgCpu": "CPU TB",
+        "avgDisk": "Ổ đĩa TB",
+        "avgMemory": "Bộ nhớ TB",
+        "complianceIssues": "Vấn đề tuân thủ",
+        "complianceScore": "Điểm tuân thủ",
+        "offline": "Ngoại tuyến",
+        "online": "Trực tuyến",
+        "topAlertingRules": "Quy tắc cảnh báo hàng đầu",
+        "topCpuConsumers": "Tiêu thụ CPU cao nhất",
+        "totalDevices": "Tổng số thiết bị"
+      },
+      "emptyDescription": "Cấu hình cài đặt báo cáo và nhấp Xem trước để xem dữ liệu.",
+      "emptyTitle": "Không có bản xem trước",
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "generated": "Đã tạo {{date}}",
+      "generatedWithRecords": "Đã tạo {{date}} - {{count}} bản ghi",
+      "generating": "Đang tạo bản xem trước báo cáo...",
+      "noDataMatches": "Không có dữ liệu khớp với bộ lọc hiện tại.",
+      "pagination": {
+        "page": "Trang {{current}} / {{total}}",
+        "showing": "Đang hiển thị {{start}} đến {{end}} của {{total}} bản ghi"
+      },
+      "refresh": "Làm mới",
+      "lifecycle": {
+        "dueSoon": "Sắp đến hạn",
+        "onTrack": "Đúng tiến độ",
+        "otherEquipment": "Thiết bị khác",
+        "recommendations": "Khuyến nghị của chúng tôi",
+        "replaceNow": "Thay thế ngay",
+        "unknownAge": "Không rõ ngày mua"
+      },
+      "backupStatus": {
+        "healthy": "Khỏe mạnh",
+        "warning": "Cảnh báo",
+        "critical": "Nghiêm trọng",
+        "unknown": "Không rõ",
+        "truncated": "Danh sách thiết bị đã đạt giới hạn hàng và không đầy đủ."
+      },
+      "vulnerabilityManagement": {
+        "critical": "Mở cảnh báo nghiêm trọng",
+        "expiringExceptions": "Ngoại lệ hết hạn kỳ tới",
+        "high": "Mở nghiêm trọng",
+        "highEpss": "Có khả năng bị khai thác",
+        "knownExploited": "Đang bị khai thác (KEV)",
+        "notMeasured": "N/A"
+      },
+      "reportTypes": {
+        "ai_fleet_design": "Thiết kế đội thiết bị",
+        "ai_org_narrative": "Tường thuật vận hành AI hàng tuần",
+        "alert_summary": "Tóm tắt cảnh báo",
+        "compliance": "Báo cáo tuân thủ",
+        "device_inventory": "Danh sách thiết bị",
+        "executive_summary": "Tóm tắt điều hành",
+        "hardware_lifecycle": "Vòng đời phần cứng",
+        "vulnerability_management": "Quản lý lỗ hổng bảo mật",
+        "identity_access_review": "Đánh giá danh tính & quyền truy cập",
+        "performance": "Báo cáo hiệu suất",
+        "security_compliance_posture": "Trạng thái bảo mật & tuân thủ",
+        "software_inventory": "Danh sách phần mềm",
+        "threat_detection_review": "Đánh giá phát hiện mối đe dọa",
+        "endpoint_management_review": "Đánh giá quản lý điểm cuối",
+        "ticket_sla_attainment": "Đạt SLA phiếu hỗ trợ",
+        "technician_time_billability": "Thời gian kỹ thuật viên & tính phí",
+        "ar_aging": "Tuổi nợ phải thu",
+        "ai_usage_by_client": "Mức sử dụng AI theo khách hàng",
+        "mrr_renewals": "MRR & gia hạn",
+        "quote_win_rate": "Tỷ lệ chốt báo giá",
+        "client_profitability": "Lợi nhuận khách hàng",
+        "backup_status": "Trạng thái sao lưu"
+      },
+      "threatDetection": {
+        "agents": "Điểm cuối có tác nhân phát hiện",
+        "breezeDevices": "Thiết bị do Breeze quản lý",
+        "carriedIn": "Mang sang, vẫn mở",
+        "coverage": "Giới hạn của báo cáo này",
+        "devicesWithoutAgent": "Thiết bị quản lý không có tác nhân",
+        "notMeasured": "N/A",
+        "opened": "Phát hiện được nêu",
+        "resolved": "Phát hiện đã giải quyết"
+      },
+      "tryAgain": "Thử lại",
+      "values": {
+        "no": "Không",
+        "yes": "Có"
+      },
+      "viewModes": {
+        "chart": "Biểu đồ",
+        "table": "Bảng"
+      },
+      "endpointManagement": {
+        "breezeWithoutIntune": "Thiết bị Breeze chưa đăng ký",
+        "dataGaps": "Những gì chúng tôi không thể đo lường",
+        "intuneDevices": "Đã đăng ký trong Intune",
+        "intuneWithoutBreezeLink": "Bản ghi Intune chưa liên kết",
+        "noncompliant": "Không tuân thủ",
+        "notMeasured": "N/A",
+        "staleEnrolments": "Đăng ký cũ"
+      },
+      "identityAccess": {
+        "notMeasured": "N/A",
+        "coverage": "Giới hạn của báo cáo này",
+        "signins": "Đăng nhập tương tác",
+        "distinctUsers": "Tài khoản đang đăng nhập",
+        "failures": "Đăng nhập thất bại",
+        "admins": "Tài khoản có vai trò quản trị",
+        "adminsWithoutMfa": "Quản trị viên không có MFA",
+        "mfaUnknown": "Trạng thái MFA không xác định",
+        "dormant": "Tài khoản không hoạt động"
+      }
+    },
+    "reportsList": {
+      "actions": {
+        "delete": "Xóa",
+        "edit": "Sửa",
+        "generateNow": "Tạo ngay"
+      },
+      "adhocReport": "Báo cáo đặc biệt",
+      "aiNarrative": {
+        "managedBySchedule": "Quản lý theo lịch AI",
+        "openLatest": "Mở bản mới nhất"
+      },
+      "confirmDelete": "Bạn có chắc chắn muốn xóa \"{{name}}\"?",
+      "createReport": "Tạo báo cáo",
+      "description": "Tạo và lên lịch báo cáo cho hạ tầng của bạn.",
+      "download": "Tải xuống",
+      "emailRecipients": "Người nhận email",
+      "emptyReportsDescription": "Tạo báo cáo đầu tiên của bạn để bắt đầu.",
+      "emptyReportsTitle": "Chưa có báo cáo nào",
+      "emptyRunsDescription": "Tạo báo cáo để xem ở đây.",
+      "emptyRunsTitle": "Chưa có lần chạy gần đây",
+      "errors": {
+        "deleteReport": "Không thể xóa báo cáo",
+        "downloadFailed": "Tải xuống thất bại",
+        "fetchReports": "Không thể tải báo cáo",
+        "generateReport": "Không thể tạo báo cáo",
+        "generic": "Đã xảy ra lỗi",
+        "noCompletedRun": "Chưa có lần chạy hoàn thành để mở"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "loading": "Đang tải báo cáo...",
+      "never": "Không bao giờ",
+      "notGeneratedYet": "Chưa được tạo",
+      "success": {
+        "generated": "Đã tạo báo cáo \"{{name}}\"."
+      },
+      "visibleInPortal": "Hiển thị trong cổng thông tin khách hàng",
+      "newReport": "Báo cáo mới",
+      "nextOccurrence": "Tiếp theo: {{next}}",
+      "reportTypes": {
+        "ai_fleet_design": "Thiết kế đội thiết bị",
+        "ai_org_narrative": "Tường thuật vận hành AI hàng tuần",
+        "alert_summary": "Tóm tắt cảnh báo",
+        "compliance": "Báo cáo tuân thủ",
+        "device_inventory": "Danh sách thiết bị",
+        "executive_summary": "Tóm tắt điều hành",
+        "hardware_lifecycle": "Vòng đời phần cứng",
+        "vulnerability_management": "Quản lý lỗ hổng bảo mật",
+        "identity_access_review": "Đánh giá danh tính & quyền truy cập",
+        "performance": "Báo cáo hiệu suất",
+        "security_compliance_posture": "Trạng thái bảo mật & tuân thủ",
+        "software_inventory": "Danh sách phần mềm",
+        "threat_detection_review": "Đánh giá phát hiện mối đe dọa",
+        "endpoint_management_review": "Đánh giá quản lý điểm cuối",
+        "ticket_sla_attainment": "Đạt SLA phiếu hỗ trợ",
+        "technician_time_billability": "Thời gian kỹ thuật viên & tính phí",
+        "ar_aging": "Tuổi nợ phải thu",
+        "ai_usage_by_client": "Mức sử dụng AI theo khách hàng",
+        "mrr_renewals": "MRR & gia hạn",
+        "quote_win_rate": "Tỷ lệ chốt báo giá",
+        "client_profitability": "Lợi nhuận khách hàng",
+        "backup_status": "Trạng thái sao lưu"
+      },
+      "runsTable": {
+        "actions": "Thao tác",
+        "completed": "Đã hoàn thành",
+        "report": "Báo cáo",
+        "started": "Đã bắt đầu",
+        "status": "Trạng thái",
+        "organization": "Tổ chức"
+      },
+      "schedules": {
+        "daily": "Hàng ngày",
+        "monthly": "Hàng tháng",
+        "one_time": "Một lần",
+        "weekly": "Hàng tuần"
+      },
+      "status": {
+        "completed": "đã hoàn thành",
+        "failed": "thất bại",
+        "pending": "đang chờ",
+        "running": "đang chạy"
+      },
+      "table": {
+        "actions": "Thao tác",
+        "format": "Định dạng",
+        "lastGenerated": "Tạo gần nhất",
+        "name": "Tên",
+        "schedule": "Lịch chạy",
+        "type": "Loại",
+        "covers": "Phạm vi"
+      },
+      "tabs": {
+        "recentRuns": "Lần chạy gần đây",
+        "savedReports": "Báo cáo đã lưu"
+      },
+      "templates": "Mẫu",
+      "title": "Báo cáo",
+      "tryAgain": "Thử lại",
+      "unknownReport": "Báo cáo không xác định",
+      "partnerWideIncomplete": "Không thể tải một số báo cáo bao gồm tất cả tổ chức, danh sách này có thể không đầy đủ. Chuyển sang Tất cả tổ chức để xem mọi báo cáo.",
+      "covers": {
+        "combined": "Tất cả tổ chức · Kết hợp",
+        "unknownOrg": "Tổ chức không xác định",
+        "seriesAll": "Tất cả tổ chức · {{count}} · Một bản mỗi tổ chức",
+        "seriesSelected_one": "{{count}} tổ chức · Một bản mỗi tổ chức",
+        "seriesSelected_other": "{{count}} tổ chức · Một bản mỗi tổ chức"
+      },
+      "delivery": {
+        "noRecipients": "Không có người nhận",
+        "noRecipientsHint": "Lần chạy theo lịch trình trước không có ai để gửi email. Thêm người nhận để gửi báo cáo này.",
+        "partial": "Đã gửi một phần",
+        "failed": "Email chưa được gửi"
+      },
+      "runDelete": {
+        "confirmOne": "Xóa lần chạy này? Kết quả đã lưu của bạn cũng sẽ bị xóa và không thể tải lại.",
+        "confirmMany": "Xóa {{count}} lần chạy? Kết quả đã lưu của chúng cũng sẽ bị xóa và không thể tải lại.",
+        "partialFailure": "Không thể xóa {{count}} lần chạy (vẫn đang chạy, được bảo vệ hoặc không có quyền).",
+        "selected": "Đã chọn {{count}}",
+        "clearSelection": "Xóa chọn",
+        "deleteSelected": "Xóa đã chọn ({{count}})",
+        "selectAll": "Chọn tất cả lần chạy",
+        "selectRun": "Chọn lần chạy của {{name}}",
+        "deleteOne": "Xóa lần chạy"
+      }
+    },
+    "reportBuilder": {
+      "actions": {
+        "cancel": "Hủy",
+        "generateReport": "Tạo báo cáo",
+        "preview": "Xem trước",
+        "saveReport": "Lưu báo cáo",
+        "updateReport": "Cập nhật báo cáo"
+      },
+      "addCondition": "Thêm điều kiện",
+      "addRecipient": "Thêm người nhận",
+      "aggregation": "Phép tổng hợp",
+      "aggregationField": "Trường tổng hợp",
+      "aggregationOptions": {
+        "avg": "Trung bình",
+        "count": "Số lượng",
+        "sum": "Tổng"
+      },
+      "availableFields": "Trường khả dụng",
+      "chart": {
+        "notEnoughData": "Không đủ dữ liệu để vẽ biểu đồ.",
+        "pieChartPreview": "Xem trước biểu đồ tròn"
+      },
+      "chartTypes": {
+        "bar": "Cột",
+        "line": "Đường",
+        "pie": "Tròn",
+        "table": "Bảng"
+      },
+      "dataSource": {
+        "activity": {
+          "includeSystem": {
+            "label": "Bao gồm tài khoản hệ thống"
+          },
+          "region": {
+            "label": "Khu vực",
+            "options": {
+              "all": "Tất cả khu vực",
+              "apac": "APAC",
+              "emea": "EMEA",
+              "na": "Bắc Mỹ"
+            }
+          },
+          "source": {
+            "label": "Nguồn hoạt động",
+            "options": {
+              "admin": "Thao tác của quản trị viên",
+              "api": "Hoạt động API",
+              "auth": "Xác thực",
+              "system": "Sự kiện hệ thống"
+            }
+          },
+          "timeWindow": {
+            "label": "Khoảng thời gian",
+            "options": {
+              "last_24h": "24 giờ qua",
+              "last_30d": "30 ngày qua",
+              "last_7d": "7 ngày qua"
+            }
+          }
+        },
+        "alerts": {
+          "severity": {
+            "label": "Mức độ nghiêm trọng",
+            "options": {
+              "all": "Tất cả mức độ",
+              "critical": "Nghiêm trọng",
+              "high": "Cao",
+              "low": "Thấp",
+              "medium": "Trung bình"
+            }
+          },
+          "source": {
+            "label": "Nguồn cảnh báo",
+            "options": {
+              "all": "Tất cả nguồn",
+              "monitoring": "Giám sát",
+              "operations": "Vận hành",
+              "security": "Bảo mật"
+            }
+          },
+          "status": {
+            "label": "Trạng thái cảnh báo",
+            "options": {
+              "acknowledged": "Đã xác nhận",
+              "all": "Tất cả trạng thái",
+              "open": "Đang mở",
+              "resolved": "Đã giải quyết"
+            }
+          },
+          "timeWindow": {
+            "label": "Khoảng thời gian",
+            "options": {
+              "last_24h": "24 giờ qua",
+              "last_30d": "30 ngày qua",
+              "last_7d": "7 ngày qua"
+            }
+          }
+        },
+        "compliance": {
+          "includeExceptions": {
+            "label": "Bao gồm ngoại lệ"
+          },
+          "policySet": {
+            "label": "Bộ chính sách",
+            "options": {
+              "cis": "CIS Benchmarks",
+              "custom": "Chính sách tùy chỉnh",
+              "hipaa": "HIPAA",
+              "iso27001": "ISO 27001"
+            }
+          },
+          "scope": {
+            "label": "Phạm vi bao phủ",
+            "options": {
+              "all_devices": "Tất cả thiết bị",
+              "by_group": "Theo nhóm thiết bị",
+              "by_site": "Theo chi nhánh"
+            }
+          },
+          "scoring": {
+            "label": "Phương pháp tính điểm",
+            "options": {
+              "pass_fail": "Đạt / Không đạt",
+              "weighted": "Chấm điểm trọng số"
+            }
+          }
+        },
+        "devices": {
+          "includeInactive": {
+            "label": "Bao gồm thiết bị không hoạt động"
+          },
+          "inventorySource": {
+            "label": "Nguồn kiểm kê",
+            "options": {
+              "agent": "Agent báo cáo",
+              "cmdb": "Nhập từ CMDB",
+              "combined": "Kết hợp các nguồn"
+            }
+          },
+          "ownership": {
+            "label": "Quyền sở hữu",
+            "options": {
+              "all": "Tất cả thiết bị",
+              "managed": "Thiết bị được quản lý",
+              "unmanaged": "Thiết bị không được quản lý"
+            }
+          },
+          "platform": {
+            "label": "Nền tảng",
+            "options": {
+              "all": "Tất cả nền tảng",
+              "linux": "Linux",
+              "macos": "macOS",
+              "windows": "Windows"
+            }
+          },
+          "scope": {
+            "label": "Phạm vi thiết bị",
+            "options": {
+              "all_devices": "Tất cả thiết bị",
+              "by_site": "Theo chi nhánh",
+              "by_tag": "Theo thẻ",
+              "by_device": "Chọn thiết bị"
+            }
+          },
+          "layout": {
+            "label": "Bố cục PDF",
+            "options": {
+              "table": "Bảng kiểm kê",
+              "detail": "Chi tiết thiết bị (một trang mỗi thiết bị)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Phần mềm đã cài đặt"
+          }
+        },
+        "patches": {
+          "approval": {
+            "label": "Trạng thái duyệt",
+            "options": {
+              "approved": "Đã duyệt",
+              "deployed": "Đã triển khai",
+              "pending": "Chờ duyệt"
+            }
+          },
+          "catalog": {
+            "label": "Danh mục bản vá",
+            "options": {
+              "firmware": "Firmware và BIOS",
+              "os_updates": "Bản cập nhật HĐH",
+              "third_party": "Ứng dụng bên thứ ba"
+            }
+          },
+          "priority": {
+            "label": "Mức ưu tiên",
+            "options": {
+              "critical": "Nghiêm trọng",
+              "important": "Quan trọng",
+              "routine": "Thông thường"
+            }
+          },
+          "vendor": {
+            "label": "Nhà供应商",
+            "options": {
+              "all": "Tất cả nhà cung cấp",
+              "apple": "Apple",
+              "linux": "Linux",
+              "microsoft": "Microsoft"
+            }
+          }
+        }
+      },
+      "dataSourceSummary": "{{label}}: {{value}}",
+      "dayOfMonth": "Ngày trong tháng",
+      "dayOfWeek": "Ngày trong tuần",
+      "deviceFilterDescription": "Áp dụng báo cáo này cho các thiết bị khớp với bộ lọc bên dưới.",
+      "emailDistributionList": "Danh sách phân phối email",
+      "errors": {
+        "generatePreview": "Không thể tạo bản xem trước",
+        "generic": "Đã xảy ra lỗi",
+        "loadLivePreview": "Không thể tải bản xem trước trực tiếp",
+        "reportNameRequired": "Tên báo cáo là bắt buộc.",
+        "saveReport": "Không thể lưu báo cáo",
+        "selectExportFormat": "Chọn ít nhất một định dạng xuất.",
+        "templateNameRequired": "Tên mẫu là bắt buộc.",
+        "validEmail": "Nhập địa chỉ email hợp lệ."
+      },
+      "exportFormats": {
+        "csv": {
+          "description": "Giá trị phân tách bằng dấu phẩy",
+          "label": "CSV"
+        },
+        "excel": {
+          "description": "Bảng tính",
+          "label": "Excel"
+        },
+        "pdf": {
+          "description": "Tài liệu định dạng",
+          "label": "PDF"
+        }
+      },
+      "exportFormatsTitle": "Định dạng xuất",
+      "fields": {
+        "activity": {
+          "action": "Thao tác",
+          "duration_seconds": "Thời lượng (giây)",
+          "ip_address": "Địa chỉ IP",
+          "location": "Vị trí",
+          "resource": "Tài nguyên",
+          "result": "Kết quả",
+          "target": "Mục tiêu",
+          "timestamp": "Dấu thời gian",
+          "user": "Người dùng"
+        },
+        "alerts": {
+          "alert_id": "ID cảnh báo",
+          "device": "Thiết bị",
+          "duration_minutes": "Thời lượng (phút)",
+          "resolved_at": "Đã giải quyết lúc",
+          "rule": "Quy tắc",
+          "severity": "Mức độ",
+          "source": "Nguồn",
+          "status": "Trạng thái",
+          "triggered_at": "Đã kích hoạt lúc"
+        },
+        "compliance": {
+          "control_family": "Nhóm kiểm soát",
+          "device_count": "Thiết bị",
+          "exception_count": "Ngoại lệ",
+          "last_audit": "Kiểm toán lần cuối",
+          "policy": "Chính sách",
+          "score": "Điểm số",
+          "status": "Trạng thái"
+        },
+        "devices": {
+          "cpu": "CPU",
+          "gpu": "GPU",
+          "motherboard": "Bo mạch chủ",
+          "hostname": "Tên máy",
+          "last_seen": "Lần thấy cuối",
+          "ram": "RAM",
+          "disks": "Ổ đĩa",
+          "os": "HĐH",
+          "owner": "Chủ sở hữu",
+          "patch_level": "Phiên bản Agent",
+          "serial": "Số sê-ri",
+          "site": "Chi nhánh",
+          "status": "Trạng thái"
+        },
+        "patches": {
+          "approved_at": "Đã duyệt lúc",
+          "device_count": "Thiết bị",
+          "missing_count": "Còn thiếu",
+          "patch_id": "ID bản vá",
+          "release_date": "Ngày phát hành",
+          "severity": "Mức độ",
+          "status": "Trạng thái",
+          "title": "Tiêu đề",
+          "vendor": "Nhà cung cấp"
+        }
+      },
+      "fieldsShared": {
+        "reportName": "Tên báo cáo",
+        "saveAsTemplate": "Lưu thành mẫu",
+        "templateName": "Tên mẫu"
+      },
+      "filterModes": {
+        "deviceFilter": "Bộ lọc thiết bị",
+        "recordFilters": "Bộ lọc bản ghi"
+      },
+      "filterOperators": {
+        "contains": "Chứa",
+        "gt": "Lớn hơn",
+        "is": "Là",
+        "is_not": "Không là",
+        "lt": "Nhỏ hơn"
+      },
+      "groupBy": "Nhóm theo",
+      "groupedMetric": {
+        "avg": "Trung bình {{field}}",
+        "count": "Số lượng",
+        "sum": "Tổng {{field}}",
+        "value": "Giá trị"
+      },
+      "livePreview": {
+        "description": "Cập nhật khi bạn cấu hình báo cáo.",
+        "loading": "Đang tải bản xem trước trực tiếp...",
+        "noData": "Không có dữ liệu xem trước cho cấu hình hiện tại.",
+        "previewRows": "Hàng xem trước",
+        "title": "Xem trước trực tiếp",
+        "untitledReport": "Báo cáo chưa đặt tên"
+      },
+      "logic": {
+        "and": "VÀ",
+        "or": "HOẶC"
+      },
+      "filterLabels": {
+        "logic": "Logic lọc",
+        "field": "Trường lọc",
+        "operator": "Toán tử lọc"
+      },
+      "noFieldsSelected": "Chưa chọn trường nào.",
+      "noFilters": "Chưa có bộ lọc. Thêm điều kiện đầu tiên của bạn.",
+      "noGrouping": "Không nhóm",
+      "noNumericFields": "Không có trường số",
+      "placeholders": {
+        "email": "name@company.com",
+        "reportName": "Tổng quan Bảo mật Hàng tháng",
+        "templateName": "Gói tuân thủ hàng quý",
+        "value": "Giá trị"
+      },
+      "recipients": {
+        "contacts": "Liên hệ của tổ chức",
+        "legacy": "Địa chỉ email cũ",
+        "convert": "Chuyển thành liên hệ",
+        "added": "Đã thêm người nhận báo cáo",
+        "removed": "Đã xóa người nhận báo cáo",
+        "converted": "Địa chỉ email đã được chuyển thành liên hệ",
+        "updateFailed": "Không thể cập nhật người nhận báo cáo",
+        "convertFailed": "Không thể chuyển đổi địa chỉ email này",
+        "mfaRequired": "Việc chuyển đổi người nhận yêu cầu xác thực đa yếu tố. Hãy bật MFA trong hồ sơ của bạn và thử lại.",
+        "loadFailed": "Không thể tải danh sách người nhận báo cáo",
+        "businessEmailOnly": "Báo cáo kinh doanh chỉ được gửi đến các địa chỉ email bên dưới. Không thể thêm liên hệ của tổ chức.",
+        "partnerOwnedEmailOnly": "Báo cáo này bao gồm tất cả các tổ chức, do đó chỉ được gửi đến các địa chỉ email bên dưới. Không thể thêm liên hệ của tổ chức.",
+        "oneTimeNotEmailed": "Báo cáo chạy một lần không được gửi qua email. Hãy chọn lịch định kỳ để gửi báo cáo này cho các liên hệ.",
+        "emailAddresses": "Địa chỉ email"
+      },
+      "previewTable": {
+        "selectFields": "Chọn các trường để hiển thị trong bảng xem trước.",
+        "emptyColumns": "Chưa có dữ liệu cho: {{fields}}. Thanh RAM và số sê-ri ổ đĩa lấy từ tác nhân Windows mới nhất; thiết bị dùng tác nhân cũ hơn sẽ hiển thị dấu \"-\"."
+      },
+      "reportTypes": {
+        "activity": {
+          "description": "Lịch sử hoạt động của người dùng, quản trị viên và hệ thống",
+          "label": "Hoạt động"
+        },
+        "alerts": {
+          "description": "Khối lượng cảnh báo, mức độ nghiêm trọng và hiệu quả phản hồi",
+          "label": "Cảnh báo"
+        },
+        "compliance": {
+          "description": "Khả năng hiển thị mức độ sẵn sàng kiểm toán và tuân thủ chính sách",
+          "label": "Tuân thủ"
+        },
+        "devices": {
+          "description": "Trạng thái tồn kho và sức khỏe trên các thiết bị đầu cuối được quản lý",
+          "label": "Thiết bị"
+        },
+        "patches": {
+          "description": "Mức độ sẵn sàng vá lỗi, trạng thái triển khai và rủi ro",
+          "label": "Bản vá"
+        }
+      },
+      "runTime": "Thời gian chạy",
+      "schedule": "Lịch trình",
+      "scheduleDetail": {
+        "day": "Ngày {{date}}",
+        "everyDay": "Mỗi ngày"
+      },
+      "scheduleOptions": {
+        "one_time": {
+          "label": "Một lần"
+        },
+        "daily": {
+          "label": "Hàng ngày"
+        },
+        "monthly": {
+          "label": "Hàng tháng"
+        },
+        "weekly": {
+          "label": "Hàng tuần"
+        }
+      },
+      "sections": {
+        "chartType": {
+          "description": "Chọn cách hiển thị báo cáo dưới dạng trực quan.",
+          "title": "Loại biểu đồ"
+        },
+        "columns": {
+          "description": "Chọn các trường và kéo để sắp xếp lại.",
+          "title": "Cột và trường"
+        },
+        "dataSource": {
+          "description": "Cấu hình tập dữ liệu cho loại báo cáo này.",
+          "title": "Nguồn dữ liệu"
+        },
+        "delivery": {
+          "description": "Đặt tần suất, định dạng và người nhận.",
+          "title": "Lịch trình và phân phối"
+        },
+        "filters": {
+          "description": "Lọc dữ liệu báo cáo theo bản ghi hoặc thuộc tính thiết bị.",
+          "title": "Bộ lọc"
+        },
+        "grouping": {
+          "description": "Tóm tắt dữ liệu bằng cách đếm, tính tổng hoặc trung bình.",
+          "title": "Nhóm và tổng hợp"
+        },
+        "reportDetails": {
+          "description": "Đặt tên cho báo cáo và quyết định xem có lưu thành mẫu hay không.",
+          "title": "Chi tiết báo cáo"
+        },
+        "reportType": {
+          "description": "Chọn loại báo cáo bạn đang tạo.",
+          "title": "Loại báo cáo"
+        }
+      },
+      "removeField": "Xóa {{field}}",
+      "selectedFields": "Trường đã chọn",
+      "success": {
+        "created": "Đã lưu báo cáo \"{{name}}\".",
+        "updated": "Đã cập nhật báo cáo \"{{name}}\"."
+      },
+      "values": {
+        "enabled": "Đã bật",
+        "off": "Tắt",
+        "on": "Bật"
+      },
+      "weekDays": {
+        "friday": "Thứ Sáu",
+        "monday": "Thứ Hai",
+        "saturday": "Thứ Bảy",
+        "sunday": "Chủ Nhật",
+        "thursday": "Thứ Năm",
+        "tuesday": "Thứ Ba",
+        "wednesday": "Thứ Tư"
+      },
+      "where": "Khu vực",
+      "devicePicker": {
+        "title": "Thiết bị (đã chọn {{count}})",
+        "clear": "Xóa",
+        "search": "Tìm kiếm tên máy chủ hoặc chi nhánh…",
+        "loading": "Đang tải thiết bị…",
+        "empty": "Không tìm thấy thiết bị nào"
+      }
+    },
+    "reportTemplates": {
+      "blankConfigurationDescription": "Cấu hình báo cáo từ đầu hoặc bắt đầu với cấu hình trống.",
+      "createCustomTemplate": "Tạo mẫu tùy chỉnh",
+      "custom": "Tùy chỉnh",
+      "description": "Bắt đầu từ các mẫu có sẵn và chỉnh sửa chi tiết trước khi xuất bản.",
+      "errors": {
+        "createReport": "Không thể tạo báo cáo",
+        "fetchTemplates": "Không thể tải mẫu báo cáo",
+        "loadTemplates": "Không thể tải các mẫu"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "last30Days": "30 ngày qua",
+      "previewAlt": "Xem trước {{name}}",
+      "reportTypes": {
+        "activity": "Hoạt động",
+        "ai_fleet_design": "Thiết kế đội máy",
+        "ai_org_narrative": "Bản tường thuật vận hành AI hàng tuần",
+        "alert_summary": "Tóm tắt cảnh báo",
+        "alerts": "Cảnh báo",
+        "compliance": "Báo cáo tuân thủ",
+        "device_inventory": "Kiểm kê thiết bị",
+        "devices": "Thiết bị",
+        "executive_summary": "Tóm tắt điều hành",
+        "hardware_lifecycle": "Vòng đời phần cứng",
+        "vulnerability_management": "Quản lý lỗ hổng bảo mật",
+        "identity_access_review": "Đánh giá định danh & quyền truy cập",
+        "patches": "Bản vá",
+        "performance": "Báo cáo hiệu suất",
+        "security_compliance_posture": "Trạng thái bảo mật & tuân thủ",
+        "software_inventory": "Kiểm kê phần mềm",
+        "threat_detection_review": "Đánh giá phát hiện mối威胁",
+        "endpoint_management_review": "Đánh giá quản lý thiết bị đầu cuối",
+        "ticket_sla_attainment": "Đạt SLA phiếu hỗ trợ",
+        "technician_time_billability": "Thời gian kỹ thuật viên & tính phí được",
+        "ar_aging": "Tuổi nợ AR",
+        "ai_usage_by_client": "Mức sử dụng AI theo khách hàng",
+        "mrr_renewals": "MRR & gia hạn",
+        "quote_win_rate": "Tỷ lệ thắng báo giá",
+        "client_profitability": "Khả năng sinh lời của khách hàng",
+        "backup_status": "Trạng thái sao lưu"
+      },
+      "schedules": {
+        "daily": "Hàng ngày",
+        "monthly": "Hàng tháng",
+        "one_time": "Một lần",
+        "weekly": "Hàng tuần"
+      },
+      "spec": {
+        "cadence": "Tần suất",
+        "defaultRange": "Phạm vi mặc định",
+        "lastFullMonth": "Tháng đủ trước đó",
+        "asOfRunDate": "Tính đến ngày chạy",
+        "format": "Định dạng"
+      },
+      "success": {
+        "created": "Đã tạo \"{{name}}\". Hãy tạo báo cáo từ danh sách Báo cáo."
+      },
+      "syncing": "Đang đồng bộ mẫu...",
+      "template": "Mẫu",
+      "templates": {
+        "alert_summary": {
+          "description": "Cảnh báo hàng đầu, xu hướng mức độ nghiêm trọng và khối lượng công việc xử lý.",
+          "name": "Báo cáo tóm tắt cảnh báo"
+        },
+        "device_health": {
+          "description": "Xu hướng CPU, bộ nhớ và thời gian hoạt động cùng điểm số trạng thái thiết bị.",
+          "name": "Báo cáo trạng thái thiết bị"
+        },
+        "executive_summary": {
+          "description": "KPI cấp cao, tình trạng rủi ro và xu hướng chiến lược dành cho ban lãnh đạo.",
+          "name": "Tóm tắt điều hành"
+        },
+        "hardware_lifecycle": {
+          "description": "Kế hoạch thay thế thiết bị sẵn sàng cho khách hàng: độ tuổi, bảo hành, hạn thay thế và trạng thái hỗ trợ hệ điều hành, kèm theo khuyến nghị theo giai đoạn.",
+          "name": "Báo cáo vòng đời phần cứng"
+        },
+        "vulnerability_management": {
+          "description": "Các phát hiện mở theo mức độ nghiêm trọng, với các phát hiện bị khai thác tích cực (KEV) và điểm EPSS cao được tách riêng, các phát hiện có thể vá để khắc phục trước và các ngoại lệ rủi ro được chấp nhận hết hạn vào kỳ tới.",
+          "name": "Báo cáo quản lý lỗ hổng bảo mật"
+        },
+        "identity_access_review": {
+          "name": "Đánh giá danh tính & quyền truy cập",
+          "description": "Lần đăng nhập Microsoft 365 tương tác trong một khoảng thời gian, với danh sách danh tính, tài khoản không hoạt động, tình trạng truy cập có điều kiện và sự hiện diện của client truy cập từ xa — cùng với khoảng thời gian thực tế được bao phủ."
+        },
+        "security_compliance_posture": {
+          "description": "Bằng chứng sẵn sàng cho bảo hiểm/thẩm định: phạm vi EDR, mã hóa, tường lửa, vá lỗi, lỗ hổng bảo mật, quyền truy cập đặc quyền và tích hợp bảo mật với tỷ lệ phần trăm đã triển khai.",
+          "name": "Tình trạng bảo mật & tuân thủ (Bảo hiểm)"
+        },
+        "threat_detection_review": {
+          "description": "Các phát hiện mối đe dọa trong một khoảng thời gian, với khoảng thời gian thực tế được bao phủ — không bao giờ hiển thị bằng không đối với nguồn chưa được kết nối.",
+          "name": "Đánh giá phát hiện mối đe dọa"
+        },
+        "endpoint_management_review": {
+          "description": "Bằng chứng Microsoft Intune: phạm vi đăng ký, phân tích tuân thủ với xu hướng 30 ngày, đăng ký cũ và số lượng giấy phép, cùng với thời gian đồng bộ mới nhất của từng mục.",
+          "name": "Đánh giá quản lý điểm cuối Intune"
+        },
+        "ticket_sla_attainment": {
+          "name": "Mức độ đạt SLA của phiếu hỗ trợ",
+          "description": "Mức độ đáp ứng và giải quyết trong kỳ, được tính toán lại từ dấu thời gian của phiếu hỗ trợ thay vì đọc từ cọc mốc vi phạm — do đó một phiếu được trả lời muộn nhưng cuối cùng vẫn được trả lời vẫn được tính là chưa đạt. Nhóm theo tổ chức, mức độ ưu tiên, kỹ thuật viên hoặc danh mục."
+        },
+        "technician_time_billability": {
+          "name": "Thời gian & khả năng tính phí của kỹ thuật viên",
+          "description": "Thời gian đã ghi nhận so với công suất hàng tuần giả định, tỷ lệ tính phí / bao gồm / không tính phí, và lượng thời gian tính phí thực tế đã được phê duyệt và lập hóa đơn. Các kỹ thuật viên không có thời gian ghi nhận trong kỳ sẽ được hiển thị ở mức không thay vì bị loại bỏ."
+        },
+        "ar_aging": {
+          "name": "Tuổi nợ phải thu (AR)",
+          "description": "Số dư hóa đơn chưa thanh toán theo hạn hiện tại / 1–30 / 31–60 / 61–90 / 90+ ngày quá hạn, một bộ tổng cho mỗi loại tiền tệ không quy đổi. Hóa đơn không có ngày đáo hạn sẽ có mục riêng, không bao giờ là \"hiện tại\"."
+        },
+        "ai_usage_by_client": {
+          "name": "Mức độ sử dụng AI theo khách hàng",
+          "description": "Mức độ sử dụng AI nền tảng cho mỗi khách hàng trong kỳ: số yêu cầu, token, chi phí Breeze, số tiền tính phí từ hồ sơ thanh toán của khách hàng, và những gì đã được lập hóa đơn. Mức sử dụng đã bao gồm và các mô hình không có giá được hiển thị riêng, không bao giờ trộn lẫn."
+        },
+        "mrr_renewals": {
+          "name": "MRR & gia hạn",
+          "description": "Doanh thu định kỳ hàng tháng và hàng năm từ các hợp đồng đang hoạt động, tính vào ngày chạy báo cáo, cùng với các hợp đồng gia hạn trong khoảng thời gian đã chọn và thực tế đã lập hóa đơn định kỳ. Một bộ tổng cho mỗi tiền tệ, không quy đổi."
+        },
+        "quote_win_rate": {
+          "name": "Tỷ lệ thắng báo giá",
+          "description": "Tỷ lệ báo giá đã gửi được chốt thành công, tính trên mỗi cơ hội để báo giá được sửa đổi và gửi lại chỉ tính một lần. Tỷ lệ chính chỉ bao gồm các cơ hội đã chốt, đi kèm số lượng vẫn đang mở. Giá trị trước thuế, một bộ cho mỗi tiền tệ, không quy đổi."
+        },
+        "client_profitability": {
+          "name": "Khả năng sinh lời của khách hàng",
+          "description": "Doanh thu đã lập hóa đơn cho mỗi khách hàng trong kỳ theo nguồn (định kỳ, nhân công, sản phẩm, AI, khác), kèm theo số giờ ghi nhận và ước tính chi phí nhân công tùy chọn từ một mức giá theo giờ kết hợp. Các số liệu sử dụng mức giá đó được dán nhãn là ước tính. Một bộ tổng cho mỗi tiền tệ, không quy đổi."
+        },
+        "backup_status": {
+          "name": "Báo cáo trạng thái sao lưu",
+          "description": "Trạng thái sao lưu của mọi thiết bị trên Breeze và các nhà cung cấp sao lưu đã kết nối, trong một cái nhìn tổng quan: các nhóm phạm vi, lần sao lưu thành công gần nhất và lịch sử 28 ngày cho mỗi thiết bị."
+        },
+        "device_detail": {
+          "name": "Báo cáo chi tiết thiết bị",
+          "description": "Một trang cho mỗi thiết bị: phần cứng, từng thanh RAM và ổ đĩa kèm số sê-ri, phân vùng, bộ điều hợp mạng, bảo hành — tùy chọn phần mềm đã cài đặt."
+        }
+      },
+      "title": "Mẫu báo cáo",
+      "useTemplate": "Sử dụng mẫu",
+      "useTemplateTitle": "Sử dụng {{name}}",
+      "groups": {
+        "business": "Doanh nghiệp",
+        "general": "Chung",
+        "businessDescription": "Số liệu về doanh nghiệp MSP của riêng bạn thay vì thiết bị của khách hàng — chỉ dành cho nhân viên."
+      },
+      "delivery": {
+        "contactsLoading": "Đang tải danh bạ tổ chức…",
+        "contactsFailed": "Không thể tải danh bạ của tổ chức này. Bạn vẫn có thể thêm địa chỉ email.",
+        "noContacts": "Tổ chức này không có liên hệ nào có địa chỉ email.",
+        "removeEmail": "Xóa {{email}}",
+        "recipientsFailed": "Báo cáo \"{{name}}\" đã được tạo, nhưng không thể thêm tất cả người nhận. Hãy thêm họ từ báo cáo."
+      }
+    },
+    "threatDetectionOptions": {
+      "cancel": "Hủy",
+      "coverageNote": "Báo cáo hiển thị khoảng thời gian thực tế mà nó bao phủ. Nếu nguồn phát hiện không được kết nối trong một phần của kỳ, báo cáo sẽ ghi rõ điều đó thay vì báo cáo là không.",
+      "createReport": "Tạo báo cáo",
+      "includeCarriedIn": "Bao gồm các phát hiện mang sang",
+      "includeCarriedInHelp": "Các phát hiện mở trước kỳ này và vẫn chưa được giải quyết sẽ được liệt kê cùng với các phát hiện trong kỳ.",
+      "topIncidents": "Liệt kê tối đa (phát hiện)",
+      "topIncidentsHelp": "Giới hạn bảng phát hiện để một tháng có nhiều cảnh báo không tạo ra tệp PDF dài hàng trăm trang. Báo cáo nêu rõ số lượng đã bị ẩn thay vì cắt bớt âm thầm."
+    },
+    "endpointManagementOptions": {
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo",
+      "includeLicences": "Bao gồm số lượng giấy phép",
+      "includeLicencesHelp": "Hiển thị số ghế đang sử dụng so với số ghế đã mua cho mỗi sản phẩm Microsoft 365.",
+      "staleEnrolmentDays": "Đánh dấu đăng ký không hoạt động trong (ngày)",
+      "staleEnrolmentDaysHelp": "Thiết bị không kết nối với Intune trong số ngày này được tính là đăng ký cũ. Được đánh giá dựa trên chu kỳ đồng bộ Intune, không dựa trên kỳ báo cáo.",
+      "trendDays": "Cửa sổ xu hướng tuân thủ (ngày)",
+      "trendDaysHelp": "Khoảng thời gian xu hướng tuân thủ hàng ngày đọc lùi lại từ dữ liệu tổng hợp tình trạng Microsoft 365."
+    },
+    "identityAccessOptions": {
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo",
+      "orgWideNote": "Báo cáo này bao trùm toàn bộ tổ chức. Dữ liệu danh tính Microsoft 365 không có chiều chi nhánh, nên không thể thu hẹp cho các chi nhánh cụ thể — và tài khoản bị giới hạn ở một số chi nhánh nhất định hoàn toàn không thể chạy báo cáo này.",
+      "dormantDays": "Coi tài khoản là không hoạt động sau (ngày)",
+      "dormantDaysHelp": "Các tài khoản đã bật không ghi nhận lần đăng nhập thành công nào trong số ngày này sẽ được liệt kê. Tài khoản chưa từng được thấy đăng nhập sẽ được liệt kê là “chưa từng ghi nhận”, không giống như khoảng thời gian trống dài.",
+      "homeCountries": "Quốc gia đăng nhập dự kiến (mã ISO)",
+      "homeCountriesHelp": "Mã quốc gia gồm hai chữ cái, phân tách bằng dấu phẩy — ví dụ US, CA. Các lần đăng nhập từ bên ngoài danh sách này sẽ được tính. Để trống thì phần này sẽ hiển thị “chưa cấu hình”, không bao giờ là “không có đăng nhập nước ngoài”.",
+      "adminDetail": "Bao gồm chi tiết đăng nhập quản trị viên",
+      "adminDetailHelp": "Liệt kê từng lần đăng nhập tương tác bởi tài khoản có vai trò quản trị, bao gồm địa chỉ xuất phát. Đây là phần kiểm toán viên đọc đầu tiên.",
+      "coverageNote": "Báo cáo chỉ bao gồm các lần đăng nhập tương tác và in ra khoảng thời gian thực tế mà nó bao phủ. Microsoft giữ nhật ký đăng nhập trong khoảng 30 ngày và yêu cầu giấy phép Entra ID P1 hoặc P2 để cung cấp, do đó báo cáo đầu tiên sau khi bật tính năng thu thập sẽ là một phần và có ghi chú rõ."
+    },
+    "reportPeriod": {
+      "label": "Kỳ báo cáo",
+      "kinds": {
+        "last_full_month": "Tháng trước",
+        "last_30_days": "30 ngày qua",
+        "last_quarter": "Quý trước",
+        "custom": "Ngày tùy chỉnh"
+      },
+      "start": "Ngày bắt đầu",
+      "end": "Ngày kết thúc (tính cả ngày này)",
+      "help": "Các khoảng thời gian đặt sẵn được tính toán lại mỗi khi chạy báo cáo, do đó lịch trình hàng tháng luôn bao trùm tháng vừa kết thúc.",
+      "errors": {
+        "missing": "Chọn cả ngày bắt đầu và ngày kết thúc.",
+        "invalid": "Cả hai ngày phải là ngày lịch thực tế.",
+        "order": "Ngày bắt đầu không được sau ngày kết thúc."
+      }
+    },
+    "ticketSlaOptions": {
+      "approximationNote": "Mức độ đạt được tính toán lại từ dấu thời gian của phiếu hỗ trợ thay vì đọc từ cờ vi phạm, do đó phiếu được trả lời muộn vẫn tính là chưa đạt. Thời gian tạm dừng được lưu dưới dạng tổng thời gian, do đó việc tạm dừng sau phản hồi đầu tiên sẽ làm tăng nhẹ mức độ đạt phản hồi.",
+      "groupBy": "Nhóm theo",
+      "groupByAutomatic": "Tự động: theo tổ chức cho tất cả tổ chức, theo mức độ ưu tiên cho một tổ chức",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "priority": "Mức độ ưu tiên",
+        "technician": "Kỹ thuật viên (người được giao hiện tại)",
+        "category": "Danh mục"
+      },
+      "technicianNote": "Phiếu hỗ trợ được nhóm theo người được giao hiện tại. Lịch sử phân công lại không được theo dõi, do đó đây không nhất thiết là kỹ thuật viên đã phản hồi.",
+      "includeNoSla": "Liệt kê phiếu hỗ trợ không có mục tiêu SLA",
+      "includeNoSlaHelp": "Phiếu hỗ trợ không có mục tiêu SLA luôn được tính riêng và không bao giờ ảnh hưởng đến mức độ đạt. Tùy chọn này chỉ kiểm soát việc chúng có xuất hiện trong các hàng chi tiết hay không.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "technicianTimeOptions": {
+      "groupBy": "Nhóm theo",
+      "groupByValues": {
+        "technician": "Kỹ thuật viên",
+        "organization": "Tổ chức",
+        "work_type": "Loại công việc"
+      },
+      "orgAxisNote": "Các mục thời gian không liên kết với tổ chức sẽ xuất hiện trong hàng \"Không có tổ chức\" riêng. Báo cáo thuộc sở hữu của một tổ chức đơn lẻ chỉ thấy thời gian ghi nhận cho các phiếu hỗ trợ của tổ chức đó.",
+      "capacityHours": "Công suất hàng tuần mỗi kỹ thuật viên (giờ)",
+      "capacityHoursHelp": "Hiệu suất giả định công suất đồng đều cho mọi kỹ thuật viên, phân bổ theo ngày làm việc. Lịch nghỉ phép và bán thời gian không được mô hình hóa.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "arAgingOptions": {
+      "asOf": "Tuổi số dư tính đến",
+      "asOfHelp": "Để trống để tính tuổi nợ đến ngày chạy báo cáo. Ngày tháng chỉ di chuyển ngày tham chiếu tuổi nợ: số dư là hiện tại, do đó không tạo lại số dư trước đây hoặc hủy bỏ các khoản thanh toán được ghi nhận sau ngày đó.",
+      "asOfInvalid": "Nhập ngày lịch thực tế, hoặc để trống trường này.",
+      "groupBy": "Nhóm theo",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "currency": "Tiền tệ"
+      },
+      "currencyNote": "Mỗi tiền tệ có tổng số riêng. Số tiền không được quy đổi giữa các loại tiền tệ.",
+      "includePaidInPeriod": "Liệt kê hóa đơn đã thanh toán tính đến hiện tại trong tháng",
+      "includePaidInPeriodHelp": "Thêm ghi chú liệt kê các hóa đơn đã thanh toán hoàn toàn từ ngày mùng 1 của tháng tính đến ngày báo cáo. Thao tác này không bao giờ làm thay đổi các nhóm tuổi nợ.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "aiUsageByClientOptions": {
+      "groupBy": "Nhóm theo",
+      "groupByAutomatic": "Tự động: theo tổ chức cho tất cả tổ chức, theo mẫu cho một tổ chức",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "model": "Mẫu"
+      },
+      "periodNote": "Tính phí theo tháng dương lịch UTC. Khoảng thời gian ở múi giờ khác có thể khác với hóa đơn đối với mức sử dụng gần cuối tháng.",
+      "unpricedNote": "Mức sử dụng trên mô hình không có đơn giá trong hồ sơ thanh toán của khách hàng được tính là chưa có giá. Không bao giờ được coi là miễn phí.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "Báo cáo này luôn được tính vào ngày chạy báo cáo. Không có khoảng thời gian hoặc ngày tính đến nào để thiết lập.",
+      "groupBy": "Nhóm theo",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "contract": "Hợp đồng"
+      },
+      "renewalHorizon": "Thời hạn gia hạn",
+      "renewalHorizonOption": "{{days}} ngày tới",
+      "renewalHorizonHelp": "Các hợp đồng có thời hạn kết thúc trong khoảng thời gian này được liệt kê là cần gia hạn.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Nhóm theo",
+      "groupByAutomatic": "Tự động: theo tổ chức cho tất cả tổ chức, theo tác giả cho một tổ chức",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "author": "Tác giả",
+        "currency": "Tiền tệ"
+      },
+      "periodNote": "Khoảng thời gian áp dụng cho ngày mỗi báo giá được gửi lần đầu. Báo giá được sửa đổi và gửi lại được tính một lần, như một cơ hội.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Nhóm theo",
+      "groupByDefault": "Mặc định cho phạm vi của báo cáo",
+      "groupByValues": {
+        "organization": "Tổ chức",
+        "source": "Nguồn"
+      },
+      "groupByHelp": "Mặc định nhóm theo tổ chức đối với báo cáo tất cả tổ chức và theo nguồn đối với một tổ chức duy nhất.",
+      "laborEnabled": "Ước tính chi phí nhân công",
+      "laborAmount": "Chi phí nhân công mỗi giờ",
+      "laborCurrency": "Tiền tệ",
+      "laborHelp": "Một mức phí kết hợp cho mọi kỹ thuật viên. Các số liệu sử dụng mức này được dán nhãn là ước tính.",
+      "cancel": "Hủy",
+      "createReport": "Tạo báo cáo"
+    },
+    "ownerScope": {
+      "legend": "Báo cáo bao gồm",
+      "allOrganizations": "Tất cả tổ chức",
+      "allOrganizationsHint": "Bao gồm mọi tổ chức đang hoạt động và dùng thử, được xác định tại mỗi lần chạy. Các tổ chức bị loại trừ được liệt kê trong ghi chú của báo cáo. Yêu cầu quyền truy cập tất cả tổ chức.",
+      "singleOrganization": "Một tổ chức",
+      "singleOrganizationHint": "Tổ chức được chọn trong trình chuyển đổi tổ chức.",
+      "singleOrganizationDisabledHint": "Chọn một tổ chức trong trình chuyển đổi tổ chức để tạo báo cáo theo phạm vi tổ chức.",
+      "needsOrganizationHint": "Chọn một tổ chức trong trình chuyển đổi tổ chức để tạo báo cáo này. Báo cáo cho tất cả tổ chức yêu cầu quyền truy cập tất cả tổ chức."
+    },
+    "orgPicker": {
+      "label": "Tổ chức",
+      "placeholder": "Chọn một tổ chức",
+      "hint": "Bạn đang xem tất cả tổ chức. Hãy chọn tổ chức mà báo cáo này áp dụng.",
+      "required": "Chọn một tổ chức trước khi lưu báo cáo này.",
+      "chooseFirst": "Chọn một tổ chức ở trên trước khi sử dụng mẫu.",
+      "previewNeedsOrg": "Chọn một tổ chức để xem bản xem trước trực tiếp."
+    },
+    "series": {
+      "covers": {
+        "legend": "Bao gồm",
+        "org": "Một tổ chức",
+        "orgHint": "Báo cáo cho một khách hàng, được gửi đến các liên hệ của tổ chức đó.",
+        "series": "Một báo cáo cho mỗi tổ chức",
+        "seriesHint": "Một định nghĩa, với một bản sao riêng cho mọi tổ chức mà nó bao gồm, mỗi bản được gửi đến các liên hệ của tổ chức đó.",
+        "combined": "Tất cả tổ chức kết hợp",
+        "combinedHint": "Một báo cáo kết hợp trên tất cả tổ chức của bạn, dành cho đội ngũ của bạn.",
+        "seriesUnavailableType": "Loại báo cáo này không thể được gửi dưới dạng mỗi tổ chức một báo cáo."
+      },
+      "schedule": {
+        "label": "Tần suất gửi bản sao của mỗi tổ chức",
+        "placeholder": "Chọn lịch trình",
+        "hint": "Báo cáo được gửi đến nhiều tổ chức chạy theo lịch trình, vì vậy không thể là chạy một lần. Chọn tần suất gửi bản sao của mỗi tổ chức.",
+        "required": "Chọn tần suất gửi báo cáo."
+      },
+      "targeting": {
+        "legend": "Các tổ chức nào",
+        "all": "Tất cả tổ chức",
+        "allHint": "Bao gồm mọi tổ chức hiện tại và tương lai. Bỏ chọn bất kỳ tổ chức nào bạn muốn bỏ qua.",
+        "selected": "Các tổ chức đã chọn",
+        "selectedHint": "Chỉ bao gồm các tổ chức bạn tích chọn.",
+        "search": "Tìm kiếm tổ chức",
+        "summary": "Bao gồm {{covered}} trên tổng số {{total}} tổ chức",
+        "noneSelected": "Chọn ít nhất một tổ chức.",
+        "empty": "Không có tổ chức nào phù hợp."
+      },
+      "recipients": {
+        "legend": "Ai nhận bản sao của mỗi tổ chức",
+        "primaryContact": "Liên hệ chính của tổ chức",
+        "roles": "Liên hệ có các vai trò này",
+        "noRuleWarning": "Chưa chọn quy tắc nào, vì vậy tổ chức chỉ nhận bản sao khi bạn thêm liên hệ vào bản sao của tổ chức đó.",
+        "internalCc": "Bản sao nội bộ",
+        "internalCcHint": "Bản sao của mọi tổ chức cũng được gửi đến các địa chỉ này trong đội ngũ của bạn.",
+        "ccPlaceholder": "name@example.com",
+        "ccAdd": "Thêm",
+        "ccInvalid": "Nhập địa chỉ email hợp lệ.",
+        "ccRemove": "Xóa {{email}}",
+        "previewLoading": "Đang kiểm tra người nhận…",
+        "previewContacts_one": "Xác định được {{count}} liên hệ",
+        "previewContacts_other": "Xác định được {{count}} liên hệ",
+        "previewOrgs_one": "trên {{count}} tổ chức",
+        "previewOrgs_other": "trên {{count}} tổ chức",
+        "previewMissing_one": "{{count}} tổ chức không có người nhận là khách hàng: {{names}}",
+        "previewMissing_other": "{{count}} tổ chức không có người nhận là khách hàng: {{names}}",
+        "previewMore": "và thêm {{count}} mục nữa",
+        "previewFailed": "Không thể kiểm tra người nhận. Họ vẫn được xác định cho từng tổ chức khi báo cáo chạy.",
+        "previewNoTargets": "Chọn tổ chức để xem ai nhận báo cáo."
+      },
+      "builder": {
+        "filtersDisabled": "Bộ lọc chi nhánh, thiết bị và nhóm không khả dụng ở đây: bản sao của mỗi tổ chức bao trùm toàn bộ tổ chức.",
+        "created": "Đã tạo báo cáo đa tổ chức “{{name}}”",
+        "saved": "Đã lưu báo cáo đa tổ chức “{{name}}”",
+        "saveFailed": "Không thể lưu báo cáo đa tổ chức.",
+        "targetsFailed": "Đã lưu cài đặt, nhưng các tổ chức được bao gồm chưa được cập nhật. Hãy thử lưu lại."
+      },
+      "list": {
+        "filtersLabel": "Hiển thị",
+        "filters": {
+          "all": "Tất cả",
+          "multi": "Đa tổ chức",
+          "single": "Đơn tổ chức",
+          "combined": "Kết hợp"
+        },
+        "noMatches": "Không có báo cáo nào khớp với bộ lọc này.",
+        "loadFailed": "Không thể tải báo cáo đa tổ chức. Các báo cáo khác đang được hiển thị.",
+        "multiOrgBadge": "Đa tổ chức",
+        "multiOrgBadgeTitle": "Là một phần của báo cáo đa tổ chức “{{name}}”",
+        "expand": "Hiển thị tổ chức",
+        "collapse": "Ẩn tổ chức",
+        "summary": "{{date}} · Đã gửi {{delivered}}/{{total}}",
+        "summaryNoRecipient_one": "{{count}} không có người nhận",
+        "summaryNoRecipient_other": "{{count}} không có người nhận",
+        "summaryBlocked_one": "{{count}} bị chặn",
+        "summaryBlocked_other": "{{count}} bị chặn",
+        "summaryNever": "Chưa chạy",
+        "runsSeriesColumn": "Báo cáo đa tổ chức",
+        "actions": {
+          "edit": "Sửa báo cáo đa tổ chức",
+          "transferOwner": "Chuyển quyền sở hữu",
+          "delete": "Xóa báo cáo đa tổ chức",
+          "pause": "Tạm dừng",
+          "resume": "Tiếp tục"
+        },
+        "pausedBadge": "Đã tạm dừng",
+        "pausedTitle": "Đã tạm dừng: không có bản sao của tổ chức nào chạy cho đến khi bạn tiếp tục.",
+        "paused": "Đã tạm dừng “{{name}}”",
+        "resumed": "Đã tiếp tục “{{name}}”",
+        "pauseFailed": "Không thể tạm dừng hoặc tiếp tục báo cáo đa tổ chức.",
+        "deleteTitle": "Xóa báo cáo đa tổ chức?",
+        "deleteMessage": "“{{name}}” sẽ ngừng chạy. Bản sao của từng tổ chức được lưu trữ kèm theo lịch sử chạy.",
+        "deleteConfirm": "Xóa",
+        "deleted": "Đã xóa báo cáo đa tổ chức “{{name}}”",
+        "deleteFailed": "Không thể xóa báo cáo đa tổ chức."
+      },
+      "drilldown": {
+        "columns": {
+          "org": "Tổ chức",
+          "state": "Trạng thái",
+          "lastRun": "Chạy lần cuối",
+          "delivery": "Gửi",
+          "recipients": "Người nhận",
+          "actions": "Thao tác"
+        },
+        "states": {
+          "active": "Đang hoạt động",
+          "excluded": "Đã loại trừ",
+          "ineligible": "Không đủ điều kiện",
+          "blocked_no_authority": "Đã chặn: chủ sở hữu không có quyền truy cập",
+          "blocked_no_recipients": "Không có người nhận là khách hàng",
+          "detached": "Đã tách"
+        },
+        "delivery": {
+          "sent": "Đã gửi",
+          "not_scheduled": "Chưa gửi email"
+        },
+        "neverRun": "Chưa chạy",
+        "actions": {
+          "runNow": "Chạy ngay",
+          "editRecipients": "Sửa người nhận",
+          "exclude": "Loại trừ",
+          "include": "Bao gồm",
+          "detach": "Tách"
+        },
+        "lastOrgHint": "Báo cáo đa tổ chức với các tổ chức đã chọn cần ít nhất một. Thay vào đó, hãy xóa báo cáo này.",
+        "noAuthorityHint": "Chủ sở hữu không thể truy cập tổ chức này, do đó bản sao của tổ chức sẽ không chạy. Hãy chuyển giao chủ sở hữu để khắc phục.",
+        "excludeTitle": "Loại trừ {{org}}?",
+        "excludeMessage": "{{org}} sẽ ngừng nhận báo cáo này. Bản sao của tổ chức được lưu trữ kèm theo lịch sử chạy, và việc bao gồm lại sẽ khôi phục chính bản sao đó.",
+        "excludeConfirm": "Loại trừ",
+        "detachTitle": "Tách {{org}}?",
+        "detachMessage": "Bản sao của {{org}} trở thành một báo cáo độc lập mà bạn có thể chỉnh sửa tự do. Bản sao này giữ lại lịch sử chạy và ngừng tuân theo báo cáo đa tổ chức này. Khi bản sao độc lập đó còn tồn tại, {{org}} vẫn nằm ngoài báo cáo đa tổ chức ngay cả khi bạn bao gồm lại.",
+        "detachConfirm": "Tách",
+        "excluded": "Đã loại trừ {{org}}",
+        "included": "Đã bao gồm {{org}}",
+        "detached": "Đã tách {{org}}",
+        "generated": "Đã tạo báo cáo cho {{org}}",
+        "updateFailed": "Không thể cập nhật báo cáo đa tổ chức.",
+        "detachFailed": "Không thể tách báo cáo.",
+        "generateFailed": "Không thể tạo báo cáo.",
+        "detachedHint": "Bản sao độc lập của báo cáo được quản lý riêng. Hãy xóa báo cáo đó để đưa tổ chức này quay lại báo cáo đa tổ chức."
+      },
+      "transferOwner": {
+        "title": "Chuyển giao chủ sở hữu",
+        "description": "Bản sao của mỗi tổ chức chạy với quyền truy cập của chủ sở hữu. Hãy chọn một người dùng đối tác có quyền truy cập vào mọi tổ chức.",
+        "label": "Chủ sở hữu mới",
+        "placeholder": "Chọn người dùng",
+        "current": "{{name}} (chủ sở hữu hiện tại)",
+        "confirm": "Chuyển giao",
+        "loadFailed": "Không thể tải người dùng.",
+        "forbidden": "Bạn cần quyền xem người dùng để chuyển giao chủ sở hữu.",
+        "noCandidates": "Không có người dùng nào khác có quyền truy cập vào mọi tổ chức.",
+        "transferred": "Đã chuyển giao chủ sở hữu cho {{name}}",
+        "failed": "Không thể chuyển giao chủ sở hữu."
+      },
+      "child": {
+        "partOf": "Thuộc báo cáo đa tổ chức “{{name}}”",
+        "partOfUnnamed": "Thuộc báo cáo đa tổ chức",
+        "lockedExplanation": "Cài đặt chung được chỉnh sửa trên báo cáo đa tổ chức. Chỉ có thể thay đổi người nhận của riêng tổ chức này tại đây.",
+        "managedByMsp": "Được quản lý bởi MSP của bạn",
+        "managedExplanation": "MSP của bạn quản lý báo cáo này. Bạn có thể thay đổi những ai trong tổ chức của mình nhận được báo cáo.",
+        "editSeries": "Sửa báo cáo đa tổ chức",
+        "detach": "Tách",
+        "archived": "Bản sao này đã được lưu trữ: tổ chức không còn nằm trong phạm vi của báo cáo đa tổ chức.",
+        "summary": {
+          "type": "Loại",
+          "schedule": "Lịch chạy",
+          "format": "Định dạng"
+        },
+        "recipients": {
+          "title": "Người nhận cho tổ chức này",
+          "description": "Chọn người nhận bản sao của tổ chức này, ngoài quy tắc của báo cáo đa tổ chức.",
+          "default": "Tuân theo quy tắc",
+          "add": "Luôn gửi",
+          "remove": "Không bao giờ gửi",
+          "byRule": "Được bao gồm theo quy tắc",
+          "loadFailed": "Không thể tải người nhận.",
+          "updated": "Đã cập nhật người nhận",
+          "updateFailed": "Không thể cập nhật người nhận.",
+          "empty": "Tổ chức này không có liên hệ nào có địa chỉ email."
+        }
+      },
+      "editPage": {
+        "title": "Sửa báo cáo đa tổ chức",
+        "description": "Các thay đổi áp dụng cho bản sao của mọi tổ chức thuộc “{{name}}”.",
+        "breadcrumb": "Báo cáo",
+        "back": "Quay lại phần Báo cáo",
+        "loading": "Đang tải báo cáo đa tổ chức…",
+        "notFound": "Báo cáo đa tổ chức này không còn tồn tại.",
+        "loadFailed": "Không thể tải báo cáo đa tổ chức."
+      },
+      "errors": {
+        "seriesTypeUnsupported": "Loại báo cáo này không thể được gửi dưới dạng mỗi tổ chức một báo cáo.",
+        "seriesConfigOrgSpecific": "Xóa các bộ lọc chi nhánh, thiết bị và nhóm: báo cáo đa tổ chức bao trùm toàn bộ tổ chức.",
+        "seriesManaged": "Báo cáo này thuộc về một báo cáo đa tổ chức. Hãy chỉnh sửa báo cáo đa tổ chức hoặc tách bản sao này trước.",
+        "seriesOwnerIneligible": "Người dùng đó không thể sở hữu báo cáo đa tổ chức.",
+        "seriesOwnerIneligiblePermission": "Người dùng đó không thể sở hữu báo cáo đa tổ chức: vai trò của họ không cấp quyền xuất báo cáo (reports:export).",
+        "seriesOwnerIneligibleOrgAccess": "Người dùng đó không thể sở hữu báo cáo đa tổ chức: họ cần quyền truy cập vào mọi tổ chức.",
+        "seriesOwnerIneligibleInactive": "Tài khoản của người dùng đó không hoạt động, do đó họ không thể sở hữu báo cáo đa tổ chức.",
+        "seriesOwnerIneligibleMembership": "Người dùng đó không còn là thành viên của đối tác của bạn, do đó họ không thể sở hữu báo cáo đa tổ chức.",
+        "seriesOwnerIneligibleNotPartner": "Người dùng đó không thuộc đối tác của bạn, do đó họ không thể sở hữu báo cáo đa tổ chức.",
+        "seriesOwnerIneligibleTenantInactive": "Tài khoản đối tác của bạn không hoạt động, do đó báo cáo đa tổ chức không thể nhận chủ sở hữu mới.",
+        "seriesNotFound": "Báo cáo đa tổ chức này không còn tồn tại.",
+        "seriesWriteDenied": "Chỉ người dùng đối tác có quyền truy cập vào mọi tổ chức mới có thể thay đổi báo cáo đa tổ chức.",
+        "seriesTargetOrgInaccessible": "Một trong các tổ chức đã chọn không khả dụng với bạn.",
+        "seriesTargetOrgHidden": "Quick Support và tổ chức chứa thiết bị chưa gán không thể nằm trong phạm vi báo cáo đa tổ chức.",
+        "reportNotSeriesChild": "Báo cáo này không còn là một phần của báo cáo đa tổ chức.",
+        "recipientModeRequiresSeries": "\"Không bao giờ gửi\" chỉ áp dụng cho bản sao của báo cáo đa tổ chức.",
+        "recipientsNeedExportAndMfa": "Việc gửi báo cáo cho người nhận yêu cầu quyền xuất và đăng nhập đa yếu tố.",
+        "seriesAuthorityUnverifiable": "Không thể xác nhận quyền truy cập của chủ sở hữu lúc này. Vui lòng thử lại sau giây lát."
+      }
+    },
+    "seriesCombine": {
+      "banner": "Một số tổ chức có các báo cáo gần như giống nhau có thể được gộp thành một báo cáo đa tổ chức. Các nhóm đã tìm thấy: {{groups}}",
+      "review": "Xem lại",
+      "title": "Gộp thành một báo cáo đa tổ chức",
+      "groupLabel": "Nhóm",
+      "groupSummary": "{{type}} · {{schedule}} · tổ chức: {{orgs}}",
+      "nameLabel": "Tên báo cáo đa tổ chức",
+      "targetLegend": "Các tổ chức được bao trùm",
+      "targetSelected": "Chỉ các tổ chức này (không có gì mới được gửi)",
+      "targetAll": "Tất cả tổ chức, kể cả các tổ chức được thêm sau",
+      "targetAllWarning": "Các tổ chức chưa có bản sao từ hôm nay bắt đầu nhận báo cáo này, chỉ có CC nội bộ cho đến khi bạn thêm người nhận là khách hàng.",
+      "adopt": "Được giữ lại và chuyển đổi",
+      "archive": "Bản sao, sẽ được lưu trữ",
+      "deliverableLinked": "Được dùng làm bằng chứng bàn giao dịch vụ",
+      "lastRun": "Chạy lần cuối {{date}}",
+      "neverRun": "Chưa từng chạy",
+      "contacts": "Người nhận là khách hàng: {{list}}",
+      "noContacts": "Không có người nhận là khách hàng",
+      "ccShared": "CC nội bộ trên mọi bản sao: {{list}}",
+      "ccNone": "Không có CC nội bộ",
+      "ccConflictHeading": "Các địa chỉ CC này chỉ có trên một số báo cáo này. Hãy chọn việc sẽ làm với từng địa chỉ:",
+      "ccInclude": "CC mọi bản sao",
+      "ccDrop": "Ngừng CC",
+      "ccUnresolved": "Chọn cách xử lý mọi địa chỉ CC trước khi gộp.",
+      "ruleNote": "Mọi khách hàng giữ nguyên người nhận như hiện tại. Bạn có thể thêm quy tắc người nhận sau trên báo cáo đa tổ chức.",
+      "confirm": "Gộp",
+      "success": "Đã gộp vào “{{name}}”",
+      "failed": "Không thể gộp các báo cáo này.",
+      "groupChanged": "Các báo cáo này đã thay đổi từ khi bạn mở hộp thoại này. Danh sách đã được làm mới.",
+      "stalled": "Không gửi hôm nay (chủ sở hữu đã mất quyền truy cập). Việc gộp sẽ tiếp tục gửi lại.",
+      "ccHeldBy": "Đang CC cho: {{list}}",
+      "ownerIneligible": "Bạn không thể làm chủ sở hữu báo cáo cho các tổ chức này: {{list}}",
+      "ccTooMany": "Quá nhiều địa chỉ CC nội bộ (tối đa {{max}}).",
+      "otherOrgs": "tổ chức khác"
+    }
+  }
+}

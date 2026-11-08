@@ -1,0 +1,24 @@
+{
+  "public": {
+    "title": "Xem lại yêu cầu hỗ trợ",
+    "loading": "Đang tải yêu cầu…",
+    "hello": "Xin chào, {{name}}",
+    "request": "{{technician}} từ {{partner}} muốn:",
+    "reset_password": "Đặt lại mật khẩu cho {{target}}",
+    "disable_user": "Vô hiệu hóa tài khoản cho {{target}}",
+    "any": "Xác nhận yêu cầu hỗ trợ cho {{target}}",
+    "target": "tài khoản được yêu cầu",
+    "provider": "nhà cung cấp hỗ trợ của bạn",
+    "reverse": "Mã yêu cầu",
+    "choose": "Chạm vào số mà kỹ thuật viên yêu cầu bạn chọn. Không bao giờ đọc mã cho người khác nghe.",
+    "notMe": "Không phải tôi",
+    "caution": "Chỉ chạm vào một số nếu bạn đang gọi điện với {{technician}} ngay lúc này. Nếu bạn không chắc chắn, hãy gác máy và gọi cho {{partner}} theo số điện thoại bạn đang có sẵn.",
+    "expires": "Hết hạn sau {{seconds}} giây",
+    "expired": "Yêu cầu này không khả dụng hoặc đã hết hạn.",
+    "received": "Phản hồi của bạn đã được ghi nhận.",
+    "failed": "Không thể gửi phản hồi của bạn. Vui lòng thử lại.",
+    "loadFailed": "Không thể tải yêu cầu. Vui lòng thử lại.",
+    "retry": "Thử lại",
+    "sending": "Đang gửi…"
+  }
+}

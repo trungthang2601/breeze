@@ -1,0 +1,939 @@
+{
+  "aiApprovalDialog": {
+    "idleFor": "nhàn rỗi {{duration}}",
+    "justNow": "vừa xong",
+    "offlineFor": "ngoại tuyến {{duration}}",
+    "sessionStates": {
+      "active": "đang hoạt động",
+      "idle": "nhàn rỗi",
+      "locked": "đã khóa",
+      "away": "vắng mặt",
+      "disconnected": "đã ngắt kết nối",
+      "unknown": "không rõ"
+    },
+    "ariaLabel": "Cần phê duyệt công cụ: {{toolName}}",
+    "title": "Yêu cầu Phê duyệt",
+    "pendingApproverTitle": "Đang chờ người phê duyệt",
+    "selfApproveTitle": "Cần có sự phê duyệt của bạn",
+    "pendingApproverDescription": "Thao tác này cần được phê duyệt trong mục Phê duyệt hoặc ứng dụng di động Breeze.",
+    "timeRemaining": "Còn lại {{minutes}} phút {{seconds}} giây",
+    "urgentWarning": "Còn lại dưới 30 giây. Yêu cầu này sẽ bị từ chối tự động.",
+    "progressLabel": "Thời gian còn lại trước khi tự động từ chối",
+    "showParameters": "Hiển thị tham số",
+    "approve": "Phê duyệt",
+    "reject": "Từ chối",
+    "approveVerify": "Xác minh & Phê duyệt",
+    "verifying": "Đang chờ xác minh…",
+    "approving": "Đang phê duyệt…",
+    "deny": "Từ chối",
+    "verificationFailed": "Xác minh thất bại. Thử lại.",
+    "alreadyDecided": "Yêu cầu này đã được xử lý.",
+    "resolvedApproved": "Yêu cầu này đã được phê duyệt.",
+    "resolvedNotApproved": "Yêu cầu này không được phê duyệt nên thao tác không chạy.",
+    "resolvedEnded": "Yêu cầu này không còn chờ quyết định tại đây.",
+    "contentChanged": "Chi tiết yêu cầu đã thay đổi sau khi tạo nên không thể phê duyệt.",
+    "expired": "Yêu cầu đã hết hạn trước khi được quyết định.",
+    "notSoleApprover": "Cần có người phê duyệt khác — bạn không thể tự phê duyệt yêu cầu của chính mình.",
+    "siteCeiling": "Phê duyệt này cấp quyền trên toàn tổ chức. Quyền của bạn chỉ giới hạn ở các chi nhánh cụ thể, do đó cần người phê duyệt khác quyết định.",
+    "noApproverDevice": "Tự phê duyệt yêu cầu đòi hỏi Touch ID / Windows Hello.",
+    "freshFactorRequired": "Kiểm tra này cần xác nhận passkey mới (Touch ID, Windows Hello hoặc khóa phần cứng) dành riêng cho lần phê duyệt này. Thử lại.",
+    "registerDevice": "Đăng ký thiết bị này",
+    "decideFailed": "Gửi quyết định thất bại",
+    "approvedToast": "Đã phê duyệt thao tác",
+    "approvedToast_one": "Đã phê duyệt {{count}} thao tác",
+    "approvedToast_other": "Đã phê duyệt {{count}} thao tác",
+    "deniedToast": "Đã từ chối thao tác",
+    "deniedToast_one": "Đã từ chối {{count}} thao tác",
+    "deniedToast_other": "Đã từ chối {{count}} thao tác",
+    "refusedToast": "Phê duyệt của bạn đã bị chặn nên yêu cầu đã bị từ chối.",
+    "runContextLabel": "Ngữ cảnh chạy:",
+    "runContextChosenByAssistant": "được chọn bởi Breeze AI",
+    "runContextScriptDefault": "mặc định đã lưu của tập lệnh",
+    "runContextOverrides": "được chọn bởi Breeze AI, ghi đè mặc định đã lưu của tập lệnh ({{context}})"
+  },
+  "aiChatInput": {
+    "waiting": "Đang chờ phản hồi...",
+    "placeholder": "Hỏi về các thiết bị của bạn...",
+    "stopResponse": "Dừng phản hồi",
+    "send": "Gửi tin nhắn"
+  },
+  "aiChatMessages": {
+    "title": "Breeze AI",
+    "description": "Hỏi về thiết bị, cảnh báo, số liệu hoặc khắc phục sự cố.",
+    "unknownTool": "Công cụ không rõ",
+    "toolResult": "Kết quả công cụ",
+    "unattendedRelease": "Được xem xét bởi bộ đánh giá tập lệnh AI và phát hành mà không cần thẻ phê duyệt.",
+    "openScriptProposal": "Mở đề xuất để xem các lần chạy hoặc lưu vào thư viện",
+    "pauseAi": "Tạm dừng AI",
+    "quickActions": {
+      "serverHealth": {
+        "label": "Kiểm tra sức khỏe máy chủ",
+        "prompt": "Kiểm tra trạng thái sức khỏe của tất cả máy chủ Windows — hiển thị CPU, RAM, mức sử dụng ổ đĩa và mọi cảnh báo"
+      },
+      "criticalAlerts": {
+        "label": "Hiển thị cảnh báo nghiêm trọng",
+        "prompt": "Liệt kê tất cả cảnh báo mức độ nghiêm trọng cao và nghiêm trọng từ 24 giờ qua kèm chi tiết thiết bị"
+      },
+      "offlineDevices": {
+        "label": "Tìm thiết bị ngoại tuyến",
+        "prompt": "Hiển thị tất cả thiết bị hiện đang ngoại tuyến và thời điểm lần cuối nhìn thấy"
+      },
+      "securityOverview": {
+        "label": "Tổng quan bảo mật",
+        "prompt": "Cung cấp tổng quan bảo mật — bất kỳ mối đe dọa hoạt động nào, quét gần đây và thiết bị cần chú ý"
+      },
+      "diskSpace": {
+        "label": "Báo cáo dung lượng ổ đĩa",
+        "prompt": "Thiết bị nào sắp hết dung lượng ổ đĩa? Hiển thị thiết bị có mức sử dụng ổ đĩa trên 80%"
+      },
+      "recentActivity": {
+        "label": "Hoạt động gần đây",
+        "prompt": "Hiển thị các mục nhật ký kiểm toán gần đây nhất — những hành động nào đã thực hiện trong vài giờ qua?"
+      }
+    },
+    "toolGroup": {
+      "done": "Đã xong {{count}}",
+      "failed_one": "Thất bại {{count}}",
+      "failed_other": "Thất bại {{count}}",
+      "expand": "Hiển thị chi tiết",
+      "collapse": "Ẩn chi tiết"
+    },
+    "divider": {
+      "today": "Hôm nay lúc {{time}}",
+      "yesterday": "Hôm qua lúc {{time}}"
+    },
+    "specialists": {
+      "heading_one": "Đã chuyển cho {{count}} chuyên gia",
+      "heading_other": "Đã chuyển cho {{count}} chuyên gia"
+    },
+    "loadEarlier": "Tải thêm"
+  },
+  "aiChatSidebar": {
+    "history": "Lịch sử",
+    "title": "Breeze AI",
+    "conversationHistory": "Lịch sử trò chuyện",
+    "newConversation": "Cuộc trò chuyện mới",
+    "unflagConversation": "Bỏ gắn cờ cuộc trò chuyện",
+    "flagConversation": "Gắn cờ cuộc trò chuyện để xem xét",
+    "closeShortcut": "Đóng (Cmd+Shift+A)",
+    "searchPlaceholder": "Tìm kiếm cuộc trò chuyện...",
+    "noResults": "Không tìm thấy kết quả",
+    "untitledConversation": "Cuộc trò chuyện không có tiêu đề",
+    "noConversations": "Chưa có cuộc trò chuyện nào",
+    "m365Customer": "Khách hàng M365",
+    "noM365Customer": "Không phải khách hàng M365",
+    "dismiss": "Bỏ qua"
+  },
+  "aiConversationMove": {
+    "openInAssistant": "Mở trong Breeze AI",
+    "continueInPanel": "Tiếp tục ở bảng bên",
+    "openPastConversation": "Mở cuộc trò chuyện trước đây",
+    "closeTabInAssistant": "Đóng một tab trong Breeze AI để mở cuộc trò chuyện này",
+    "closeTabToOpen": "Đóng một tab để mở cuộc trò chuyện này",
+    "notAvailable": "Cuộc trò chuyện này không khả dụng",
+    "wasClosed": "Cuộc trò chuyện này đã bị đóng",
+    "topologyFromMap": "Các cuộc điều tra mở từ bản đồ cấu trúc",
+    "openInPanel": "Mở trong bảng bên",
+    "replaceConfirm": "Thay thế cuộc trò chuyện trong bảng bên? Cuộc trò chuyện vẫn nằm trong lịch sử của bạn.",
+    "joinedMidResponse": "Đã tham gia giữa chừng phản hồi. Phản hồi đầy đủ sẽ hiển thị khi hoàn tất.",
+    "chooseModelInPanel": "Tiếp tục ở bảng bên để chọn mô hình",
+    "tabMenu": "Tùy chọn tab",
+    "anotherOrg": "Tổ chức khác",
+    "device": "Thiết bị",
+    "newChat": "Trò chuyện mới"
+  },
+  "aiContextBadge": {
+    "record": "Bản ghi",
+    "context": "Ngữ cảnh",
+    "dashboard": "Tổng quan"
+  },
+  "aiCostIndicator": {
+    "messageCount": "{{count}} tin nhắn tháng này",
+    "messageCount_one": "{{count}} tin nhắn tháng này",
+    "messageCount_other": "{{count}} tin nhắn tháng này",
+    "thisMonth": "{{amount}} tháng này",
+    "credits_one": "{{formatted}} tín dụng",
+    "credits_other": "{{formatted}} tín dụng"
+  },
+  "aiPlanProgressBar": {
+    "completed": "Đã hoàn thành kế hoạch ({{completed}}/{{total}})",
+    "aborted": "Kế hoạch đã bị hủy ở bước {{step}}",
+    "executing": "Đang thực thi: Bước {{step}} / {{total}}",
+    "stop": "Dừng",
+    "stepTitle": "Bước {{step}}: {{name}}"
+  },
+  "aiPlanReviewCard": {
+    "title": "Kế hoạch hành động",
+    "stepCount": "{{count}} bước",
+    "stepCount_one": "{{count}} bước",
+    "stepCount_other": "{{count}} bước",
+    "approveAll": "Phê duyệt tất cả",
+    "reject": "Từ chối"
+  },
+  "aiToolCallCard": {
+    "running": "Đang chạy...",
+    "failed": "Thất bại",
+    "approvedRunning": "Đã phê duyệt · đang chạy",
+    "approvedFailed": "Đã phê duyệt · thất bại",
+    "approvedCompleted": "Đã phê duyệt · hoàn thành",
+    "input": "Đầu vào:",
+    "error": "Lỗi:",
+    "output": "Đầu ra:",
+    "outputExpired": "Đầu ra đã hết hạn theo chính sách lưu trữ",
+    "unknownTool": "Công cụ không rõ · chưa chạy"
+  },
+  "aiForOfficePage": {
+    "title": "Breeze AI for Office",
+    "description": "Trợ lý AI được kiểm soát trong Excel của khách hàng — cung cấp, chính sách, kiểm toán, mức sử dụng và mẫu",
+    "tabs": {
+      "orgs": "Tổ chức",
+      "sessions": "Phiên",
+      "usage": "Mức sử dụng tiện ích bổ sung Office",
+      "templates": "Mẫu"
+    }
+  },
+  "orgsTab": {
+    "status": {
+      "active": "Hoạt động",
+      "consentPending": "Đang chờ đồng ý",
+      "notProvisioned": "Chưa được cung cấp"
+    },
+    "errors": {
+      "removeMapping": "Không thể xóa liên kết đối tượng thuê",
+      "loadStatus": "Không thể tải trạng thái tổ chức.",
+      "saveMapping": "Không thể lưu liên kết đối tượng thuê",
+      "copyConsent": "Không thể sao chép — vui lòng chọn URL thủ công",
+      "enableAi": "Không thể bật AI cho Office",
+      "loadConsent": "Không thể tải URL đồng ý. Đóng và thử lại."
+    },
+    "messages": {
+      "mappingRemoved": "Đã xóa liên kết đối tượng thuê cho {{orgName}}",
+      "mappingSaved": "Đã lưu liên kết đối tượng thuê",
+      "consentCopied": "Đã sao chép URL đồng ý",
+      "aiEnabled": "Đã bật AI cho Office đối với {{orgName}}"
+    },
+    "notEnabled": {
+      "title": "Breeze AI for Office chưa được bật trên phiên bản này.",
+      "description": "Đặt <code>CLIENT_AI_ENTRA_CLIENT_ID</code> (đăng ký ứng dụng tiện ích bổ sung Entra) trên API và tải lại."
+    },
+    "title": "Tổ chức khách hàng",
+    "description": "Cung cấp Breeze AI for Office cho mỗi tổ chức khách hàng: liên kết đối tượng thuê Entra, cấp quyền đồng ý của quản trị viên, bật chính sách, triển khai tiện ích bổ sung.",
+    "columns": {
+      "aiEnabled": "Đã bật AI",
+      "entraTenant": "Đối tượng thuê Entra",
+      "costMtd": "Chi phí (MTD)",
+      "messagesMtd": "Tin nhắn (MTD)"
+    },
+    "manage": "Quản lý",
+    "setUp": "Thiết lập",
+    "policy": "Chính sách",
+    "unmap": "Hủy liên kết",
+    "noOrganizations": "Không có tổ chức nào",
+    "removeMapping": {
+      "title": "Xóa liên kết đối tượng thuê",
+      "message": "Người dùng trong đối tượng thuê Entra của {{orgName}} sẽ không thể đăng nhập vào Breeze AI for Office nữa. Chính sách tổ chức và lịch sử sử dụng được giữ lại.",
+      "confirm": "Xóa liên kết"
+    },
+    "wizard": {
+      "steps": {
+        "tenant": "Đối tượng thuê",
+        "consent": "Đồng ý",
+        "enable": "Bật",
+        "deploy": "Triển khai"
+      },
+      "title": "Thiết lập AI cho Office — {{orgName}}",
+      "mapDescription": "Liên kết tổ chức này với đối tượng thuê Microsoft Entra của họ (ID thư mục). Liên kết này là cốt lõi để cô lập đối tượng thuê — mọi lần đăng nhập Excel từ đối tượng thuê này sẽ chuyển vào tổ chức này.",
+      "prefilled": " Được điền sẵn từ kết nối Microsoft 365 hiện có của tổ chức.",
+      "entraTenantId": "ID đối tượng thuê Entra",
+      "guidError": "Phải là một GUID (Trung tâm quản trị Entra → Tổng quan → ID đối tượng thuê).",
+      "saveContinue": "Lưu & tiếp tục",
+      "consentDescription": "Quản trị viên Microsoft 365 của đối tượng thuê khách hàng phải cấp quyền quản trị cho ứng dụng Breeze AI for Office. Gửi cho họ liên kết này (hoặc tự mở nếu bạn giữ quyền Quản trị viên toàn cục trong đối tượng thuê khách hàng):",
+      "loadingConsent": "Đang tải URL đồng ý…",
+      "copyUrl": "Sao chép URL",
+      "openNewTab": "Mở trong tab mới",
+      "afterConsent": "Sau khi cấp quyền, Microsoft sẽ chuyển hướng đến trang xác nhận của Breeze. Trạng thái đồng ý hiển thị là đã cấp ở đây sau khi người dùng đầu tiên đăng nhập từ Excel — không có lệnh thăm dò trực tiếp với Microsoft (Quyết định 1 của Kế hoạch-4).",
+      "consentGranted": "Tôi đã cấp quyền đồng ý",
+      "enableDescription": "Bật Breeze AI for Office cho tổ chức này. Thao tác này ghi <code>enabled: true</code> vào chính sách tổ chức với các giá trị mặc định an toàn (tất cả người dùng, đọc/ghi với sự phê duyệt của người dùng cuối, ẩn danh DLP đối với các loại tài chính/dinh danh). Tinh chỉnh mọi thứ trong trình chỉnh sửa chính sách sau đó.",
+      "enabling": "Đang bật…",
+      "alreadyEnabled": "Đã bật — tiếp tục",
+      "enableAi": "Bật AI cho Office",
+      "deployTitle": "Triển khai tiện ích bổ sung Excel qua tính năng triển khai tập trung của Microsoft 365",
+      "deploySteps": {
+        "signIn": "Đăng nhập vào <strong>Trung tâm quản trị Microsoft 365</strong> của đối tượng thuê khách hàng → Cài đặt → Ứng dụng tích hợp.",
+        "upload": "Chọn <strong>Tải lên ứng dụng tùy chỉnh</strong> → Tiện ích bổ sung Office → cung cấp URL tệp kê khai Breeze AI for Office từ phiên bản Breeze của bạn.",
+        "assign": "Chỉ định tiện ích bổ sung cho mọi người hoặc cho các nhóm người dùng thuộc phạm vi chính sách truy cập của tổ chức này.",
+        "wait": "Việc triển khai có thể mất tới 24 giờ để xuất hiện trên thanh ribbon Excel của người dùng (Trang đầu → Tiện ích bổ sung).",
+        "signInAutomatically": "Người dùng đăng nhập tự động bằng tài khoản công việc Microsoft của họ — không cần thêm thông tin đăng nhập."
+      },
+      "openPolicyEditor": "Mở trình chỉnh sửa chính sách"
+    }
+  },
+  "policyEditor": {
+    "errors": {
+      "ruleNameRequired": "Mỗi quy tắc DLP tùy chỉnh cần có một tên",
+      "invalidPattern": "Quy tắc DLP \"{{ruleName}}\" có mẫu không hợp lệ — hãy sửa trước khi lưu",
+      "save": "Không thể lưu chính sách",
+      "load": "Không thể tải chính sách tổ chức."
+    },
+    "messages": {
+      "saved": "Đã lưu chính sách"
+    },
+    "organizations": "Tổ chức",
+    "title": "Chính sách tổ chức",
+    "description": "Mọi thứ mà Breeze AI for Office của tổ chức khách hàng này được phép làm.",
+    "sections": {
+      "general": "Chung",
+      "userAccess": "Truy cập của người dùng",
+      "budgets": "Ngân sách & giới hạn tốc độ",
+      "branding": "Nhãn hiệu",
+      "dlp": "Ngăn ngừa mất dữ liệu"
+    },
+    "assistant": "Trợ lý",
+    "workbookAccess": "Truy cập sổ làm việc",
+    "workbookAccessOptions": {
+      "readWrite": "Đọc & ghi (thao tác ghi được kiểm soát phê duyệt bởi người dùng cuối)",
+      "readOnly": "Chỉ đọc (các công cụ ghi bị xóa khỏi mô hình)"
+    },
+    "workbookWrites": "Ghi sổ làm việc",
+    "writeOptions": {
+      "ask": "Hỏi mọi lần (người dùng cuối phê duyệt từng thao tác ghi)",
+      "allowAuto": "Cho phép tự động áp dụng (người dùng cuối có thể chọn tham gia tự động)"
+    },
+    "autoApplyHint": "Tính năng tự động áp dụng tắt theo mặc định và chỉ khả dụng khi được cho phép ở đây.",
+    "aiModel": "Mô hình AI",
+    "whoCanUse": "Ai có thể sử dụng trợ lý",
+    "userAccessOptions": {
+      "all": "Tất cả người dùng trong đối tượng thuê đã liên kết",
+      "selected": "Chỉ người dùng được chọn"
+    },
+    "noUsersHint": "Chưa có người dùng nào đăng nhập từ Excel — người dùng sẽ xuất hiện ở đây sau lần đăng nhập đầu tiên. Cho đến lúc đó, hãy giữ quyền truy cập ở chế độ \"Tất cả người dùng\".",
+    "dailyBudget": "Ngân sách hàng ngày ($)",
+    "monthlyBudget": "Ngân sách hàng tháng ($)",
+    "noLimit": "Không giới hạn",
+    "messagesPerMinute": "Tin nhắn/phút cho mỗi người dùng",
+    "messagesPerHour": "Tin nhắn/giờ cho mỗi tổ chức",
+    "retentionDays": "Lưu giữ bản ghi (ngày)",
+    "keepForever": "Giữ vĩnh viễn",
+    "brandingDescription": "Hiển thị ở chân trang tiện ích bổ sung: \"Được quản lý bởi nhà cung cấp IT của bạn\" — móc nối thương hiệu riêng (đặc tả §11).",
+    "displayName": "Tên hiển thị",
+    "mspNamePlaceholder": "Tên MSP của bạn",
+    "logoUrl": "URL logo",
+    "dlpDescription": "Mọi payload rời khỏi Breeze gửi đến mô hình đều được quét (mục §6). Các giá trị bị ẩn danh sẽ được lưu dưới dạng đã ẩn danh — nhật ký kiểm toán không bao giờ lưu trữ dữ liệu nhạy cảm.",
+    "builtins": {
+      "creditCard": "Số thẻ tín dụng (đã kiểm tra Luhn)",
+      "ssn": "Số căn cước / CMND",
+      "iban": "Số tài khoản IBAN",
+      "apiKey": "Khóa & token API",
+      "email": "Địa chỉ email",
+      "phone": "Số điện thoại"
+    },
+    "actions": {
+      "redact": "Ẩn danh",
+      "block": "Chặn yêu cầu",
+      "log": "Chỉ ghi nhật ký",
+      "off": "Tắt"
+    },
+    "customRules": "Quy tắc tùy chỉnh",
+    "addRule": "Thêm quy tắc",
+    "testSample": "Kiểm tra mẫu (dán dữ liệu ô đại diện — được đánh giá cục bộ, không bao giờ gửi đi đâu)",
+    "ruleName": "Tên quy tắc",
+    "regexPlaceholder": "Biểu thức chính quy, ví dụ PRJ-\\d{4}",
+    "removeRule": "Xóa quy tắc",
+    "matchCount": "{{count}} kết quả khớp trong mẫu",
+    "matchCount_one": "{{count}} kết quả khớp trong mẫu",
+    "matchCount_other": "{{count}} kết quả khớp trong mẫu",
+    "patternCompiles": "Mẫu hợp lệ — thêm mẫu kiểm tra ở trên để xem kết quả khớp",
+    "patternError": "Lỗi mẫu: {{error}}",
+    "savePolicy": "Lưu chính sách"
+  },
+  "sessionsTab": {
+    "toolStatus": {
+      "pending": "đang chờ",
+      "approved": "đã duyệt",
+      "rejected": "đã từ chối",
+      "stopped": "đã dừng",
+      "completed": "đã hoàn thành",
+      "failed": "thất bại"
+    },
+    "errors": {
+      "flag": "Không thể gắn cờ phiên",
+      "unflag": "Không thể bỏ gắn cờ phiên",
+      "load": "Không thể tải các phiên.",
+      "loadTranscript": "Không thể tải bản ghi phiên."
+    },
+    "messages": {
+      "flagged": "Đã gắn cờ phiên",
+      "unflagged": "Đã bỏ gắn cờ phiên"
+    },
+    "allOrganizations": "Tất cả tổ chức",
+    "allUsers": "Tất cả người dùng",
+    "from": "Từ",
+    "to": "Đến",
+    "flaggedOnly": "Chỉ đã gắn cờ",
+    "columns": {
+      "started": "Đã bắt đầu",
+      "title": "Tiêu đề",
+      "turns": "Lượt",
+      "cost": "Chi phí",
+      "flagged": "Đã gắn cờ"
+    },
+    "untitled": "Không có tiêu đề",
+    "flagged": "Đã gắn cờ",
+    "empty": "Không có phiên AI của khách hàng nào khớp với bộ lọc",
+    "pagination": "{{from}}–{{to}} của {{total}}",
+    "prev": "Trước",
+    "transcriptTitle": "Bản ghi phiên",
+    "untitledSession": "Phiên không có tiêu đề",
+    "flagReason": "Lý do gắn cờ: {{reason}}",
+    "unflag": "Bỏ gắn cờ",
+    "flag": "Gắn cờ",
+    "redacted": "đã ẩn danh: {{type}} ×{{count}}",
+    "noMessages": "Không có tin nhắn nào được lưu cho phiên này.",
+    "approvalTrail": "Luồng phê duyệt công cụ",
+    "tokenCounts": "{{input}} vào / {{output}} ra",
+    "requestedAt": "đã yêu cầu lúc {{time}}",
+    "approvedAt": "đã duyệt lúc {{time}}",
+    "rejectedAt": "đã từ chối lúc {{time}}",
+    "stoppedAt": "đã dừng lúc {{time}}",
+    "appliedAt": "đã áp dụng lúc {{time}}",
+    "flagDialog": {
+      "title": "Gắn cờ phiên",
+      "description": "Gắn cờ đánh dấu phiên để theo dõi và được ghi lại trong nhật ký kiểm toán.",
+      "reason": "Lý do (tùy chọn)",
+      "flagging": "Đang gắn cờ…"
+    },
+    "unflagDialog": {
+      "title": "Bỏ gắn cờ phiên",
+      "message": "Xóa cờ khỏi phiên này? Lịch sử gắn cờ/bỏ gắn cờ vẫn được lưu trong nhật ký kiểm toán."
+    }
+  },
+  "templatesTab": {
+    "allApps": "Tất cả ứng dụng",
+    "allOrgs": "Toàn đối tác",
+    "org": "Tổ chức",
+    "errors": {
+      "delete": "Không thể xóa mẫu",
+      "load": "Không thể tải các mẫu.",
+      "update": "Không thể cập nhật mẫu",
+      "create": "Không thể tạo mẫu"
+    },
+    "messages": {
+      "deleted": "Đã xóa mẫu \"{{name}}\"",
+      "updated": "Đã cập nhật mẫu",
+      "created": "Đã tạo mẫu"
+    },
+    "title": "Mẫu prompt",
+    "description": "Hiển thị trong trình chọn trò chuyện trống của tiện ích bổ sung. Mẫu \"Tất cả tổ chức\" áp dụng cho mọi tổ chức khách hàng; mẫu tổ chức chỉ áp dụng cho riêng họ.",
+    "newTemplate": "Mẫu mới",
+    "columns": {
+      "scope": "Phạm vi",
+      "apps": "Ứng dụng",
+      "category": "Danh mục",
+      "updated": "Đã cập nhật"
+    },
+    "empty": "Chưa có mẫu nào — hãy tạo mẫu đầu tiên",
+    "deleteDialog": {
+      "title": "Xóa mẫu",
+      "message": "Xóa \"{{name}}\"? Mẫu sẽ biến mất ngay lập tức khỏi trình chọn mẫu của tiện ích bổ sung."
+    },
+    "editTemplate": "Sửa mẫu",
+    "categoryPlaceholder": "ví dụ: tài chính",
+    "promptBody": "Nội dung prompt",
+    "partnerWide": "Tất cả tổ chức (toàn đối tác)",
+    "scopeImmutable": "Phạm vi không thể thay đổi sau khi tạo — hãy xóa và tạo lại để di chuyển.",
+    "appsHint": "Để trống tất cả để hiển thị mẫu này trong mọi ứng dụng.",
+    "saveChanges": "Lưu thay đổi",
+    "createTemplate": "Tạo mẫu"
+  },
+  "usageTab": {
+    "errors": {
+      "export": "Xuất thất bại",
+      "load": "Không thể tải báo cáo sử dụng."
+    },
+    "fromMonth": "Từ tháng",
+    "toMonth": "Đến tháng",
+    "allOrganizations": "Tất cả tổ chức",
+    "exporting": "Đang xuất…",
+    "exportCsv": "Xuất CSV",
+    "rangeError": "Tháng bắt đầu phải ≤ tháng kết thúc",
+    "columns": {
+      "orgUser": "Tổ chức / người dùng",
+      "month": "Tháng",
+      "messages": "Tin nhắn",
+      "sessions": "Phiên",
+      "tokens": "Token (vào/ra)",
+      "cost": "Chi phí"
+    },
+    "rowCount": "{{count}} hàng",
+    "rowCount_one": "{{count}} hàng",
+    "rowCount_other": "{{count}} hàng",
+    "empty": "Không có dữ liệu sử dụng trong khoảng thời gian này",
+    "total": "Tổng"
+  },
+  "workspaceChatPanel": {
+    "errors": {
+      "autoDraft": "Không thể tự động soạn thảo từ cuộc trò chuyện này — bạn có thể điền phiếu hỗ trợ thủ công.",
+      "createTicket": "Không thể tạo phiếu hỗ trợ."
+    },
+    "createTicket": "Tạo phiếu hỗ trợ",
+    "dismiss": "Bỏ qua"
+  },
+  "workspaceEmptyState": {
+    "title": "Breeze AI",
+    "description": "Chạy nhiều cuộc trò chuyện cùng lúc. Khảo sát thiết bị ở một tab trong khi bạn thiết lập chính sách ở tab khác.",
+    "newConversation": "Cuộc trò chuyện mới",
+    "limit": "Tối đa 5 cuộc trò chuyện đồng thời"
+  },
+  "workspaceTab": {
+    "approvalPending": "Đang chờ phê duyệt",
+    "renameLabel": "Đổi tên trò chuyện",
+    "renameHint": "Nhấp đúp để đổi tên"
+  },
+  "workspaceTabBar": {
+    "newTabShortcut": "Tab mới (Cmd+Shift+N)",
+    "new": "Mới"
+  },
+  "createTicketFromChatModal": {
+    "title": "Tạo phiếu hỗ trợ từ cuộc trò chuyện",
+    "subject": "Tiêu đề",
+    "problem": "Vấn đề",
+    "open": "Mở",
+    "resolved": "Đã giải quyết",
+    "resolution": "Cách giải quyết",
+    "resolutionRequired": "Cần có ghi chú giải quyết để đánh dấu đã giải quyết.",
+    "timeMinutes": "Thời gian (phút)",
+    "timeMinutesAria": "Thời gian (phút)",
+    "billable": "Tính phí được",
+    "createTicket": "Tạo phiếu hỗ trợ"
+  },
+  "scriptProposal": {
+    "title": "Script do AI tạo",
+    "goal": "Mục tiêu",
+    "expectedEffect": "Hiệu quả mong đợi",
+    "verificationClaim": "Cách xác minh điều này",
+    "rollback": "Hoàn tác",
+    "findings": "Kết quả của người đánh giá",
+    "blastRadius": "Phạm vi ảnh hưởng (khuyến nghị)",
+    "touches": "Tác động đến",
+    "devices": "Thiết bị mục tiêu",
+    "showCode": "Hiện script",
+    "hideCode": "Ẩn script",
+    "acknowledgeTitle": "Xác nhận các mẫu nguy hiểm",
+    "acknowledgeRequirement": "Việc xác nhận yêu cầu quyền ghi script và lượt đăng nhập MFA gần đây.",
+    "acknowledgeIncomplete": "Xác nhận mọi mẫu để phê duyệt.",
+    "expiresIn": "Hết hạn sau {{duration}}",
+    "requestChanges": "Yêu cầu thay đổi",
+    "notePlaceholder": "Tác giả nên thay đổi gì?",
+    "noteRequired": "Bắt buộc phải có ghi chú.",
+    "sendBack": "Gửi lại cho tác giả",
+    "severityInfo": "Thông tin",
+    "severityWarning": "Cảnh báo",
+    "severityBlocking": "Chặn",
+    "saveToLibrary": "Lưu vào thư viện",
+    "verificationPending": "Đang chờ xác minh",
+    "verified": "Đã xác minh",
+    "verificationFailed": "Xác minh thất bại",
+    "verificationUnknown": "Không thể xác minh",
+    "notRunAwaitingReview": "Đang chờ đánh giá — chưa chạy",
+    "notRunReviewed": "Đã đánh giá — chưa chạy",
+    "notRunApproved": "Đã phê duyệt — chưa chạy",
+    "notRun": "Chưa chạy",
+    "reviewVerdictApprove": "Người đánh giá khuyên phê duyệt",
+    "reviewVerdictChanges": "Người đánh giá khuyên thay đổi",
+    "reviewVerdictReject": "Người đánh giá khuyên từ chối",
+    "promoteDescription": "Mô tả (tùy chọn)",
+    "ownerScopeOrganization": "Chỉ tổ chức này",
+    "ownerScopePartner": "Tất cả tổ chức thuộc đối tác này",
+    "nameRequired": "Bắt buộc phải có tên."
+  },
+  "aiRunCard": {
+    "title": "Đã chạy phân tích",
+    "openRun": "Mở bản chạy đầy đủ",
+    "resultOnRunPage": "Việc này hoàn tất sau khi cuộc trò chuyện đã chuyển đi — kết quả đầy đủ được lưu trên trang chạy.",
+    "status": {
+      "queued": "đã xếp hàng",
+      "running": "đang xử lý",
+      "completed": "đã hoàn thành",
+      "failed": "thất bại",
+      "cancelled": "đã hủy",
+      "expired": "đã hết hạn",
+      "skipped": "đã bỏ qua"
+    }
+  },
+  "aiModelPicker": {
+    "chooseModel": "Chọn một mô hình",
+    "default": "(mặc định)",
+    "suggested": "Được đề xuất",
+    "context": "Ngữ cảnh {{size}}",
+    "price": "{{input}} vào / {{output}} ra trên M token",
+    "requiresRole": "Yêu cầu {{roles}}",
+    "requiresPermission": "Yêu cầu quyền sử dụng mô hình AI cao cấp",
+    "effort": "Mức độ",
+    "effortDefault": "Mặc định",
+    "effortLevels": {
+      "low": "Thấp",
+      "medium": "Trung bình",
+      "high": "Cao",
+      "xhigh": "Rất cao",
+      "max": "Tối đa"
+    },
+    "fast": "Nhanh ({{input}} vào / {{output}} ra mỗi M)",
+    "thinking": "Đang suy nghĩ"
+  },
+  "aiThinking": {
+    "label": "Đang suy nghĩ… {{seconds}}s"
+  },
+  "aiTurnModel": {
+    "answeredBy": "Được trả lời bởi {{model}}",
+    "fast": "Nhanh",
+    "fellBack": "{{requested}} bị từ chối; mô hình khác đã trả lời",
+    "fastDowngraded": "Tốc độ nhanh không khả dụng; chạy ở tốc độ chuẩn"
+  },
+  "aiContinuation": {
+    "reason": {
+      "cross_connection": "{{model}} chạy trên kết nối AI khác, do đó đoạn chat này không thể chuyển sang mô hình đó.",
+      "connection_changed": "Kết nối AI đã thay đổi kể từ lần trả lời cuối, do đó đoạn chat này không thể đổi mô hình.",
+      "transcript_too_large": "Cuộc trò chuyện này quá dài đối với {{model}}.",
+      "fit_unverifiable": "Breeze không thể xác nhận cuộc trò chuyện này phù hợp với {{model}}."
+    },
+    "messageKept": "Tin nhắn của bạn được giữ lại. Tiếp tục trong đoạn chat mới bắt đầu từ phần tóm tắt của đoạn chat này, hoặc giữ nguyên mô hình hiện tại.",
+    "continue": "Tiếp tục với {{model}} trong đoạn chat mới",
+    "keep": "Giữ mô hình hiện tại",
+    "created": "Đã bắt đầu đoạn chat mới trên {{model}} từ phần tóm tắt.",
+    "failed": "Không thể bắt đầu đoạn chat mới. Vui lòng thử lại.",
+    "openFailed": "Đã tạo đoạn chat mới nhưng không thể mở. Tìm trong lịch sử trò chuyện của bạn; tin nhắn của bạn chưa được gửi."
+  },
+  "buyCredits": {
+    "link": "Mua tín dụng"
+  },
+  "wisp": {
+    "title": "Wisp",
+    "turnLimitRolled": "Cuộc trò chuyện này đã đạt giới hạn lượt, vì vậy Wisp đã mở một phiên mới trên chủ đề này. Gửi lại tin nhắn của bạn.",
+    "locked": {
+      "why": "Wisp khả dụng trên gói Pro trở lên.",
+      "server": "Wisp chạy trên Breeze Cloud. Tính năng này không khả dụng trên máy chủ này."
+    },
+    "modal": {
+      "title": "Bật Wisp",
+      "refreshTitle": "Làm mới quyền Wisp",
+      "scopeLabel": "Wisp có thể hoạt động trên",
+      "scopeOrg": "Tổ chức này",
+      "scopePartner": "Tất cả tổ chức",
+      "explain": "Wisp hoạt động trong giới hạn quyền hạn của bạn. Xác nhận đó là bạn để tiếp tục.",
+      "code": "Mã xác thực",
+      "passkey": "Bạn sẽ xác nhận bằng khóa thông hành (passkey).",
+      "noFactor": "Wisp cần khóa thông hành hoặc ứng dụng xác thực. Hãy thiết lập trong hồ sơ của bạn trước.",
+      "noOrg": "Hãy chọn một tổ chức ở tiêu đề trước.",
+      "confirm": "Xác nhận",
+      "cancel": "Hủy",
+      "stepUpUnavailable": "Không thể xác minh yếu tố của bạn. Vui lòng thử lại.",
+      "reverify": "Quyền hạn của bạn đã thay đổi trong lúc xác nhận. Nhập mã mới để tiếp tục.",
+      "invalidCode": "Mã đó không được chấp nhận. Vui lòng thử lại.",
+      "turningOn": "Đang bật Wisp…",
+      "alreadyOnOrg": "Wisp đã được bật cho tổ chức này.",
+      "alreadyOnPartner": "Wisp đã được bật cho tất cả các tổ chức.",
+      "open": "Mở",
+      "opening": "Đang mở…",
+      "grantEnded": "Wisp không còn bật cho phạm vi này. Xác nhận đó là bạn để bật lại."
+    },
+    "header": {
+      "scopeAll": "Tất cả tổ chức",
+      "scopeFallback": "tổ chức này",
+      "status": {
+        "active": "Đang hoạt động",
+        "paused": "Đã tạm dừng",
+        "revoked": "Đã thu hồi",
+        "expired": "Đã hết hạn",
+        "budgetReached": "Đã đạt hạn mức"
+      },
+      "refresh": "Làm mới quyền",
+      "revoke": "Tắt Wisp",
+      "revokeConfirm": "Tắt Wisp cho phạm vi này? Wisp sẽ ngừng hoạt động đối với bạn và các luồng của nó sẽ đóng lại. Các cuộc trò chuyện, vấn đề và hoạt động của chúng sẽ không còn hiển thị.",
+      "widening": "Bạn có thể làm nhiều hơn mức quyền này cho phép — hãy làm mới quyền để Wisp tiếp tục theo kịp.",
+      "refreshKeepsTerms": "Cuộc trò chuyện này giữ các điều khoản quyền trước đó. Bắt đầu cuộc trò chuyện mới để sử dụng quyền đã làm mới.",
+      "startNewConversation": "Bắt đầu cuộc trò chuyện mới",
+      "dismissNote": "Bỏ qua"
+    },
+    "settings": {
+      "title": "Hạn mức và kiểm tra",
+      "budget": "Hạn mức hàng ngày",
+      "tick": "Kiểm tra sau mỗi (phút)",
+      "save": "Lưu"
+    },
+    "focus": {
+      "label": "Đang làm việc với",
+      "none": "Không tập trung vào khách hàng",
+      "pick": "Tập trung vào một khách hàng…",
+      "clear": "Xóa tập trung"
+    },
+    "attachments": {
+      "title": "Được đính kèm vào luồng này",
+      "drop": "Thả luồng email, tệp .eml hoặc CSV vào đây, hoặc dán văn bản",
+      "paste": "Dán văn bản",
+      "label": "Nhãn",
+      "add": "Đính kèm",
+      "empty": "Chưa có tệp đính kèm",
+      "expires": "Hết hạn vào {{date}}",
+      "limits": "Tối đa 20 tệp, mỗi tệp 5 MB, chỉ văn bản",
+      "focusRequired": "Chọn khách hàng tập trung trước khi đính kèm",
+      "loadFailed": "Không thể tải tệp đính kèm"
+    },
+    "toast": {
+      "on": "Wisp đang bật",
+      "onFailed": "Không thể bật Wisp",
+      "off": "Wisp đang tắt",
+      "offFailed": "Không thể tắt Wisp",
+      "refreshed": "Đã làm mới quyền",
+      "refreshFailed": "Không thể làm mới quyền",
+      "grantCheckFailed": "Không thể kiểm tra quyền Wisp của bạn, vì vậy cuộc trò chuyện này bắt đầu dưới dạng cuộc trò chuyện Breeze AI.",
+      "settingsSaved": "Đã lưu cài đặt Wisp",
+      "settingsFailed": "Không thể lưu cài đặt Wisp",
+      "focusSet": "Wisp hiện đang hoạt động trên {{org}}",
+      "focusCleared": "Đã xóa tập trung vào khách hàng",
+      "focusFailed": "Không thể thay đổi tập trung",
+      "attached": "Đã đính kèm vào luồng",
+      "attachFailed": "Không thể đính kèm",
+      "attachTooLarge": "Tệp đó vượt quá 5 MB",
+      "attachUnsupported": "Chỉ có thể đính kèm tệp văn bản",
+      "threadFailed": "Wisp đang bật, nhưng không thể mở luồng của nó. Thử lại để mở lại.",
+      "paused": "Đã tạm dừng Wisp",
+      "resumed": "Đã tiếp tục Wisp",
+      "pauseFailed": "Không thể tạm dừng Wisp",
+      "resumeFailed": "Không thể tiếp tục Wisp"
+    },
+    "spend": {
+      "meter": "{{spent}} / {{budget}} hôm nay",
+      "resets": "đặt lại sau {{hours}} giờ",
+      "raise": "Tăng hạn mức hôm nay",
+      "atCeiling": "Hạn mức hôm nay đã đạt giới hạn của gói.",
+      "seePlans": "Xem các gói",
+      "label": "Chi tiêu Wisp hôm nay"
+    },
+    "pause": "Tạm dừng Wisp",
+    "resume": "Tiếp tục",
+    "paused": {
+      "byYou": "Bạn đã tạm dừng Wisp. Wisp sẽ không kiểm tra hay nhắc nhở bạn cho đến khi bạn tiếp tục.",
+      "partnerDisabled": "Wisp đã bị tắt đối với đối tác của bạn. Quản trị viên có thể bật lại.",
+      "system": {
+        "budgetExhausted": "Đã tạm dừng bởi Breeze: đã dùng hết hạn mức hôm nay. Hạn mức sẽ đặt lại sau {{hours}} giờ.",
+        "budgetExhaustedNoTime": "Đã tạm dừng bởi Breeze: đã dùng hết hạn mức hôm nay.",
+        "grantorAccessLost": "Đã tạm dừng bởi Breeze: quyền truy cập của bạn không còn bao gồm quyền này. Wisp sẽ tự động tiếp tục khi quyền truy cập của bạn được khôi phục.",
+        "grantorSuspended": "Đã tạm dừng bởi Breeze: tài khoản của bạn bị đình chỉ. Wisp sẽ tự động tiếp tục khi việc đình chỉ được gỡ bỏ.",
+        "factorExpired": "Đã tạm dừng bởi Breeze: quá trình kiểm tra đăng nhập cho quyền này đã hết hạn.",
+        "entitlementLost": "Đã tạm dừng bởi Breeze: gói của bạn không còn bao gồm Wisp. Wisp sẽ tự động tiếp tục khi gói của bạn có lại tính năng này.",
+        "unknown": "Đã tạm dừng bởi Breeze. Bạn không thể tiếp tục từ đây."
+      }
+    },
+    "live": {
+      "checking": "Đang kiểm tra {{org}}…",
+      "checkingUnnamed": "Đang kiểm tra khách hàng…"
+    },
+    "thread": {
+      "notFound": "Luồng Wisp này không tồn tại hoặc không phải của bạn.",
+      "loadFailed": "Không thể tải luồng Wisp này.",
+      "retry": "Thử lại",
+      "stale": "Không thể làm mới luồng này. Nội dung bạn thấy có thể đã lỗi thời."
+    },
+    "activity": {
+      "title": "Hoạt động",
+      "empty": "Chưa có gì. Công việc của Wisp sẽ hiển thị ở đây.",
+      "loadFailed": "Không thể tải hoạt động",
+      "loadMore": "Tải thêm",
+      "cost": "Chi phí {{amount}}",
+      "kind": {
+        "assessment": "Kiểm tra",
+        "concern": "Vấn đề",
+        "specialist": "Chuyên gia",
+        "approval": "Phê duyệt",
+        "memory": "Bộ nhớ",
+        "nudge": "Nhắc nhở",
+        "brief": "Tóm tắt"
+      },
+      "show": "Hiển thị",
+      "hide": "Ẩn",
+      "count_one": "{{count}} gần đây",
+      "count_other": "{{count}} gần đây"
+    },
+    "home": {
+      "briefSentAt": "Đã gửi {{time}}",
+      "briefStale": "Từ ngày hôm trước",
+      "needsYouTitle": "Cần bạn chú ý",
+      "needsYouCount_one": "{{count}} mục",
+      "needsYouCount_other": "{{count}} mục",
+      "needsYouApprovals_one": "{{count}} mục chờ bạn phê duyệt",
+      "needsYouApprovals_other": "{{count}} mục chờ bạn phê duyệt",
+      "threadPaused": "Wisp đang tạm dừng. Tiếp tục từ tiêu đề để tiếp tục trò chuyện.",
+      "threadEnded": "Việc ủy quyền này đã kết thúc. Bắt đầu lượt mới để trò chuyện với Wisp.",
+      "threadOpening": "Đang mở cuộc trò chuyện…",
+      "threadOpenFailed": "Không thể mở cuộc trò chuyện.",
+      "threadDismissError": "Bỏ qua",
+      "openChats": "Tất cả trò chuyện",
+      "memory": "Bộ nhớ",
+      "startTitle": "Giao việc cho Wisp",
+      "startBody": "Wisp theo dõi thiết bị, phiếu hỗ trợ và thanh toán của bạn theo quyền ủy quyền do bạn kiểm soát, đồng thời mang đến cho bạn những việc cần quyết định.",
+      "startAction": "Bắt đầu Wisp",
+      "disabledTitle": "Wisp đang tắt",
+      "disabledBody": "Quản trị viên đối tác đã tắt Wisp trong Cài đặt → Tác nhân AI. Các cuộc trò chuyện của bạn vẫn hoạt động.",
+      "disabledSettings": "Mở cài đặt Tác nhân AI",
+      "loadFailed": "Không thể tải trang chính của Wisp.",
+      "noAccess": "Bạn không có quyền truy cập Wisp",
+      "historyFailed": "Không thể tải cuộc trò chuyện này.",
+      "refreshFailed": "Không thể kiểm tra bài viết mới.",
+      "earlierFailed": "Không thể tải tin nhắn cũ hơn."
+    },
+    "links": {
+      "title": "Mục đã liên kết",
+      "empty": "Chưa liên kết mục nào. Hãy liên kết phiếu hỗ trợ, thiết bị hoặc hóa đơn để Wisp ghi nhớ.",
+      "add": "Liên kết mục",
+      "remove": "Xóa {{label}}",
+      "removed": "Đã hủy liên kết",
+      "removeFailed": "Không thể xóa liên kết.",
+      "addedByWisp": "Được thêm bởi Wisp",
+      "added": "Đã liên kết với Wisp",
+      "addFailed": "Không thể liên kết mục đó.",
+      "count": "Đã liên kết {{count}}/{{max}}",
+      "groupPinned": "Đã ghim",
+      "groupConcerns": "Vấn đề cần lưu ý",
+      "groupRecent": "Gần đây",
+      "pin": "Ghim",
+      "dismiss": "Bỏ qua",
+      "more": "Thêm",
+      "neighbours": "Mục liên quan"
+    },
+    "picker": {
+      "title": "Liên kết một mục với Wisp",
+      "searchPlaceholder": "Tìm theo tên hoặc số",
+      "kindsLabel": "Loại mục",
+      "kinds": {
+        "ticket": "Phiếu hỗ trợ",
+        "quote": "Báo giá",
+        "invoice": "Hóa đơn",
+        "contract": "Hợp đồng",
+        "device": "Thiết bị",
+        "organization": "Tổ chức",
+        "site": "Chi nhánh",
+        "alert": "Cảnh báo",
+        "run": "Lần chạy tác nhân",
+        "task": "Tác vụ AI",
+        "user": "Người dùng"
+      },
+      "loading": "Đang tìm kiếm…",
+      "empty": "Không có kết quả.",
+      "loadFailed": "Không thể tải danh sách này.",
+      "alreadyLinked": "Đã liên kết",
+      "close": "Đóng"
+    },
+    "sidebar": {
+      "openHome": "Mở trong Wisp",
+      "meetWisp": "Giới thiệu về Wisp"
+    },
+    "partnerSwitch": {
+      "description": "Cho phép kỹ thuật viên ủy quyền công việc cho Wisp. Tắt tính năng này sẽ tạm dừng mọi ủy quyền đang chạy ở lần kiểm tra tiếp theo và chặn các ủy quyền mới; không có gì bị xóa và bật lại sẽ tiếp tục những gì đã tạm dừng.",
+      "label": "Cho phép Wisp",
+      "savedOn": "Đã bật Wisp",
+      "savedOff": "Đã tắt Wisp",
+      "saveFailed": "Không thể thay đổi cài đặt Wisp.",
+      "adminOnly": "Chỉ quản trị viên đối tác mới có thể thay đổi điều này.",
+      "loadFailed": "Không thể tải cài đặt Wisp."
+    },
+    "post": {
+      "brief": "Tóm tắt buổi sáng",
+      "nudge": "Nhắc nhở",
+      "digest": "Bản tin tổng hợp",
+      "summary": "Tóm tắt",
+      "open": "Mở",
+      "unread": "Chưa đọc"
+    },
+    "welcome": {
+      "title": "Tôi đang xem xét {{scope}}.",
+      "body": "Bản tóm tắt đầu tiên của bạn sẽ đến vào mỗi buổi sáng sau khi tôi xem qua. Hãy hỏi tôi bất cứ điều gì trong lúc chờ đợi.",
+      "suggestions": {
+        "needsMe": {
+          "label": "Hôm nay có việc gì cần tôi?",
+          "prompt": "Hôm nay có gì cần tôi chú ý? Nói ngắn gọn thôi."
+        },
+        "offline": {
+          "label": "Thiết bị nào ngoại tuyến?",
+          "prompt": "Thiết bị nào của tôi đang ngoại tuyến ngay bây giờ?"
+        },
+        "sweep": {
+          "label": "Chạy quét tình trạng",
+          "prompt": "Chạy quét tình trạng trên {{scope}} ngay."
+        },
+        "overnight": {
+          "label": "Đã có chuyện gì xảy ra trong đêm?",
+          "prompt": "Đã có chuyện gì xảy ra với khách hàng của tôi trong đêm?"
+        }
+      }
+    },
+    "rail": {
+      "workersTitle": "Tác vụ",
+      "workersEmpty": "Không có chuyên gia nào đang chạy.",
+      "allRuns": "Tất cả các lần chạy",
+      "details": "Chi tiết",
+      "ended": "Ủy quyền này đã kết thúc, do đó các vấn đề, tác vụ và hoạt động của nó không còn được hiển thị nữa."
+    },
+    "composer": {
+      "placeholder": "Nhắn tin cho Wisp",
+      "link": "Liên kết mục"
+    },
+    "talk": {
+      "openFailed": "Không thể mở trò chuyện: {{message}}",
+      "button": "Trò chuyện với Wisp",
+      "buttonPlain": "Hỏi AI về việc này",
+      "draft": "Giới thiệu về {{label}}: ",
+      "switchFocus": "Wisp đang tập trung vào {{from}}. Chuyển sang {{to}}?"
+    }
+  },
+  "wispConcerns": {
+    "title": "Vấn đề",
+    "empty": "Không có gì trong tầm ngắm của Wisp lúc này.",
+    "snooze": "Tạm hoãn",
+    "snoozeOneHour": "1 giờ",
+    "snoozeTomorrow": "Đến 9:00 ngày mai",
+    "snoozeWeek": "7 ngày",
+    "dismiss": "Bỏ qua",
+    "resolve": "Giải quyết",
+    "resolveOutcomePlaceholder": "Đã có chuyện gì xảy ra?",
+    "resolveSubmit": "Đánh dấu đã giải quyết",
+    "snoozed": "Đã tạm hoãn",
+    "dismissed": "Đã bỏ qua",
+    "resolved": "Đã giải quyết",
+    "quietUntil": "tắt thông báo đến {{when}}",
+    "digestOnly": "chỉ bản tin tổng hợp",
+    "showAll": "Hiển thị tất cả",
+    "showLive": "Hiển thị mục mở",
+    "loadFailed": "Không thể tải các vấn đề",
+    "actionFailed": "Thao tác đó không thành công. Thử lại.",
+    "severity": {
+      "high": "Cao",
+      "medium": "Trung bình",
+      "low": "Thấp",
+      "info": "Thông tin"
+    },
+    "subject": {
+      "ticket": "Phiếu hỗ trợ",
+      "device": "Thiết bị",
+      "alert": "Cảnh báo",
+      "org": "Khách hàng",
+      "integration": "Tích hợp",
+      "run": "Chạy",
+      "task": "Tác vụ",
+      "incident": "Sự cố",
+      "quote": "Báo giá",
+      "invoice": "Hóa đơn",
+      "contract": "Hợp đồng",
+      "site": "Chi nhánh",
+      "readiness": "Mức độ sẵn sàng"
+    },
+    "reviewApproval": "Xem xét phê duyệt",
+    "openLink": "Mở",
+    "useful": "Hữu ích",
+    "notUseful": "Không hữu ích",
+    "feedbackNotePlaceholder": "Điều gì có thể tốt hơn? (tùy chọn)",
+    "feedbackSend": "Gửi",
+    "feedbackGivenUseful": "Bạn đã đánh dấu đây là hữu ích",
+    "feedbackGivenNotUseful": "Bạn đã đánh dấu đây là không hữu ích",
+    "feedbackSaved": "Cảm ơn. Wisp sẽ ghi nhớ điều đó."
+  }
+}

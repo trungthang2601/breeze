@@ -16,7 +16,7 @@ import type { TrustCatalogCopy } from './types';
 export type { TrustCatalogCopy } from './types';
 
 export const TRUST_CATALOG_COPY: Record<SupportedLocale, TrustCatalogCopy> = {
-  en, 'pt-BR': ptBR, 'es-419': es419, 'fr-FR': frFR, 'fr-CA': frCA, 'de-DE': deDE, 'it-IT': itIT, 'tr-TR': trTR,
+  en, 'pt-BR': ptBR, 'es-419': es419, 'fr-FR': frFR, 'fr-CA': frCA, 'de-DE': deDE, 'it-IT': itIT, 'tr-TR': trTR, vi: en, // vi reuses English until translated
 };
 
 /** The catalog copy for `locale`; an unknown, null or undefined locale gets English. */

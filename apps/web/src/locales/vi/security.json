@@ -1,0 +1,2812 @@
+{
+  "aiRisk": {
+    "tiers": {
+      "tier1": {
+        "label": "Tier 1 — Đọc"
+      },
+      "tier2": {
+        "label": "Tier 2 — Thao tác và ghi nhật ký"
+      },
+      "tier3": {
+        "label": "Tier 3 — Hỏi trước"
+      },
+      "tier4": {
+        "label": "Tier 4 — Bị chặn"
+      }
+    }
+  },
+  "aiRiskAiRiskDashboard": {
+    "aiRiskEngine": "AI Risk Engine",
+    "analytics": "Phân tích",
+    "approvals": "Phê duyệt",
+    "denials": "Từ chối",
+    "proposals": "Đề xuất script",
+    "failedToLoadData": "Không thể tải dữ liệu",
+    "failedToLoadToolExecutions": "Không thể tải lịch sử chạy công cụ",
+    "guardrails": "Rào cản",
+    "rateLimits": "Giới hạn tần suất",
+    "refresh": "Làm mới",
+    "securityEventsCouldNotBeLoadedDenialData": "Không thể tải sự kiện bảo mật. Dữ liệu từ chối có thể không đầy đủ.",
+    "tabs": "Tab",
+    "toolExecutionGuardrailsApprovalHistoryAndAnalytics": "Rào cản chạy công cụ, lịch sử phê duyệt và phân tích",
+    "updated": "Đã cập nhật {{time}}",
+    "value24h": "24h",
+    "value30d": "30d",
+    "value7d": "7d"
+  },
+  "aiRiskScriptProposalsPanel": {
+    "title": "Đề xuất script",
+    "proposalsPerDay": "Đề xuất mỗi ngày",
+    "reviewerDisagreements": "Người đánh giá bất đồng",
+    "humanRejectedAfterApprove": "Con người từ chối, AI khuyên duyệt",
+    "humanApprovedAfterReject": "Con người duyệt, AI khuyên từ chối",
+    "unattendedRuns": "Chạy tự động",
+    "laneState": "Luồng tự động",
+    "laneOpen": "Mở (tạm dừng sau khi xác thực thất bại liên tiếp)",
+    "laneClosed": "Đóng",
+    "laneNotConfigured": "Chưa được cấu hình cho tổ chức này",
+    "noData": "Không có đề xuất script trong khoảng thời gian này"
+  },
+  "aiRiskApprovalHistoryFeed": {
+    "all2": "Tất cả",
+    "approved": "Đã phê duyệt",
+    "error": "Lỗi",
+    "exec": "Chạy: {{duration}}ms",
+    "noTier3ToolExecutionsFound": "Không tìm thấy lần chạy công cụ Tier 3 nào.",
+    "pending": "Đang chờ",
+    "rejected": "Đã từ chối",
+    "status": {
+      "pending": "Đang chờ",
+      "approved": "Đã phê duyệt",
+      "executing": "Đang chạy",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "rejected": "Đã từ chối"
+    },
+    "session": "Phiên: {{sessionId}}",
+    "tempPasswordAlreadyRevealed": "Mật khẩu tạm thời đã được hiển thị.",
+    "tempPasswordCopied": "Đã sao chép",
+    "tempPasswordCopy": "Sao chép",
+    "tempPasswordExpired": "Mật khẩu tạm thời đã hết hạn mà chưa được hiển thị.",
+    "tempPasswordForbidden": "Chỉ kỹ thuật viên yêu cầu đặt lại này mới có thể hiển thị mật khẩu.",
+    "tempPasswordReveal": "Hiển thị mật khẩu tạm thời",
+    "tempPasswordRevealFailed": "Không thể hiển thị mật khẩu tạm thời",
+    "tempPasswordShownOnce": "Lưu lại ngay — mật khẩu này sẽ không hiển thị lần nữa. Người dùng phải đổi mật khẩu khi đăng nhập lần tới.",
+    "tempPasswordTitle": "Mật khẩu tạm thời",
+    "tier3ApprovalHistory": "Lịch sử phê duyệt Tier 3",
+    "toolInput": "Đầu vào công cụ",
+    "wait": "Chờ: {{duration}}"
+  },
+  "aiRiskRateLimitStatus": {
+    "defaultLimit": "(mặc định {{limit}})",
+    "failedToLoad": "Không thể tải giới hạn tần suất hiện hành. Vui lòng thử lại sau.",
+    "filterRateLimits": "Lọc giới hạn tần suất...",
+    "limit": "Giới hạn",
+    "multiplierApplied": "Giới hạn bao gồm hệ số nhân giới hạn tần suất mỗi công cụ là {{multiplier}}×, được đặt trong cài đặt ngân sách AI.",
+    "noRateLimitsMatchYourSearch": "Không có giới hạn tần suất nào khớp với tìm kiếm của bạn.",
+    "permission": "Quyền",
+    "rateLimitConfiguration": "Cấu hình giới hạn tần suất",
+    "requestCount": "{{count}} yêu cầu",
+    "ruleCount": "{{count}} quy tắc",
+    "ruleCount_one": "{{count}} quy tắc",
+    "ruleCount_other": "{{count}} quy tắc",
+    "t": "T{{tier}}",
+    "tier": "Tier",
+    "tool": "Công cụ",
+    "window": "Khoảng thời gian"
+  },
+  "aiRiskRejectionDenialLog": {
+    "all2": "Tất cả",
+    "denied": "Bị chặn",
+    "error": "Lỗi",
+    "failed": "Thất bại",
+    "noRejectionsOrDenialsFound": "Không tìm thấy hành động bị từ chối, chặn hoặc thất bại nào.",
+    "rejected": "Đã từ chối",
+    "rejectionsAndDenials": "Đã từ chối & chặn",
+    "stopped": "Đã dừng",
+    "search": "Tìm kiếm...",
+    "session": "Phiên",
+    "status": "Trạng thái",
+    "timestamp": "Thời gian",
+    "tool": "Công cụ"
+  },
+  "aiRiskTierOverviewMatrix": {
+    "filterTools": "Lọc công cụ...",
+    "guardrailTierMatrix": "Ma trận Tier rào cản",
+    "tier": "Tier {{tier}}",
+    "toolCount": "{{count}} công cụ",
+    "toolCount_one": "{{count}} công cụ",
+    "toolCount_other": "{{count}} công cụ"
+  },
+  "aiRiskToolExecutionAnalytics": {
+    "avgDurationByToolMs": "Thời lượng TB theo công cụ (ms)",
+    "avgMs": "ms TB",
+    "executionsOverTime": "Lần chạy theo thời gian",
+    "mostUsedToolsTop10": "Công cụ dùng nhiều nhất (Top 10)",
+    "noDurationDataAvailable": "Không có dữ liệu thời lượng",
+    "noToolExecutionsInThisTimePeriod": "Không có lần chạy công cụ nào trong khoảng thời gian này.",
+    "statusDistribution": "Phân bố trạng thái",
+    "toolExecutionAnalytics": "Phân tích chạy công cụ"
+  },
+  "securityAdminAuditPage": {
+    "adminAccountAudit": "Kiểm toán tài khoản quản trị",
+    "admins": "Quản trị viên",
+    "all": "Tất cả",
+    "allOS": "Tất cả HĐH",
+    "builtIn": "Có sẵn",
+    "custom": "Tùy chỉnh",
+    "default": "Mặc định",
+    "defaultAccounts": "Tài khoản mặc định",
+    "defaultAccts": "TK mặc định",
+    "device": "Thiết bị",
+    "enabled": "Đã bật",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "issues": "Vấn đề",
+    "lastLogin": "Đăng nhập lần cuối",
+    "linux": "Linux",
+    "macos": "macOS",
+    "next": "Tiếp theo",
+    "no": "Không",
+    "noDevicesFound": "Không tìm thấy thiết bị nào.",
+    "noIssues": "Không có sự cố",
+    "none": "Không có",
+    "os": "HĐH",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "passwordAge": "Tuổi mật khẩu",
+    "previous": "Trang trước",
+    "privilegedAccountReviewAcrossAllDevices": "Xem lại tài khoản đặc quyền trên tất cả thiết bị",
+    "searchDevicesOrUsers": "Tìm kiếm thiết bị hoặc người dùng...",
+    "stale": "Cũ",
+    "staleAccounts": "Tài khoản cũ",
+    "staleAccts": "Tài khoản cũ",
+    "totalAdmins": "Tổng QTV",
+    "totalDevices": "Tổng thiết bị",
+    "type": "Loại",
+    "username": "Tên người dùng",
+    "weakPassword": "Mật khẩu yếu",
+    "weakPasswords": "Mật khẩu yếu",
+    "windows": "Windows",
+    "withIssues": "Có sự cố",
+    "yes": "Có",
+    "issueFilterLabel": "Bộ lọc sự cố",
+    "osFilterLabel": "Hệ điều hành"
+  },
+  "securityAntivirusPage": {
+    "active": "Hoạt động",
+    "allOS": "Tất cả HĐH",
+    "allStatuses": "Tất cả trạng thái",
+    "antivirusCoverage": "Độ phủ Antivirus",
+    "atRisk": "Có rủi ro",
+    "coverage": "Độ phủ",
+    "device": "Thiết bị",
+    "endpointProtectionStatusAcrossAllDevices": "Trạng thái bảo vệ điểm cuối trên tất cả thiết bị",
+    "inactive": "Không hoạt động",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "linux": "Linux",
+    "macos": "macOS",
+    "next": "Tiếp theo",
+    "noDevicesFound": "Không tìm thấy thiết bị nào.",
+    "offline": "Ngoại tuyến",
+    "os": "HĐH",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "previous": "Trang trước",
+    "protected": "Được bảo vệ",
+    "provider": "Nhà cung cấp",
+    "providerDistribution": "Phân phối nhà cung cấp",
+    "realTime": "Thời gian thực",
+    "searchDevices": "Tìm kiếm thiết bị...",
+    "status": "Trạng thái",
+    "totalDevices": "Tổng thiết bị",
+    "unknown": "Không rõ",
+    "unprotected": "Chưa bảo vệ",
+    "windows": "Windows",
+    "statusFilterLabel": "Trạng thái",
+    "osFilterLabel": "Hệ điều hành"
+  },
+  "securityDeviceSecurityStatus": {
+    "agentDefinitions": "Agent/Định nghĩa",
+    "definitionsUpdated": "Định nghĩa đã cập nhật {{time}}",
+    "detectedAV": "AV được phát hiện",
+    "deviceSecurityStatus": "Trạng thái bảo mật thiết bị",
+    "disabled": "Đã tắt",
+    "diskEncryption": "Mã hóa đĩa",
+    "enabled": "Đã bật",
+    "firewall": "Tường lửa",
+    "guardianGatekeeper": "Guardian (Gatekeeper)",
+    "lastScan": "Quét lần cuối",
+    "loadingSecurityStatus": "Đang tải trạng thái bảo mật...",
+    "noDeviceSecurityDataAvailable": "Không có dữ liệu bảo mật thiết bị.",
+    "policyEnforced": "Đã áp dụng chính sách",
+    "quickScan": "Quét nhanh",
+    "realTimeProtection": "Bảo vệ thời gian thực",
+    "reviewThreats": "Xem lại mối đe dọa",
+    "running": "Đang chạy",
+    "threatsDetectedCount": "{{count}} mối đe dọa",
+    "unknownProvider": "Nhà cung cấp không rõ",
+    "unknownVendor": "Nhà  cung cấp không rõ",
+    "unknown": "Không rõ"
+  },
+  "securityEdrPage": {
+    "endpointDetectionAndAmpResponse": "Phát hiện & Phản hồi Điểm cuối",
+    "huntressIncidents": "Sự cố Huntress",
+    "sentineloneThreats": "Mối đe dọa SentinelOne",
+    "threatsAndIncidentsAcrossYourFleetFrom": "Các mối đe dọa và sự cố trên hệ thống của bạn từ SentinelOne và Huntress.",
+    "iocScansLink": "Tìm kiếm quét Breeze IOC? →"
+  },
+  "securityOtherEdr": {
+    "tabLabel": "EDR khác",
+    "statusError": "Không thể kiểm tra các nhà cung cấp EDR khác.",
+    "title": "Phát hiện EDR khác",
+    "loading": "Đang tải phát hiện...",
+    "showing": "Hiển thị {{from}}-{{to}} của {{total}}",
+    "refresh": "Làm mới",
+    "filters": {
+      "severity": "Mức độ nghiêm trọng",
+      "status": "Trạng thái",
+      "provider": "Nhà cung cấp",
+      "allSeverities": "Tất cả mức độ",
+      "allProviders": "Tất cả nhà cung cấp",
+      "openDefault": "Mở (mặc định)",
+      "allStatuses": "Tất cả trạng thái"
+    },
+    "severities": {
+      "critical": "Nghiêm trọng",
+      "high": "Cao",
+      "medium": "Trung bình",
+      "low": "Thấp",
+      "info": "Thông tin",
+      "unknown": "Không rõ"
+    },
+    "statuses": {
+      "open": "Mở",
+      "in_progress": "Đang xử lý",
+      "mitigated": "Đã giảm nhẹ",
+      "resolved": "Đã giải quyết",
+      "false_positive": "Dương tính giả",
+      "dismissed": "Đã bỏ qua",
+      "unknown": "Không rõ"
+    },
+    "connectionStatuses": {
+      "connected": "Đã kết nối",
+      "error": "Lỗi",
+      "reauth_required": "Yêu cầu xác thực lại"
+    },
+    "tenants": {
+      "stale": "Tenant cũ",
+      "failed": "Tenant thất bại",
+      "pending": "Tenant đang chờ",
+      "unmapped": "Tenant chưa ánh xạ"
+    },
+    "openDetections": "Phát hiện đang mở",
+    "endpoints": "Điểm cuối",
+    "linkedEndpoints": "Điểm cuối đã liên kết",
+    "unhealthyEndpoints": "Điểm cuối không khỏe mạnh",
+    "lastDetectionSync": "Đồng bộ phát hiện lần cuối",
+    "never": "Không bao giờ",
+    "coverageHeading": "Thông tin độ phủ",
+    "emptyPartial": "Không có phát hiện nào được trả về. Độ phủ chưa hoàn thiện - xem ghi chú ở trên.",
+    "empty": "Không có phát hiện nào khớp với bộ lọc của bạn.",
+    "table": {
+      "provider": "Nhà cung cấp",
+      "detection": "Phát hiện",
+      "severity": "Mức độ nghiêm trọng",
+      "status": "Trạng thái",
+      "device": "Thiết bị",
+      "detected": "Đã phát hiện",
+      "actions": "Thao tác"
+    },
+    "unnamedDetection": "Phát hiện",
+    "detached": "Đã gỡ",
+    "promoteToIncident": "Chuyển thành sự cố",
+    "promoted": "Đã chuyển",
+    "alreadyPromoted": "Đã được chuyển trước đó",
+    "promoteFailed": "Không thể tạo sự cố",
+    "previous": "Trang trước",
+    "next": "Trang sau"
+  },
+  "securityEdrSummaryPanel": {
+    "edrStatusUnavailable": "Không thể tải trạng thái EDR. Làm mới để thử lại.",
+    "endpointDetectionAndAmpResponse": "Endpoint Detection & Response",
+    "huntressAgents": "Agent Huntress",
+    "huntressOpenIncidents": "Sự cố Huntress đang mở",
+    "loadingEDRPosture": "Đang tải trạng thái EDR...",
+    "sentineloneActiveThreats": "Mối đe dọa hoạt động SentinelOne",
+    "sentineloneAgents": "Agent SentinelOne"
+  },
+  "securityEncryptionPage": {
+    "allEscrowStates": "Tất cả trạng thái lưu khóa",
+    "allOS": "Tất cả HĐH",
+    "allStatuses": "Tất cả trạng thái",
+    "bitlocker": "BitLocker",
+    "device": "Thiết bị",
+    "diskEncryptionAcrossAllDevices": "Mã hóa ổ đĩa trên tất cả thiết bị",
+    "encrypted": "Đã mã hóa",
+    "encryptionStatus": "Trạng thái mã hóa",
+    "escrowed": "Đã lưu khóa",
+    "filevault": "FileVault",
+    "fullyEncrypted": "Đã mã hóa hoàn toàn",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "keyEscrowed": "Đã lưu khóa",
+    "keyMissing": "Thiếu khóa",
+    "linux": "Linux",
+    "luks": "LUKS",
+    "macos": "macOS",
+    "method": "Phương thức",
+    "missing": "Thiếu",
+    "next": "Tiếp theo",
+    "no": "Không",
+    "noDevicesFound": "Không tìm thấy thiết bị nào.",
+    "none": "Không có",
+    "unknown": "Không xác định",
+    "tpmNotReported": "Agent không báo cáo",
+    "os": "HĐH",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "partial": "Một phần",
+    "previous": "Trước",
+    "recoveryKey": "Khóa khôi phục",
+    "searchDevices": "Tìm kiếm thiết bị...",
+    "status": "Trạng thái",
+    "totalDevices": "Tổng số thiết bị",
+    "tpm": "TPM",
+    "unencrypted": "Chưa mã hóa",
+    "volume": "Phân vùng",
+    "windows": "Windows",
+    "yes": "Có",
+    "statusFilterLabel": "Trạng thái",
+    "osFilterLabel": "Hệ điều hành",
+    "escrowFilterLabel": "Lưu khóa"
+  },
+  "securityFirewallPage": {
+    "active": "Đang hoạt động",
+    "allOS": "Tất cả HĐH",
+    "allStatuses": "Tất cả trạng thái",
+    "coverage": "Độ bao phủ",
+    "device": "Thiết bị",
+    "disabled": "Đã tắt",
+    "enabled": "Đã bật",
+    "firewall": "Tường lửa",
+    "firewallStatus": "Trạng thái tường lửa",
+    "inactive": "Không hoạt động",
+    "inbound": "Đến",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "linux": "Linux",
+    "macos": "macOS",
+    "networkProtectionAcrossAllDevices": "Bảo vệ mạng trên tất cả thiết bị",
+    "next": "Tiếp theo",
+    "noDevicesFound": "Không tìm thấy thiết bị nào.",
+    "os": "HĐH",
+    "outbound": "Đi",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "previous": "Trước",
+    "profile": "Cấu hình",
+    "rules": "Quy tắc",
+    "searchDevices": "Tìm kiếm thiết bị...",
+    "status": "Trạng thái",
+    "totalDevices": "Tổng số thiết bị",
+    "windows": "Windows",
+    "statusFilterLabel": "Trạng thái",
+    "osFilterLabel": "Hệ điều hành",
+    "unknown": "Không xác định"
+  },
+  "securityHuntressIncidentList": {
+    "actions": "Thao tác",
+    "all": "tất cả",
+    "allSeverities": "Tất cả mức độ",
+    "allStatuses": "Tất cả trạng thái",
+    "category": "Danh mục",
+    "critical": "Nghiêm trọng",
+    "device": "Thiết bị",
+    "dismissed": "Đã bỏ qua",
+    "failedToCreateIncident": "Không thể tạo sự cố",
+    "high": "Cao",
+    "huntressIncidents": "Sự cố Huntress",
+    "inProgress": "Đang xử lý",
+    "incidentsMatchYourFilters": "{{count}} sự cố khớp với bộ lọc",
+    "loadingFleetIncidents": "Đang tải sự cố toàn hệ thống...",
+    "loadingHuntressIncidents": "Đang tải sự cố Huntress...",
+    "low": "Thấp",
+    "medium": "Trung bình",
+    "noHuntressIncidentsFound": "Không tìm thấy sự cố Huntress nào.",
+    "open": "Mở",
+    "promoteToIncident": "Chuyển thành sự cố",
+    "refresh": "Làm mới",
+    "reported": "Đã báo cáo",
+    "resolved": "Đã giải quyết",
+    "searchIncidents": "Tìm kiếm sự cố",
+    "severity": "Mức độ nghiêm trọng",
+    "status": "Trạng thái",
+    "title": "Tiêu đề"
+  },
+  "securityPasswordPolicyPage": {
+    "adminAccts": "TK Quản trị",
+    "all": "Tất cả",
+    "allOS": "Tất cả HĐH",
+    "commonFailures": "Lỗi phổ biến",
+    "compliance": "Tuân thủ",
+    "compliant": "Tuân thủ",
+    "current": "Hiện tại",
+    "device": "Thiết bị",
+    "fail": "Thất bại",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "linux": "Linux",
+    "localAccts": "TK Cục bộ",
+    "macos": "macOS",
+    "next": "Sau",
+    "noDevicesFound": "Không tìm thấy thiết bị nào.",
+    "nonCompliant": "Không tuân thủ",
+    "os": "HĐH",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "pass": "Đạt",
+    "passwordComplianceAcrossAllDevices": "Tuân thủ mật khẩu trên tất cả thiết bị",
+    "passwordPolicy": "Chính sách mật khẩu",
+    "previous": "Trước",
+    "required": "Bắt buộc",
+    "result": "Kết quả",
+    "rule": "Quy tắc",
+    "searchDevices": "Tìm kiếm thiết bị...",
+    "status": "Trạng thái",
+    "totalDevices": "Tổng số thiết bị",
+    "windows": "Windows",
+    "complianceFilterLabel": "Tuân thủ",
+    "osFilterLabel": "Hệ điều hành"
+  },
+  "securityRecommendationsPage": {
+    "actionFailed": "Không thể cập nhật khuyến nghị.",
+    "affectsOrgs": "Ảnh hưởng đến {{count}} tổ chức",
+    "adminAccounts": "Tài khoản Quản trị",
+    "allCategories": "Tất cả danh mục",
+    "allPriorities": "Tất cả mức ưu tiên",
+    "allStatuses": "Tất cả trạng thái",
+    "antivirus": "Phần mềm diệt virus",
+    "completed": "Đã hoàn thành",
+    "critical": "Nghiêm trọng",
+    "criticalHigh": "Nghiêm trọng + Cao",
+    "devices": "Thiết bị: {{value}}",
+    "dismiss": "Bỏ qua",
+    "dismissed": "Đã bỏ qua",
+    "effort": "Độ phức tạp: {{value}}",
+    "encryption": "Mã hóa",
+    "firewall": "Tường lửa",
+    "hideSteps": "Ẩn các bước",
+    "high": "Cao",
+    "impact": "Tác động: {{value}}",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "low": "Thấp",
+    "markComplete": "Đánh dấu hoàn thành",
+    "reopen": "Mở lại",
+    "medium": "Trung bình",
+    "next": "Sau",
+    "noRecommendationsMatchYourFilters": "Không có khuyến nghị nào khớp với bộ lọc.",
+    "open": "Mở",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "passwordPolicy": "Chính sách mật khẩu",
+    "patchCompliance": "Tuân thủ bản vá",
+    "previous": "Trước",
+    "prioritizedRemediationGuidance": "Hướng dẫn khắc phục ưu tiên",
+    "securityRecommendations": "Khuyến nghị bảo mật",
+    "total": "Tổng",
+    "vulnMgmt": "Quản lý lỗ hổng",
+    "priorityFilterLabel": "Mức ưu tiên",
+    "categoryFilterLabel": "Danh mục",
+    "statusFilterLabel": "Trạng thái",
+    "remediationSteps_one": "{{count}} bước khắc phục",
+    "remediationSteps_other": "{{count}} bước khắc phục"
+  },
+  "securityRecoveryKeysPanel": {
+    "aNewBitLockerRecoveryPasswordWillBe": "Mật khẩu khôi phục BitLocker mới sẽ được tạo và lưu trữ an toàn; khóa cũ sẽ bị xóa sau khi khóa mới được áp dụng.",
+    "accessRevealed": "đã hiển thị khóa",
+    "bitlocker": "BitLocker",
+    "cancel": "Hủy",
+    "collectNow": "Thu thập ngay",
+    "copy": "Sao chép",
+    "currentRecoveryKey": "Khóa khôi phục hiện tại",
+    "escrowed": "Đã lưu trữ {{time}}",
+    "failedToQueueKeyCollection": "Không thể đưa vào hàng đợi thu thập khóa",
+    "failedToQueueKeyRotation": "Không thể đưa vào hàng đợi xoay vòng khóa",
+    "failedToRevealRecoveryKey": "Không thể hiển thị khóa khôi phục",
+    "filevault": "FileVault",
+    "filevaultKeysCanOnlyBeCapturedBy": " Khóa FileVault chỉ có thể được lấy bằng cách xoay vòng — hãy sử dụng \"Xoay vòng khóa\" với thông tin đăng nhập của người dùng FileVault.",
+    "filevaultUsername": "Tên đăng nhập FileVault",
+    "keyCollectionQueued": "Đã xếp hàng đợi thu thập khóa",
+    "keyRotationQueuedTheNewKeyWill": "Đã xếp hàng đợi xoay vòng khóa — khóa mới sẽ được lưu trữ khi agent hoàn tất",
+    "macosOnlyRevealsTheFileVaultPersonalRecovery": "macOS chỉ hiển thị khóa khôi phục cá nhân FileVault khi khóa đó được xoay vòng và việc xoay vòng phải được ủy quyền bởi người dùng được bật FileVault (hoặc khóa khôi phục hiện tại). Thông tin đăng nhập chỉ được sử dụng một lần và không được lưu trữ.",
+    "noRecoveryKeysEscrowed": "Không có khóa khôi phục nào được lưu trữ.",
+    "or": "— hoặc —",
+    "password": "Mật khẩu",
+    "recentAccess": "Truy cập gần đây",
+    "recoveryKeyEscrowIsNotSupportedOn": " Lưu trữ khóa khôi phục không được hỗ trợ trên Linux.",
+    "recoveryKeys": "Khóa khôi phục",
+    "reveal": "Hiển thị",
+    "rotate": "Xoay vòng",
+    "rotateKey": "Xoay vòng khóa",
+    "rotateRecoveryKey": "Xoay vòng khóa khôi phục",
+    "rotateVolume": "Ổ đĩa",
+    "thisAccessHasBeenRecordedInThe": "Truy cập này đã được ghi lại trong nhật ký kiểm toán."
+  },
+  "securityS1ThreatList": {
+    "actions": "Thao tác",
+    "active": "Đang hoạt động",
+    "all": "tất cả",
+    "severityFilterLabel": "Mức độ nghiêm trọng",
+    "statusFilterLabel": "Trạng thái",
+    "allSeverities": "Tất cả mức độ",
+    "allStatuses": "Tất cả trạng thái",
+    "critical": "Nghiêm trọng",
+    "detected": "Đã phát hiện",
+    "device": "Thiết bị",
+    "endDate": "Ngày kết thúc",
+    "failedToCreateIncident": "Không thể tạo sự cố",
+    "high": "Cao",
+    "inProgress": "Đang xử lý",
+    "loadingFleetThreats": "Đang tải mối đe dọa của hệ thống...",
+    "loadingSentinelOneThreats": "Đang tải mối đe dọa SentinelOne...",
+    "low": "Thấp",
+    "medium": "Trung bình",
+    "noSentinelOneThreatsFound": "Không tìm thấy mối đe dọa SentinelOne nào.",
+    "promoteToIncident": "Chuyển thành Sự cố",
+    "quarantined": "Đã cách ly",
+    "refresh": "Làm mới",
+    "resolved": "Đã giải quyết",
+    "searchThreats": "Tìm kiếm mối đe dọa",
+    "sentineloneThreats": "Mối đe dọa SentinelOne",
+    "severity": "Mức độ nghiêm trọng",
+    "startDate": "Ngày bắt đầu",
+    "status": "Trạng thái",
+    "threat": "Mối đe dọa",
+    "threatsMatchYourFilters": "{{count}} mối đe dọa khớp với bộ lọc của bạn",
+    "unknownThreat": "Mối đe dọa không xác định"
+  },
+  "securityScoreDetailPage": {
+    "a": "A",
+    "a2": "A+",
+    "a3": "A-",
+    "affected": "Đã ảnh hưởng",
+    "b": "B",
+    "b2": "B+",
+    "b3": "B-",
+    "c": "C",
+    "c2": "C+",
+    "c3": "C-",
+    "category": "Danh mục",
+    "dataMayBeOutdated": "Dữ liệu có thể đã cũ — {{error}}",
+    "devicesAudited": "Thiết bị đã kiểm tra",
+    "grade": "Xếp hạng",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "overallScore": "Điểm tổng thể",
+    "retry": "Thử lại",
+    "score": "Điểm",
+    "scoreBreakdownByCategory": "Phân tích điểm theo danh mục",
+    "securityScore": "Điểm bảo mật",
+    "status": "Trạng thái",
+    "unableToLoadScoreData": "Không thể tải dữ liệu điểm.",
+    "weight": "Trọng số",
+    "weighted": "Đã có trọng số"
+  },
+  "securitySecurityDashboard": {
+    "acrossAllAssets": "Trên tất cả tài sản",
+    "actionsPrioritized_one": "{{countLabel}} hành động được ưu tiên",
+    "actionsPrioritized_other": "{{countLabel}} hành động được ưu tiên",
+    "adminAccountAudit": "Kiểm toán tài khoản quản trị",
+    "antivirusCoverage": "Độ bao phủ Antivirus",
+    "bitlockerEnabled": "Đã bật BitLocker",
+    "complianceRate": "Tỷ lệ tuân thủ",
+    "compliant": "tuân thủ",
+    "critical": "Nghiêm trọng",
+    "dataUnavailable": "Không có dữ liệu",
+    "defaultAdmins": "Quản trị viên mặc định",
+    "devicesAudited": "{{count}} thiết bị đã kiểm tra",
+    "devicesFlagged": "{{count}} thiết bị bị đánh dấu",
+    "devicesReviewed_one": "{{countLabel}} thiết bị được xem xét",
+    "devicesReviewed_other": "{{countLabel}} thiết bị được xem xét",
+    "devicesTracked": "{{count}} thiết bị được theo dõi",
+    "disabled": "Đã tắt",
+    "diskProtection": "Bảo vệ ổ đĩa",
+    "elevated": "Đã nâng quyền",
+    "enabled": "Đã bật",
+    "encryptionStatus": "Trạng thái mã hóa",
+    "filevaultEnabled": "Đã bật FileVault",
+    "firewallStatus": "Trạng thái tường lửa",
+    "goToDevices": "Đi tới thiết bị",
+    "high": "Cao",
+    "highRisk": "Rủi ro cao",
+    "low": "Thấp",
+    "medium": "Trung bình",
+    "moreDevices": "+{{count}} mục khác",
+    "networkDefense": "Phòng thủ mạng",
+    "noDataAvailable": "Không có dữ liệu",
+    "noDevicesReportingYet": "Chưa có thiết bị nào báo cáo",
+    "noRecommendationsRightNowKeepMonitoringFor": "Chưa có khuyến nghị nào. Tiếp tục theo dõi để có hướng dẫn mới.",
+    "noWeakAdminAccountsDetected": "Không phát hiện tài khoản quản trị yếu nào.",
+    "openItems_one": "{{countLabel}} mục mở",
+    "openItems_other": "{{countLabel}} mục mở",
+    "overallPosture": "Tình trạng tổng thể",
+    "passwordPolicy": "Chính sách mật khẩu",
+    "policyAdherence": "Tuân thủ chính sách",
+    "privilegedAccess": "Truy cập đặc quyền",
+    "protected": "Được bảo vệ",
+    "realTimeProtection": "Bảo vệ thời gian thực",
+    "refresh": "Làm mới",
+    "remediationGuidance": "Hướng dẫn khắc phục",
+    "retry": "Thử lại",
+    "scoreMovementOverTime": "Biến động điểm theo thời gian",
+    "security": "Bảo mật",
+    "securityDataCouldNotBeLoaded": "Không thể tải dữ liệu bảo mật. Kiểm tra kết nối và thử lại.",
+    "securityPostureAppearsOnceDevicesReport": "Tình trạng bảo mật sẽ hiển thị ở đây sau khi thiết bị được đăng ký và bắt đầu báo cáo.",
+    "securityRecommendations": "Khuyến nghị bảo mật",
+    "securityScore": "Điểm bảo mật",
+    "securityScoreTrend": "Xu hướng điểm bảo mật",
+    "someSecurityDataCouldNotBeLoaded": "Không thể tải một số dữ liệu bảo mật. Các giá trị hiển thị có thể không đầy đủ.",
+    "accessDeniedMessage": "Bạn không có quyền xem dữ liệu bảo mật cho tổ chức này.",
+    "someSecurityDataPermissionDenied": "Bạn không thể nhìn thấy một số dữ liệu bảo mật. Hãy yêu cầu quản trị viên nếu bạn cần quyền truy cập.",
+    "strong": "Mạnh",
+    "trackProtectionCoverageVulnerabilitiesAndPolicyCompliance": "Theo dõi độ bao phủ bảo vệ, lỗ hổng và tuân thủ chính sách.",
+    "trendInsights": "Thông tin chi tiết về xu hướng",
+    "unprotected": "Không được bảo vệ",
+    "updated": "Đã cập nhật {{time}}",
+    "viewDetails": "Xem chi tiết",
+    "vulnerabilities": "Lỗ hổng",
+    "weakAdmins": "Quản trị viên yếu",
+    "unknown": "Không xác định",
+    "bitlockerPartial": "BitLocker một phần",
+    "filevaultPartial": "FileVault một phần",
+    "refreshTooltip": "Tải lại ảnh chụp nhanh bảo mật mới nhất. Điểm số được tính toán lại theo lịch trình, không phải khi nhấp."
+  },
+  "securitySecurityPageHeader": {
+    "refresh": "Làm mới",
+    "security": "Bảo mật"
+  },
+  "securitySecurityPolicyEditor": {
+    "actions": "Hành động",
+    "add": "Thêm",
+    "addPathOrProcess": "Thêm đường dẫn hoặc tiến trình",
+    "allOrganizations": "Tất cả tổ chức",
+    "autoQuarantine": "Tự động cách ly",
+    "behavioralMonitoring": "Giám sát hành vi",
+    "blockUntrustedUSBDevices": "Chặn thiết bị USB không đáng tin cậy",
+    "cloudThreatLookup": "Tra cứu mối đe dọa trên đám mây",
+    "cron": "Cron:",
+    "dayOfMonth": "Ngày trong tháng",
+    "dayOfWeek": "Ngày trong tuần",
+    "description": "Mô tả",
+    "detectSuspiciousProcessBehaviorAndScripts": "Phát hiện hành vi tiến trình và tập lệnh đáng ngờ.",
+    "disabled": "Đã tắt",
+    "enabled": "Đã bật",
+    "exclusions": "Ngoại lệ",
+    "failedToLoadPolicy": "Không thể tải chính sách",
+    "failedToSavePolicy": "Không thể lưu chính sách",
+    "fri": "Thứ 6",
+    "hour": "Giờ",
+    "minute": "Phút",
+    "mon": "Thứ 2",
+    "moveThreatsToQuarantineImmediately": "Chuyển ngay các mối đe dọa vào cách ly.",
+    "notifyUserOnDetection": "Thông báo cho người dùng khi phát hiện",
+    "partnerWideTemplate": "(mẫu toàn đối tác)",
+    "policyName": "Tên chính sách",
+    "preventUnknownRemovableMedia": "Chặn thiết bị lưu trữ di động không xác định.",
+    "realTimeFileMonitoring": "Giám sát tệp thời gian thực",
+    "realTimeProtection": "Bảo vệ thời gian thực",
+    "sat": "Thứ 7",
+    "savePolicy": "Lưu chính sách",
+    "saving": "Đang lưu...",
+    "scanNewAndModifiedFilesContinuously": "Quét liên tục các tệp mới và tệp đã sửa đổi.",
+    "scheduledScans": "Quét theo lịch",
+    "scope": "Phạm vi",
+    "securityPolicyEditor": "Trình chỉnh sửa chính sách bảo mật",
+    "sendDeviceNotificationsWhenThreatsAreFound": "Gửi thông báo thiết bị khi phát hiện mối đe dọa.",
+    "skipTrustedLocationsDuringScans": "Bỏ qua các vị trí đáng tin cậy trong khi quét.",
+    "sun": "CN",
+    "thisOrganizationOnly": "Chỉ tổ chức này",
+    "thu": "Thứ 5",
+    "tue": "Thứ 3",
+    "tuneProtectionSettingsForDeviceGroups": "Tinh chỉnh cài đặt bảo vệ cho các nhóm thiết bị.",
+    "useCloudReputationForNewIndicators": "Sử dụng độ uy tín trên đám mây cho các chỉ báo mới.",
+    "wed": "Thứ 4"
+  },
+  "securitySecurityScanManager": {
+    "scanStatus": {
+      "cancelled": "Đã hủy",
+      "expired": "Đã hết hạn"
+    },
+    "activeScans": "Quét đang hoạt động",
+    "allScanRequestsFailed": "Tất cả {{count}} yêu cầu quét đã thất bại",
+    "cData": "C:\\\\Data\\\\",
+    "customPath": "Đường dẫn tùy chỉnh",
+    "customScan": "Quét tùy chỉnh",
+    "device": "Thiết bị",
+    "devices": "Thiết bị",
+    "devicesSelected": "Đã chọn {{count}} thiết bị",
+    "devicesSelected_one": "Đã chọn {{count}} thiết bị",
+    "devicesSelected_other": "Đã chọn {{count}} thiết bị",
+    "duration": "Thời lượng",
+    "failed": "Thất bại",
+    "fullScan": "Quét toàn bộ",
+    "historyShowsTheLatestCompletedAndFailed": "Lịch sử hiển thị các lần quét đã hoàn thành và thất bại gần đây nhất.",
+    "loadingDevices": "Đang tải thiết bị...",
+    "multiSelect": "Chọn nhiều",
+    "noActiveScans": "Không có quét nào đang hoạt động.",
+    "noScanHistoryYet": "Chưa có lịch sử quét.",
+    "quickScan": "Quét nhanh",
+    "scanClean": "Sạch",
+    "scanHistory": "Lịch sử quét",
+    "scanHistoryPartiallyUnavailable": "Không thể tải lịch sử quét cho {{failed}} trong tổng số {{total}} thiết bị — danh sách này chưa đầy đủ.",
+    "scanHistoryUnavailable": "Không thể tải lịch sử quét.",
+    "scanRequestFailed": "Yêu cầu quét thất bại",
+    "scanThreatsFound_one": "Phát hiện {{count}} mối đe dọa",
+    "scanThreatsFound_other": "Phát hiện {{count}} mối đe dọa",
+    "scanTimedOut": "Hết thời gian",
+    "scanTimedOutWithCount": "Hết thời gian (đã tìm thấy {{count}})",
+    "scanType": "Loại quét",
+    "scanTypeLabel": "Quét {{type}}",
+    "scansAreQueuedImmediatelyOnSelectedDevices": "Các yêu cầu quét được xếp hàng đợi ngay lập tức trên các thiết bị đã chọn.",
+    "scansQueuedCount": "{{count}} yêu cầu quét trong hàng đợi",
+    "scansQueuedCount_one": "{{count}} yêu cầu quét trong hàng đợi",
+    "scansQueuedCount_other": "{{count}} yêu cầu quét trong hàng đợi",
+    "securityScanManager": "Trình quản lý quét bảo mật",
+    "singleSelect": "Chọn đơn",
+    "someScanRequestsFailed": "{{failed}} trong tổng số {{total}} yêu cầu quét đã thất bại",
+    "startAScan": "Bắt đầu quét",
+    "startScan": "Bắt đầu quét",
+    "startScansWatchProgressAndReviewScan": "Bắt đầu quét, theo dõi tiến trình và xem lại lịch sử quét trên các thiết bị.",
+    "started": "Đã bắt đầu lúc {{time}}",
+    "startedColumn": "Đã bắt đầu",
+    "status": "Trạng thái: {{status}}",
+    "status2": "Trạng thái",
+    "type": "Loại"
+  },
+  "securityThreatDetail": {
+    "actionFailed": "Thao tác thất bại",
+    "detected": "Đã phát hiện",
+    "device": "Thiết bị",
+    "deviceInfo": "Thông tin thiết bị",
+    "filePath": "Đường dẫn tệp",
+    "investigateContainAndResolveThisDetection": "Điều tra, cô lập và xử lý phát hiện này.",
+    "loadingThreatDetails": "Đang tải chi tiết mối đe dọa...",
+    "noRelatedThreats": "Không có mối đe dọa liên quan.",
+    "noThreatSelected": "Chưa chọn mối đe dọa nào.",
+    "otherDetectionsOnThisDevice": "Các phát hiện khác trên thiết bị này.",
+    "provider": "Nhà cung cấp",
+    "providerUnknown": "Không xác định",
+    "quarantine": "Cách ly",
+    "quarantineQueued": "Đã đưa vào hàng đợi cách ly. Thiết bị sẽ phản hồi sau.",
+    "relatedThreats": "Mối đe dọa liên quan",
+    "remove": "Gỡ bỏ",
+    "removeQueued": "Đã đưa vào hàng đợi gỡ bỏ. Thiết bị sẽ phản hồi sau.",
+    "restore": "Khôi phục",
+    "restoreQueued": "Đã đưa vào hàng đợi khôi phục. Thiết bị sẽ phản hồi sau.",
+    "severity": "Mức độ nghiêm trọng",
+    "status": "Trạng thái",
+    "threatDetail": "Chi tiết mối đe dọa",
+    "threatDetected": "Đã phát hiện mối đe dọa",
+    "threatFileWasRemovedFromEndpointStorage": "Tệp đe dọa đã bị xóa khỏi bộ nhớ của điểm cuối.",
+    "threatID": "ID mối đe dọa",
+    "threatQuarantined": "Đã cách ly mối đe dọa",
+    "threatRemoved": "Đã xóa mối đe dọa",
+    "threatStatus": "Trạng thái mối đe dọa",
+    "threatWasMovedToQuarantineByPolicy": "Mối đe dọa đã bị chuyển vào cách ly bởi chính sách hoặc thao tác của người vận hành.",
+    "timeline": "Dòng thời gian",
+    "quarantineSucceeded": "Đã cách ly mối đe dọa",
+    "restoreSucceeded": "Đã khôi phục mối đe dọa",
+    "removeSucceeded": "Đã xóa mối đe dọa",
+    "notFound": "Không tìm thấy mối đe dọa này. Có thể tệp đã bị xóa hoặc bạn không có quyền truy cập vào thiết bị của tệp đó.",
+    "relatedLoadFailed": "Không thể tải các mối đe dọa liên quan.",
+    "rule": {
+      "version": "Phiên bản {{version}}",
+      "title": "Quy tắc phát hiện",
+      "legacy": "Chữ ký tích hợp sẵn (quét kế thừa)",
+      "ruleName": "Quy tắc",
+      "ruleSet": "Bộ quy tắc",
+      "ruleSetMissing": "Bộ quy tắc không còn khả dụng",
+      "tags": "Thẻ",
+      "matchedStrings": "Chuỗi khớp",
+      "noMatchedStrings": "Không có chuỗi khớp nào được báo cáo.",
+      "sha256": "Mã SHA-256 của tệp",
+      "copy": "Sao chép SHA-256",
+      "quarantinedTo": "Đã cách ly đến (tại thời điểm quét)",
+      "quarantineFailed": "Tự động cách ly thất bại"
+    }
+  },
+  "securityThreatList": {
+    "active": "Đang hoạt động",
+    "all": "tất cả",
+    "allDevices": "Tất cả thiết bị",
+    "allSeverities": "Tất cả mức độ nghiêm trọng",
+    "allStatuses": "Tất cả trạng thái",
+    "clearSelection": "Bỏ chọn",
+    "critical": "Nghiêm trọng",
+    "detected": "Đã phát hiện",
+    "device": "Thiết bị",
+    "high": "Cao",
+    "loadingThreats": "Đang tải mối đe dọa...",
+    "low": "Thấp",
+    "medium": "Trung bình",
+    "noThreatsFound": "Không tìm thấy mối đe dọa nào.",
+    "quarantineSelected": "Cách ly mục đã chọn",
+    "quarantined": "Đã cách ly",
+    "refresh": "Làm mới",
+    "removeSelected": "Xóa mục đã chọn",
+    "removed": "Đã xóa",
+    "searchByThreatName": "Tìm kiếm theo tên mối đe dọa",
+    "selectedCount": "Đã chọn {{count}}",
+    "severity": "Mức độ",
+    "status": "Trạng thái",
+    "threat": "Mối đe dọa",
+    "threats": "Mối đe dọa",
+    "threatsMatchYourFilters": "{{count}} mối đe dọa khớp với bộ lọc của bạn",
+    "threatsMatchYourFilters_one": "{{count}} mối đe dọa khớp với bộ lọc của bạn",
+    "threatsMatchYourFilters_other": "{{count}} mối đe dọa khớp với bộ lọc của bạn",
+    "type": "Loại",
+    "actionFailed": "Thực hiện thao tác thất bại",
+    "actionQueuedCount": "Đã đưa {{count}} mối đe dọa vào hàng đợi",
+    "actionQueuedCount_one": "Đã đưa {{count}} mối đe dọa vào hàng đợi",
+    "actionQueuedCount_other": "Đã đưa {{count}} mối đe dọa vào hàng đợi"
+  },
+  "securityTrendsPage": {
+    "adminAccounts": "Tài khoản Quản trị",
+    "antivirus": "Diệt virus",
+    "change": "Thay đổi",
+    "currentScore": "Điểm số Hiện tại",
+    "dataMayBeOutdated": "Dữ liệu có thể đã lỗi thời — {{error}}",
+    "encryption": "Mã hóa",
+    "firewall": "Tường lửa",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "overall": "Tổng quan",
+    "passwordPolicy": "Chính sách Mật khẩu",
+    "patchCompliance": "Tuân thủ Bản vá",
+    "previousScore": "Điểm số Trước đó",
+    "retry": "Thử lại",
+    "scoreMovementOverTime": "Biến động điểm số theo thời gian",
+    "securityTrends": "Xu hướng Bảo mật",
+    "trend": "Xu hướng",
+    "unableToLoadTrendsData": "Không thể tải dữ liệu xu hướng.",
+    "value30Days": "30 Ngày",
+    "value7Days": "7 Ngày",
+    "value90Days": "90 Ngày",
+    "vulnMgmt": "Quản lý Lỗ hổng"
+  },
+  "securityUserRiskPage": {
+    "atRiskUsers": "Người dùng có rủi ro",
+    "couldNotSaveUserRiskFeedback": "Không thể lưu phản hồi rủi ro của người dùng",
+    "failedToLoadUserRisk": "Không thể tải rủi ro của người dùng",
+    "failedToLoadUserRiskDetail": "Không thể tải chi tiết rủi ro của người dùng",
+    "failedToLoadUserRiskEvaluation": "Không thể tải đánh giá rủi ro của người dùng",
+    "failedToLoadUserRiskScores": "Không thể tải điểm rủi ro của người dùng",
+    "falsePositive": "Dương tính giả",
+    "falsePositiveLabelSaved": "Đã lưu nhãn dương tính giả",
+    "labels": "Nhãn",
+    "loadingEvidence": "Đang tải bằng chứng",
+    "noRecentEvidenceFoundForThisScore": "Không tìm thấy bằng chứng gần đây cho điểm số này.",
+    "noUsersAreAboveTheCurrentRisk": "Không có người dùng nào vượt quá ngưỡng rủi ro hiện tại.",
+    "precision": "Độ chính xác",
+    "recentEvidence": "Bằng chứng gần đây",
+    "refresh": "Làm mới",
+    "refreshing": "Đang làm mới",
+    "repeatSignalUsers": "Người dùng lặp lại tín hiệu",
+    "retry": "Thử lại",
+    "reviewUserRiskScoresEvidenceAnd": "Xem lại điểm rủi ro của người dùng, bằng chứng đằng sau và nhãn đánh giá của bạn.",
+    "scoreImpact": "Mức độ ảnh hưởng {{value}}",
+    "scoresEvidenceAndLabelsWillAppearHere": "Điểm số, bằng chứng và nhãn sẽ hiển thị ở đây khi nhà sản xuất v0 rủi ro người dùng được bật.",
+    "selectAUserToInspectRiskEvidence": "Chọn một người dùng để kiểm tra bằng chứng rủi ro.",
+    "topDrivers": "Yếu tố chính",
+    "trainingCompletion": "Hoàn thành đào tạo",
+    "truePositive": "Âm tính giả",
+    "truePositiveLabelSaved": "Đã lưu nhãn âm tính giả",
+    "userRisk": "Rủi ro Người dùng",
+    "userRiskScoringIsDisabledForThis": "Tính năng chấm điểm rủi ro người dùng đã bị vô hiệu hóa đối với tổ chức này.",
+    "factors": {
+      "mfaRisk": {
+        "label": "Khoảng trống xác thực đa yếu tố",
+        "description": "Tài khoản chưa bật MFA."
+      },
+      "authFailureRisk": {
+        "label": "Lần đăng nhập thất bại",
+        "description": "Đăng nhập thất bại liên tục, có thể chỉ ra việc đoán mật khẩu hoặc nhồi nhét thông tin đăng nhập."
+      },
+      "sessionAnomalyRisk": {
+        "label": "Hoạt động phiên bất thường",
+        "description": "Đăng nhập từ vị trí, thiết bị lạ hoặc vào thời điểm bất thường."
+      },
+      "threatExposureRisk": {
+        "label": "Mối đe dọa phơi nhiễm",
+        "description": "Các mối đe dọa được phát hiện trên thiết bị mà người dùng này làm việc."
+      },
+      "softwareViolationRisk": {
+        "label": "Vi phạm chính sách phần mềm",
+        "description": "Phần mềm được cài đặt vi phạm chính sách phần mềm của bạn."
+      },
+      "deviceSecurityRisk": {
+        "label": "Trạng thái bảo mật thiết bị",
+        "description": "Tình trạng bảo mật yếu trên thiết bị của người dùng, chẳng hạn như thiếu bảo vệ hoặc bản vá."
+      },
+      "staleAccessRisk": {
+        "label": "Truy cập cũ",
+        "description": "Tài khoản hoặc quyền truy cập không được sử dụng trong thời gian dài."
+      },
+      "recentImpactRisk": {
+        "label": "Sự kiện rủi ro gần đây",
+        "description": "Sự kiện rủi ro được ghi lại cho người dùng này trong vài ngày qua."
+      }
+    }
+  },
+  "securityVulnerabilitiesPage": {
+    "active": "Đang hoạt động",
+    "allCategories": "Tất cả danh mục",
+    "allSeverities": "Tất cả mức độ nghiêm trọng",
+    "allStatuses": "Tất cả trạng thái",
+    "category": "Danh mục",
+    "clear": "Xóa",
+    "critical": "Nghiêm trọng",
+    "detected": "Đã phát hiện",
+    "detectedThreatsAcrossAllDevices": "Các mối đe dọa được phát hiện trên tất cả thiết bị",
+    "device": "Thiết bị",
+    "high": "Cao",
+    "invalidResponseFromServer": "Phản hồi không hợp lệ từ máy chủ",
+    "low": "Thấp",
+    "malware": "Mã độc",
+    "medium": "Trung bình",
+    "next": "Tiếp",
+    "noThreatsFound": "Không tìm thấy mối đe dọa nào.",
+    "pageOfTotal": "Trang {{page}} / {{totalPages}} (Tổng số {{total}})",
+    "previous": "Trang trước",
+    "pup": "PUP",
+    "quarantine": "Cách ly",
+    "quarantined": "Đã cách ly",
+    "ransomware": "Ransomware",
+    "remove": "Gỡ bỏ",
+    "removed": "Đã gỡ bỏ",
+    "searchThreats": "Tìm kiếm mối đe dọa...",
+    "selectAllThreats": "Chọn tất cả mối đe dọa",
+    "selectThreat": "Chọn mối đe dọa {{name}}",
+    "selectedCount": "Đã chọn {{count}}",
+    "severity": "Mức độ nghiêm trọng",
+    "spyware": "Spyware",
+    "status": "Trạng thái",
+    "threat": "Mối đe dọa",
+    "total": "Tổng số",
+    "trojan": "Trojan",
+    "vulnerabilities": "Lỗ hổng",
+    "severityFilterLabel": "Mức độ nghiêm trọng",
+    "statusFilterLabel": "Trạng thái",
+    "categoryFilterLabel": "Danh mục"
+  },
+  "pamEnforcement": {
+    "declineRecordUntrusted": "Từ chối: không có bản ghi quyết định của thiết bị",
+    "userDeclined": "Đã từ chối trên thiết bị",
+    "userDecisionPending": "Không phản hồi trên thiết bị"
+  },
+  "pamRespond": {
+    "withdrawnConflict": "Người dùng đã rút lại yêu cầu này trên thiết bị."
+  },
+  "pamWithdrawReason": {
+    "dialog_error": "Lời nhắc thất bại trên thiết bị",
+    "user_denied": "Bị từ chối bởi người dùng",
+    "user_timeout": "Không phản hồi trên thiết bị"
+  },
+  "pamPamAuditTab": {
+    "errors": {
+      "loadWithStatus": "Tải lịch sử kiểm toán thất bại (HTTP {{status}})",
+      "load": "Tải lịch sử kiểm toán thất bại",
+      "exportWithStatus": "Xuất thất bại (HTTP {{status}})",
+      "export": "Xuất thất bại"
+    },
+    "filters": {
+      "status": "Trạng thái",
+      "allStatuses": "Tất cả trạng thái",
+      "flow": "Luồng",
+      "allFlows": "Tất cả luồng",
+      "from": "Từ",
+      "to": "Đến"
+    },
+    "actions": {
+      "exporting": "Đang xuất…",
+      "exportCsv": "Xuất CSV"
+    },
+    "loading": "Đang tải lịch sử kiểm toán…",
+    "empty": {
+      "title": "Không có lịch sử phù hợp",
+      "description": "Điều chỉnh bộ lọc để xem lịch sử yêu cầu nâng quyền."
+    },
+    "table": {
+      "requested": "Đã yêu cầu",
+      "device": "Thiết bị",
+      "user": "Người dùng",
+      "target": "Mục tiêu",
+      "flow": "Luồng",
+      "status": "Trạng thái",
+      "riskTierTitle": "Bậc rủi ro {{tier}}"
+    },
+    "pagination": {
+      "previous": "Trang trước",
+      "pageOf": "Trang {{page}} / {{totalPages}}"
+    }
+  },
+  "pamPamOverviewTab": {
+    "errors": {
+      "loadWithStatus": "Tải tổng quan thất bại (HTTP {{status}})",
+      "load": "Tải tổng quan thất bại"
+    },
+    "loading": "Đang tải tổng quan…",
+    "setup": {
+      "title": "Bắt đầu với Truy cập Đặc quyền",
+      "step1BeforeLink": "Tính năng bắt lời nhắc UAC được bật theo mặc định. Cấu hình theo thiết bị tại",
+      "configurationPolicyLink": "Chính sách Cấu hình → Truy cập Đặc quyền",
+      "step1AfterLink": "liên kết tính năng.",
+      "step2": "Lời nhắc nâng quyền, yêu cầu quản trị JIT và hành động công cụ AI được xếp hàng trong tab Yêu cầu.",
+      "step3": "Phê duyệt hoặc từ chối từng yêu cầu — hoặc tạo quy tắc từ đó để tự động hóa quyết định cho lần sau."
+    },
+    "stats": {
+      "activeElevations": "Quyền nâng hoạt động",
+      "pendingRequests": "Yêu cầu chờ xử lý",
+      "recentDecisions": "Quyết định gần đây"
+    },
+    "active": {
+      "title": "Quyền nâng hoạt động",
+      "emptyTitle": "Không có quyền nâng hoạt động",
+      "emptyDescription": "Thời gian nâng quyền được phê duyệt sẽ hiển thị ở đây cho đến khi hết hạn hoặc bị thu hồi."
+    },
+    "table": {
+      "device": "Thiết bị",
+      "user": "Người dùng",
+      "target": "Mục tiêu",
+      "flow": "Luồng",
+      "status": "Trạng thái",
+      "expires": "Hết hạn"
+    },
+    "recent": {
+      "title": "Quyết định gần đây",
+      "empty": "Chưa có quyết định nào."
+    },
+    "expires": {
+      "expired": "đã hết hạn"
+    }
+  },
+  "pamPamPage": {
+    "heading": "Truy cập Đặc quyền",
+    "description": "Yêu cầu nâng quyền, quy tắc phê duyệt và lịch sử kiểm toán trên toàn bộ hệ thống.",
+    "liveStatus": {
+      "live": "Trực tuyến",
+      "offline": "Ngoại tuyến"
+    },
+    "tabs": {
+      "overview": "Tổng quan",
+      "requests": "Yêu cầu",
+      "rules": "Quy tắc",
+      "signerGroups": "Nhóm người ký",
+      "audit": "Kiểm toán"
+    }
+  },
+  "pamPamRequestsTab": {
+    "errors": {
+      "loadWithStatus": "Tải yêu cầu thất bại (HTTP {{status}})",
+      "load": "Tải yêu cầu thất bại"
+    },
+    "filters": {
+      "status": "Trạng thái",
+      "allStatuses": "Tất cả trạng thái",
+      "flow": "Luồng",
+      "allFlows": "Tất cả luồng"
+    },
+    "summary": {
+      "requestCount": "{{count}} yêu cầu",
+      "requestCount_one": "{{count}} yêu cầu",
+      "requestCount_other": "{{count}} yêu cầu"
+    },
+    "loading": "Đang tải yêu cầu…",
+    "empty": {
+      "title": "Không có yêu cầu nâng quyền",
+      "pendingDescription": "Không có gì cần xử lý. Lời nhắc UAC mới, yêu cầu quản trị JIT và hành động công cụ AI sẽ xếp hàng ở đây.",
+      "filteredDescription": "Các yêu cầu khớp với bộ lọc hiện tại sẽ hiển thị ở đây.",
+      "policyPrefix": "Không thấy các yêu cầu mong đợi? Việc bắt UAC được kiểm soát theo thiết bị tại",
+      "policyLink": "Chính sách Cấu hình → Truy cập Đặc quyền"
+    },
+    "table": {
+      "requested": "Đã yêu cầu",
+      "device": "Thiết bị",
+      "user": "Người dùng",
+      "target": "Mục tiêu",
+      "flow": "Luồng",
+      "status": "Trạng thái",
+      "riskTierTitle": "Bậc rủi ro {{tier}}",
+      "signer": "Người ký: {{signer}}",
+      "deviceUnable": {
+        "helperUnavailable": "Thiết bị không thể thực hiện: không có PAM helper",
+        "sessionUnavailable": "Thiết bị không thể thực hiện: phiên người dùng không khả dụng",
+        "helperStartFailed": "Thiết bị không thể thực hiện: PAM helper khởi động thất bại",
+        "generic": "Thiết bị không thể xử lý yêu cầu này"
+      }
+    },
+    "actions": {
+      "respond": "Phản hồi",
+      "revoke": "Thu hồi",
+      "ruleTitle": "Tạo quy tắc PAM được điền sẵn từ yêu cầu này",
+      "rule": "Quy tắc…"
+    },
+    "pagination": {
+      "previous": "Trang trước",
+      "pageOf": "Trang {{page}} / {{totalPages}}"
+    }
+  },
+  "pamPamRespondModal": {
+    "errors": {
+      "windowsHello": "Xác thực Windows Hello thất bại",
+      "actionFailed": "{{decision}} yêu cầu thất bại",
+      "network": "Lỗi mạng",
+      "notApproved": "Máy chủ chưa xác nhận yêu cầu nâng quyền này đã được duyệt. Hãy đóng hộp thoại này để xem trạng thái hiện tại.",
+      "notApprovedReason": "Yêu cầu nâng quyền không được duyệt: {{reason}}"
+    },
+    "toasts": {
+      "approved": "Đã duyệt nâng quyền",
+      "denied": "Đã từ chối nâng quyền"
+    },
+    "title": "Phản hồi yêu cầu nâng quyền",
+    "summary": {
+      "reason": "Lý do: {{reason}}"
+    },
+    "decisions": {
+      "approve": "Duyệt",
+      "deny": "Từ chối"
+    },
+    "form": {
+      "approvalWindow": "Thời gian cho phép duyệt (phút)",
+      "durationHelp": "1 đến 1440 phút (tối đa 24 giờ).",
+      "reasonRecommended": "Lý do (khuyên dùng)",
+      "reasonOptional": "Lý do (tùy chọn)",
+      "reasonShownToUser": "Lý do (hiển thị cho người dùng)",
+      "reasonShownToUserHint": "Người dùng cuối sẽ thấy thông tin này trong thông báo của họ (tối đa 500 ký tự đầu).",
+      "reasonPlaceholder": "Được ghi lại trong nhật ký kiểm toán"
+    },
+    "actions": {
+      "createRule": "Tạo quy tắc từ yêu cầu này…",
+      "submitting": "Đang gửi…",
+      "approveElevation": "Duyệt nâng quyền",
+      "denyRequest": "Từ chối yêu cầu"
+    },
+    "reauth": {
+      "title": "Yêu cầu quan trọng: xác nhận danh tính của bạn",
+      "why": "Việc duyệt yêu cầu nâng quyền cấp độ quan trọng yêu cầu xác thực lại ngay lập tức ngoài thiết bị phê duyệt của bạn. Việc này được kiểm tra một lần và không bao giờ lưu trữ.",
+      "unavailable": "Tài khoản của bạn đăng nhập không dùng mật khẩu và không có ứng dụng xác thực, do đó không thể xác thực lại cho các phê duyệt quan trọng. Passkey chưa được hỗ trợ cho bước này. Hãy thiết lập ứng dụng xác thực trong Hồ sơ → Bảo mật, hoặc nhờ người duyệt có mật khẩu.",
+      "codeLabel": "Mã ứng dụng xác thực",
+      "passwordLabel": "Mật khẩu tài khoản",
+      "codeHelp": "Mã 6 chữ số từ ứng dụng xác thực bạn dùng để đăng nhập. Passkey và mã SMS chưa được hỗ trợ cho bước này.",
+      "passwordHelp": "Mật khẩu bạn dùng để đăng nhập vào Breeze.",
+      "useCode": "Dùng mã ứng dụng xác thực thay thế",
+      "usePassword": "Dùng mật khẩu của tôi thay thế",
+      "errors": {
+        "codeRequired": "Nhập mã từ ứng dụng xác thực của bạn để duyệt yêu cầu quan trọng này.",
+        "passwordRequired": "Nhập mật khẩu tài khoản của bạn để duyệt yêu cầu quan trọng này.",
+        "invalid": "Mật khẩu hoặc mã đó không được chấp nhận. Vui lòng kiểm tra lại.",
+        "required": "Đây là yêu cầu quan trọng. Nhập lại mật khẩu (hoặc mã xác thực) của bạn và duyệt lại.",
+        "assertionFailed": "Xác thực thiết bị phê duyệt của bạn không được chấp nhận. Vui lòng thử lại."
+      }
+    }
+  },
+  "pamPamRevokeModal": {
+    "errors": {
+      "revokeFailed": "Không thể thu hồi quyền nâng cao",
+      "network": "Lỗi mạng"
+    },
+    "toasts": {
+      "revoked": "Đã thu hồi quyền nâng cao"
+    },
+    "title": "Thu hồi phiên nâng quyền đang hoạt động",
+    "description": "Kết thúc ngay lập tức thời gian nâng quyền cho <target>{{target}}</target> trên <device>{{device}}</device>.",
+    "form": {
+      "reasonRequired": "Lý do (bắt buộc)",
+      "reasonPlaceholder": "Được ghi lại trong nhật ký kiểm toán"
+    },
+    "actions": {
+      "revoking": "Đang thu hồi…",
+      "revokeElevation": "Thu hồi quyền nâng cao"
+    }
+  },
+  "pamPamRuleModal": {
+    "days": {
+      "sun": "CN",
+      "mon": "Thứ 2",
+      "tue": "Thứ 3",
+      "wed": "Thứ 4",
+      "thu": "Thứ 5",
+      "fri": "Thứ 6",
+      "sat": "Thứ 7"
+    },
+    "notices": {
+      "siteScopeReset": "Chi nhánh từ yêu cầu gốc không khả dụng trong tổ chức đã chọn — phạm vi được đặt lại thành toàn tổ chức."
+    },
+    "errors": {
+      "matchCriterionRequired": "Cần ít nhất một tiêu chí khớp.",
+      "timeWindowPairRequired": "Thời gian bắt đầu và kết thúc phải được đặt cả hai (hoặc để trống cả hai).",
+      "previewWithStatus": "Xem trước thất bại (HTTP {{status}})",
+      "preview": "Xem trước thất bại",
+      "toolIgnoreVerdict": "Quy tắc thao tác công cụ không thể sử dụng kết quả Bỏ qua (Ignore).",
+      "updateRule": "Không thể cập nhật quy tắc",
+      "createRule": "Không thể tạo quy tắc",
+      "network": "Lỗi mạng"
+    },
+    "sections": {
+      "criteria": "Tiêu chí khớp",
+      "window": "Khung thời gian"
+    },
+    "toasts": {
+      "ruleSaved": "Quy tắc \"{{name}}\" đã {{action}}",
+      "updated": "được cập nhật",
+      "created": "được tạo"
+    },
+    "title": {
+      "edit": "Sửa quy tắc PAM",
+      "new": "Quy tắc PAM mới"
+    },
+    "form": {
+      "name": "Tên",
+      "priority": "Ưu tiên",
+      "descriptionOptional": "Mô tả (tùy chọn)",
+      "organization": "Tổ chức",
+      "scope": "Phạm vi",
+      "orgWideAllSites": "Toàn tổ chức (tất cả chi nhánh)",
+      "verdict": "Kết quả",
+      "ruleShape": "Hình thái quy tắc",
+      "executable": "Tệp thực thi",
+      "aiToolAction": "Thao tác công cụ AI",
+      "negate": "Đảo ngược (không khớp)",
+      "none": "— không có —",
+      "daysNoneEveryDay": "Ngày (trống = tất cả các ngày)",
+      "timezoneOptional": "Múi giờ (tùy chọn)",
+      "enabled": "Đã bật"
+    },
+    "fields": {
+      "signer": "Người ký",
+      "signerGroup": "Nhóm người ký",
+      "sha256Hash": "Mã băm SHA-256",
+      "pathGlob": "Đường dẫn glob",
+      "parentImage": "Tiến trình cha",
+      "commandLine": "Dòng lệnh",
+      "toolName": "Tên công cụ",
+      "riskTier": "Cấp độ rủi ro (0-4)",
+      "userOptional": "Người dùng (tùy chọn)",
+      "adGroupOptional": "Nhóm AD (tùy chọn)",
+      "windowStart": "Bắt đầu (HH:MM)",
+      "windowEnd": "Kết thúc (HH:MM)",
+      "approvalMinsOptional": "Số phút duyệt (tùy chọn)"
+    },
+    "placeholders": {
+      "microsoftCorporation": "vd. Microsoft Corporation",
+      "hexChars": "64 ký tự hex",
+      "programFilesGlob": "C:\\Program Files\\**",
+      "explorer": "explorer.exe",
+      "printui": "printui.dll,PrintUIEntry",
+      "runScript": "run_script",
+      "riskTier": "2",
+      "domainUser": "DOMAIN\\user",
+      "helpdeskTier1": "Helpdesk Tầng 1",
+      "windowStart": "08:00",
+      "windowEnd": "18:00",
+      "approvalMins": "15",
+      "utc": "UTC"
+    },
+    "preview": {
+      "title": "Xem trước với các yêu cầu gần đây",
+      "previewing": "Đang xem trước…",
+      "action": "Xem trước các điểm khớp",
+      "matchedPrefix": "Sẽ khớp",
+      "matchedSuffix": "trong tổng số {{totalScanned}} yêu cầu trong {{windowDays}} ngày qua",
+      "truncated": " (5000 yêu cầu mới nhất đã quét)",
+      "adGroupNote": "Lưu ý: các yêu cầu lịch sử không ghi lại nhóm AD, do đó bản nháp nào bao gồm tiêu chí nhóm AD sẽ hiển thị 0 kết quả khớp khi xem trước."
+    },
+    "actions": {
+      "saveChanges": "Lưu thay đổi",
+      "createRule": "Tạo quy tắc"
+    }
+  },
+  "pamPamRulesTab": {
+    "errors": {
+      "updateDefaultVerdict": "Không thể cập nhật kết quả mặc định",
+      "loadWithStatus": "Không thể tải quy tắc (HTTP {{status}})",
+      "load": "Không thể tải quy tắc",
+      "updateRule": "Không thể cập nhật quy tắc",
+      "deleteRule": "Không thể xóa quy tắc",
+      "reapproveRule": "Không thể duyệt lại quy tắc"
+    },
+    "toasts": {
+      "defaultVerdictSet": "Kết quả mặc định được đặt thành {{verdict}}",
+      "ruleToggled": "Quy tắc \"{{name}}\" đã {{state}}",
+      "ruleDeleted": "Đã xóa quy tắc \"{{name}}\"",
+      "ruleReapproved": "Đã phê duyệt lại quy tắc \"{{name}}\" — đã khôi phục tự động phê duyệt"
+    },
+    "states": {
+      "disabled": "đã tắt",
+      "enabled": "đã bật"
+    },
+    "description": "Chính sách phần mềm được đánh giá trước — kết quả trùng khớp danh sách cho phép/chặn sẽ quyết định trước các quy tắc này. Sau đó, các quy tắc chạy theo thứ tự ưu tiên (thấp nhất trước); kết quả trùng khớp đầu tiên sẽ quyết định.",
+    "actions": {
+      "addRule": "Thêm quy tắc",
+      "reapprove": "Phê duyệt lại"
+    },
+    "defaultVerdict": {
+      "label": "Kết quả mặc định",
+      "requireApproval": "Yêu cầu phê duyệt",
+      "autoDeny": "Tự động từ chối",
+      "help": "Kết quả khi yêu cầu nâng quyền không khớp với chính sách hoặc quy tắc nào."
+    },
+    "loading": "Đang tải quy tắc…",
+    "empty": {
+      "title": "Chưa có quy tắc PAM nào",
+      "description": "Nếu không có quy tắc, mọi yêu cầu nâng quyền sẽ phải chờ quyết định thủ công."
+    },
+    "table": {
+      "priority": "Ưu tiên",
+      "name": "Tên",
+      "criteria": "Tiêu chí",
+      "scope": "Phạm vi",
+      "verdict": "Kết quả",
+      "enabled": "Đã bật",
+      "orgWide": "Toàn tổ chức"
+    },
+    "deleteDialog": {
+      "title": "Xóa quy tắc PAM",
+      "message": "Xóa quy tắc \"{{name}}\"? Yêu cầu nâng quyền sẽ không còn khớp với quy tắc này nữa.",
+      "confirm": "Xóa quy tắc"
+    },
+    "staleTierBadge": {
+      "label": "Cũ",
+      "tooltip": "Cấp độ rủi ro {{tier}} không còn khớp với bất kỳ mục nào quy tắc này có thể chọn, do đó sẽ không bao giờ khớp.",
+      "tooltipWithTiers": "Cấp độ rủi ro {{tier}} không còn khớp với bất kỳ mục nào quy tắc này có thể chọn, do đó sẽ không bao giờ khớp. Các cấp độ đang được sử dụng: {{tiers}}."
+    },
+    "suspendedBadge": {
+      "label": "Đã tạm dừng tự động phê duyệt",
+      "tooltip": "Quy tắc này đã tự động phê duyệt trước khi nâng cấp. Quy tắc hiện yêu cầu con người phê duyệt cho đến khi quản trị viên phê duyệt lại."
+    }
+  },
+  "pamPamSignerGroupsTab": {
+    "errors": {
+      "loadWithStatus": "Không thể tải nhóm nhà ký (HTTP {{status}})",
+      "load": "Không thể tải nhóm nhà ký",
+      "deleteGroup": "Không thể xóa nhóm nhà ký"
+    },
+    "toasts": {
+      "groupDeleted": "Đã xóa nhóm nhà ký \"{{name}}\""
+    },
+    "description": "Nhóm nhà ký là danh sách có tên của các nhà ký Authenticode đáng tin cậy. Hãy tham chiếu từ quy tắc thay vì lặp lại cùng một nhà phát hành ở nhiều quy tắc.",
+    "actions": {
+      "addSignerGroup": "Thêm nhóm nhà ký"
+    },
+    "loading": "Đang tải nhóm nhà ký…",
+    "empty": {
+      "title": "Chưa có nhóm nhà ký nào",
+      "description": "Tạo nhóm để tái sử dụng danh sách nhà phát hành tin cậy trên nhiều quy tắc."
+    },
+    "table": {
+      "name": "Tên",
+      "signers": "Nhà ký"
+    },
+    "deleteDialog": {
+      "title": "Xóa nhóm nhà ký",
+      "message": "Xóa nhóm nhà ký \"{{name}}\"? Các quy tắc tham chiếu nhóm này phải được cập nhật trước.",
+      "confirm": "Xóa nhóm"
+    },
+    "modal": {
+      "errors": {
+        "update": "Không thể cập nhật nhóm nhà ký",
+        "create": "Không thể tạo nhóm nhà ký",
+        "network": "Lỗi mạng"
+      },
+      "toasts": {
+        "saved": "Nhóm nhà ký \"{{name}}\" đã {{action}}",
+        "updated": "được cập nhật",
+        "created": "được tạo"
+      },
+      "title": {
+        "edit": "Sửa nhóm nhà ký",
+        "new": "Nhóm nhà ký mới"
+      },
+      "form": {
+        "name": "Tên",
+        "descriptionOptional": "Mô tả (tùy chọn)",
+        "signers": "Nhà ký",
+        "signersHelp": "Mỗi hàng một nhà ký Authenticode (CN chủ thể); khớp không phân biệt chữ hoa chữ thường.",
+        "signerPlaceholder": "ví dụ: Microsoft Corporation"
+      },
+      "actions": {
+        "removeSigner": "Xóa nhà ký",
+        "addSigner": "Thêm nhà ký",
+        "saveChanges": "Lưu thay đổi",
+        "createGroup": "Tạo nhóm"
+      }
+    }
+  },
+  "sensitiveDataCreateScanModal": {
+    "errors": {
+      "createScan": "Không thể tạo bản quét",
+      "devicesRequired": "Chọn ít nhất một thiết bị",
+      "devicesNotReady": "Danh sách thiết bị vẫn đang tải hoặc chưa hoàn tất. Vui lòng đợi hoàn tất rồi thử lại.",
+      "devicesLoadFailed": "Không thể tải danh sách thiết bị. Hãy dùng Thử lại trong danh sách thiết bị rồi thử lại."
+    },
+    "title": "Tạo bản quét",
+    "form": {
+      "policyOptional": "Chính sách (tùy chọn)",
+      "noPolicy": "Không có chính sách (cấu hình thủ công)",
+      "detectionClasses": "Loại phát hiện",
+      "devices": "Thiết bị",
+      "devicesHelp": "Chọn thiết bị cần quét."
+    },
+    "actions": {
+      "creating": "Đang tạo...",
+      "createScan": "Tạo bản quét"
+    }
+  },
+  "sensitiveDataDashboardTab": {
+    "empty": {
+      "noDataYet": "Chưa có dữ liệu"
+    },
+    "errors": {
+      "fetchDashboard": "Không thể lấy dữ liệu tổng quan",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "stats": {
+      "totalFindings": "Tổng số kết quả",
+      "criticalOpen": "Nghiêm trọng đang mở",
+      "remediated24h": "Đã khắc phục (24h)",
+      "openFindings": "Kết quả đang mở"
+    },
+    "charts": {
+      "findingsByDataType": "Kết quả theo loại dữ liệu",
+      "riskDistribution": "Phân bổ rủi ro"
+    }
+  },
+  "sensitiveDataFindingsTab": {
+    "errors": {
+      "fetchFindings": "Không thể lấy kết quả",
+      "generic": "Đã xảy ra lỗi",
+      "updateFinding": "Không thể cập nhật kết quả",
+      "actionFailed": "Thao tác thất bại"
+    },
+    "filters": {
+      "allTypes": "Tất cả loại",
+      "allRisks": "Tất cả mức rủi ro",
+      "allStatuses": "Tất cả trạng thái",
+      "searchPlaceholder": "Tìm kiếm đường dẫn tệp..."
+    },
+    "actions": {
+      "remediateSelected": "Khắc phục ({{count}})",
+      "acceptRiskTitle": "Chấp nhận rủi ro",
+      "accept": "Chấp nhận",
+      "markFalsePositiveTitle": "Đánh dấu là dương tính giả",
+      "fp": "FP"
+    },
+    "table": {
+      "filePath": "Đường dẫn tệp",
+      "type": "Loại",
+      "pattern": "Mẫu",
+      "risk": "Rủi ro",
+      "confidence": "Độ tin cậy",
+      "status": "Trạng thái",
+      "device": "Thiết bị",
+      "found": "Đã tìm thấy",
+      "actions": "Thao tác"
+    },
+    "empty": {
+      "noFilterMatches": "Không có kết quả nào khớp với bộ lọc hiện tại.",
+      "noSearchMatches": "Không có kết quả nào trên trang này khớp với tìm kiếm của bạn."
+    },
+    "pagination": {
+      "showingSearch": "Đang hiển thị {{visible}} trong số {{pageCount}} trên trang này (tổng số {{total}})",
+      "showingTotal": "Đang hiển thị {{visible}} trong số {{total}} kết quả",
+      "pageOf": "Trang {{page}} / {{totalPages}}"
+    },
+    "toasts": {
+      "riskAccepted": "Đã chấp nhận rủi ro",
+      "markedFalsePositive": "Đã đánh dấu là dương tính giả"
+    }
+  },
+  "sensitiveDataPoliciesTab": {
+    "errors": {
+      "fetchPolicies": "Không thể tải chính sách",
+      "generic": "Đã xảy ra lỗi",
+      "savePolicy": "Không thể lưu chính sách",
+      "saveFailed": "Lưu thất bại",
+      "deletePolicy": "Không thể xóa chính sách",
+      "deleteFailed": "Xóa thất bại",
+      "updatePolicy": "Không thể cập nhật chính sách",
+      "updateFailed": "Cập nhật thất bại"
+    },
+    "toasts": {
+      "policyUpdated": "Đã cập nhật chính sách",
+      "policyCreated": "Đã tạo chính sách",
+      "policyDeleted": "Đã xóa chính sách \"{{name}}\""
+    },
+    "heading": "Chính sách quét",
+    "descriptionPrefix": "Quản lý chính sách quét dữ liệu nhạy cảm. Để gán theo phân cấp, hãy dùng",
+    "configurationPoliciesLink": "Chính sách cấu hình",
+    "actions": {
+      "newPolicy": "Chính sách mới",
+      "saving": "Đang lưu...",
+      "update": "Cập nhật"
+    },
+    "form": {
+      "editPolicy": "Sửa chính sách",
+      "createPolicy": "Tạo chính sách",
+      "scope": "Phạm vi",
+      "allOrganizations": "Tất cả tổ chức",
+      "partnerWidePolicyParenthetical": "(chính sách toàn đối tác)",
+      "thisOrganizationOnly": "Chỉ tổ chức này",
+      "name": "Tên",
+      "policyNamePlaceholder": "Tên chính sách",
+      "detectionClasses": "Loại phát hiện",
+      "scheduleType": "Loại lịch trình",
+      "intervalMinutes": "Khoảng thời gian (phút)",
+      "cronPlaceholder": "0 2 * * *",
+      "cronExpressionUtc": "Biểu thức Cron (UTC)",
+      "cronNextRun": "Lần chạy tiếp theo (giờ địa phương): {{time}}",
+      "cronExpressionZone": "Biểu thức Cron ({{zone}})"
+    },
+    "schedule": {
+      "manual": "Thủ công",
+      "interval": "Khoảng thời gian",
+      "cron": "Cron",
+      "everyMinutes": "Mỗi {{minutes}}p",
+      "paused": "Đã tạm dừng",
+      "pausedTitle": "Lịch trình đã bị tắt cho chính sách này, nên chính sách sẽ không chạy tự động"
+    },
+    "table": {
+      "name": "Tên",
+      "detectionClasses": "Loại phát hiện",
+      "schedule": "Lịch trình",
+      "active": "Đang hoạt động",
+      "actions": "Thao tác"
+    },
+    "empty": "Chưa có chính sách nào. Hãy tạo một chính sách để bắt đầu.",
+    "badges": {
+      "partnerWideTitle": "Chính sách toàn đối tác — quét thiết bị ở mọi tổ chức",
+      "allOrgs": "Toàn đối tác"
+    },
+    "deleteDialog": {
+      "title": "Xóa chính sách quét",
+      "message": "Bạn có chắc chắn muốn xóa \"{{name}}\"? Hành động này không thể hoàn tác và mọi lịch quét theo chính sách này sẽ dừng lại.",
+      "confirm": "Xóa chính sách"
+    }
+  },
+  "sensitiveDataRemediationModal": {
+    "errors": {
+      "remediationFailed": "Khắc phục thất bại"
+    },
+    "title": "Khắc phục kết quả",
+    "selectedCount": "Đã chọn {{count}} kết quả",
+    "selectedCount_one": "Đã chọn {{count}} kết quả",
+    "selectedCount_other": "Đã chọn {{count}} kết quả",
+    "badges": {
+      "destructive": "Mang tính phá hủy"
+    },
+    "actions": {
+      "processing": "Đang xử lý...",
+      "continue": "Tiếp tục",
+      "confirmSecureDelete": "Xác nhận xóa an toàn"
+    },
+    "confirm": {
+      "title": "Thao tác phá hủy",
+      "beforeAction": "Bạn sắp",
+      "findingCount": "{{count}} kết quả.",
+      "findingCount_one": "{{count}} kết quả.",
+      "findingCount_other": "{{count}} kết quả.",
+      "afterCount": "Thao tác này có thể sửa đổi hoặc xóa tệp trên thiết bị đích."
+    },
+    "secondApproval": {
+      "notice": "Xóa an toàn yêu cầu mã thông báo phê duyệt thứ hai.",
+      "approvalToken": "Mã thông báo phê duyệt",
+      "placeholder": "Nhập mã thông báo phê duyệt thứ hai"
+    },
+    "result": {
+      "success": "Đã khởi tạo khắc phục thành công.",
+      "updated": "Đã cập nhật {{count}} kết quả",
+      "queued": "Đã đưa vào hàng đợi {{count}} lệnh",
+      "failed": "{{count}} thất bại"
+    }
+  },
+  "sensitiveDataScansTab": {
+    "errors": {
+      "fetchScans": "Không thể tải các lần quét",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "duration": {
+      "running": "Đang chạy..."
+    },
+    "heading": "Lần quét",
+    "actions": {
+      "newScan": "Quét mới"
+    },
+    "table": {
+      "scanId": "ID quét",
+      "device": "Thiết bị",
+      "status": "Trạng thái",
+      "findings": "Kết quả",
+      "started": "Đã bắt đầu",
+      "duration": "Thời lượng"
+    },
+    "empty": "Chưa có lần quét nào. Tạo lần quét mới để bắt đầu."
+  },
+  "sensitiveDataSensitiveDataPage": {
+    "tabs": {
+      "dashboard": "Tổng quan",
+      "findings": "Kết quả",
+      "scans": "Lần quét",
+      "policies": "Chính sách"
+    },
+    "heading": "Dữ liệu nhạy cảm"
+  },
+  "dnsSecurityAddDnsIntegrationModal": {
+    "title": "Thêm tích hợp DNS",
+    "description": "Kết nối nhà cung cấp lọc DNS để thu thập nhật ký truy vấn và sự kiện mối đe dọa.",
+    "providers": {
+      "umbrella": {
+        "label": "Cisco Umbrella",
+        "helpText": "Khóa API + bí mật từ thông tin xác thực Umbrella API Keys. ID tổ chức là tùy chọn — mã thông báo tự giới hạn phạm vi tổ chức.",
+        "apiKeyPlaceholder": "reporting-api-key",
+        "apiSecretPlaceholder": "reporting-api-secret",
+        "organizationIdPlaceholder": "1234567"
+      },
+      "cloudflare": {
+        "label": "Cloudflare Gateway",
+        "helpText": "Mã thông báo API với phạm vi Zero Trust → Gateway → Read.",
+        "apiTokenPlaceholder": "cf-api-token",
+        "accountIdPlaceholder": "Mã hex 32 ký tự từ bảng điều khiển Cloudflare"
+      },
+      "dnsfilter": {
+        "label": "DNSFilter",
+        "helpText": "Khóa API từ cài đặt tài khoản DNSFilter; ID tài khoản chỉ bắt buộc cho phạm vi đa khách thuê.",
+        "apiKeyPlaceholder": "dnsfilter-api-key",
+        "accountIdPlaceholder": "để trống cho đơn khách thuê"
+      },
+      "pihole": {
+        "label": "Pi-hole",
+        "helpText": "Điểm cuối API Pi-hole + khóa API. Sử dụng tên máy chủ có thể định tuyến qua LAN.",
+        "apiKeyPlaceholder": "khóa api pi-hole từ /admin",
+        "apiEndpointPlaceholder": "http://pihole.local"
+      },
+      "adguardHome": {
+        "label": "AdGuard Home",
+        "helpText": "Điểm cuối API + tên người dùng xác thực HTTP Basic (apiKey) + mật khẩu (apiSecret).",
+        "usernamePlaceholder": "admin",
+        "passwordPlaceholder": "password",
+        "apiEndpointPlaceholder": "https://adguard.client.local"
+      }
+    },
+    "fields": {
+      "provider": "Nhà cung cấp",
+      "displayName": "Tên hiển thị",
+      "descriptionOptional": "Mô tả (tùy chọn)",
+      "apiKey": "Khóa API",
+      "apiSecret": "Bí mật API",
+      "apiToken": "Mã thông báo API",
+      "organizationId": "ID tổ chức",
+      "accountId": "ID tài khoản",
+      "accountIdOptional": "ID tài khoản (tùy chọn)",
+      "apiEndpoint": "Điểm cuối API",
+      "httpBasicUsername": "Tên người dùng HTTP Basic",
+      "httpBasicPassword": "Mật khẩu HTTP Basic"
+    },
+    "placeholders": {
+      "displayName": "ví dụ: Acme HQ Gateway",
+      "description": "Tích hợp này bao gồm những gì"
+    },
+    "actions": {
+      "cancel": "Hủy",
+      "adding": "Đang thêm…",
+      "addIntegration": "Thêm tích hợp"
+    },
+    "messages": {
+      "createFailed": "Không thể tạo tích hợp",
+      "createSuccess": "Đã thêm tích hợp {{provider}} \"{{name}}\"",
+      "networkError": "Lỗi mạng"
+    }
+  },
+  "dnsSecurityAddDnsPolicyModal": {
+    "title": "Chính sách DNS Mới",
+    "description": "Các tên miền trong danh sách chặn hoặc danh sách cho phép sẽ được đẩy tới nhà cung cấp DNS của bạn trong chu kỳ đồng bộ tiếp theo.",
+    "fields": {
+      "integration": "Tích hợp",
+      "policyName": "Tên chính sách",
+      "type": "Loại",
+      "descriptionOptional": "Mô tả (tùy chọn)",
+      "initialDomainsOptional": "Tên miền ban đầu (tùy chọn)"
+    },
+    "policyTypes": {
+      "blocklist": "Danh sách chặn (từ chối)",
+      "allowlist": "Danh sách cho phép (cho phép)"
+    },
+    "placeholders": {
+      "policyName": "ví dụ: Danh sách chặn mối đe dọa",
+      "domains": "malware.example.com\nphish.example.com\nc2.example.org"
+    },
+    "initialDomainsHelp": "(mỗi dòng một tên miền, phân tách bằng dấu phẩy, hoặc dán danh sách — tối đa 500)",
+    "loadingIntegrations": "Đang tải tích hợp…",
+    "noIntegrations": "Chưa cấu hình tích hợp nào. Hãy thêm một tích hợp ở tab Tích hợp trước.",
+    "actions": {
+      "cancel": "Hủy",
+      "creating": "Đang tạo…",
+      "createPolicy": "Tạo chính sách"
+    },
+    "messages": {
+      "loadIntegrationsHttpError": "Không thể tải tích hợp (HTTP {{status}})",
+      "loadIntegrationsFailed": "Không thể tải tích hợp",
+      "pickIntegrationFirst": "Chọn một tích hợp trước",
+      "createFailed": "Không thể tạo chính sách",
+      "createSuccess": "Đã tạo chính sách \"{{name}}\"",
+      "networkError": "Lỗi mạng"
+    }
+  },
+  "dnsSecurityDnsSecurityPage": {
+    "title": "Bảo Mật DNS",
+    "description": "Tích hợp lọc DNS, chính sách danh sách chặn/cho phép và sự kiện mối đe dọa trên Umbrella, Cloudflare Gateway, DNSFilter, Pi-hole, OpenDNS, Quad9 và AdGuard Home.",
+    "tabs": {
+      "overview": "Tổng quan",
+      "integrations": "Tích hợp",
+      "policies": "Chính sách",
+      "events": "Sự kiện"
+    }
+  },
+  "dnsSecurityDnsSecurityOverviewTab": {
+    "messages": {
+      "loadFailed": "Không thể tải tổng quan"
+    },
+    "stats": {
+      "totalQueries": "Tổng số truy vấn",
+      "blocked": "Đã chặn",
+      "allowed": "Được phép",
+      "redirected": "Đã chuyển hướng",
+      "notStored": "Không lưu trữ"
+    },
+    "topBlocked": {
+      "title": "Tên miền bị chặn nhiều nhất",
+      "empty": "Không có tên miền bị chặn trong khoảng thời gian hiện tại."
+    },
+    "loading": "Đang tải…",
+    "allowedTraffic": {
+      "none": "Truy vấn được phép không được lưu trữ cho các tích hợp này, do đó chỉ tính các truy vấn bị chặn và chuyển hướng. Để tính các truy vấn này, hãy bật \"Lưu lượng truy cập được phép\" trong cài đặt dữ liệu lưu trữ của tích hợp.",
+      "some": "Truy vấn được phép chỉ được lưu trữ cho một số tích hợp, do đó số lượng được phép chỉ là một phần."
+    }
+  },
+  "dnsSecurityDnsSecurityIntegrationsTab": {
+    "title": "Tích hợp đã cấu hình",
+    "providers": {
+      "umbrella": "Cisco Umbrella",
+      "cloudflare": "Cloudflare Gateway",
+      "dnsfilter": "DNSFilter",
+      "pihole": "Pi-hole",
+      "opendns": "OpenDNS",
+      "quad9": "Quad9",
+      "adguardHome": "AdGuard Home"
+    },
+    "actions": {
+      "addIntegration": "Thêm tích hợp",
+      "syncNow": "Đồng bộ ngay",
+      "deleteIntegration": "Xóa tích hợp",
+      "editRetention": "Dữ liệu đã lưu trữ"
+    },
+    "messages": {
+      "loadHttpError": "Không thể tải tích hợp (HTTP {{status}})",
+      "loadFailed": "Không thể tải tích hợp",
+      "syncFailed": "Không thể kích hoạt đồng bộ cho {{name}}",
+      "syncQueued": "Đã đưa vào hàng đợi đồng bộ cho {{name}}",
+      "deleteConfirm": "Xóa {{name}}? Các chính sách, sự kiện và thống kê của tích hợp này sẽ bị xóa ngầm.",
+      "deleteFailed": "Không thể xóa {{name}}",
+      "deleteSuccess": "Đang xóa {{name}} ngầm",
+      "deleteComplete": "Đã xóa {{name}}"
+    },
+    "loading": "Đang tải tích hợp…",
+    "empty": {
+      "title": "Chưa cấu hình tích hợp DNS nào",
+      "description": "Kết nối một trong 7 nhà cung cấp được hỗ trợ để bắt đầu thu thập nhật ký truy vấn DNS."
+    },
+    "table": {
+      "name": "Tên",
+      "provider": "Nhà cung cấp",
+      "lastSync": "Đồng bộ lần cuối",
+      "events": "Sự kiện",
+      "actions": "Thao tác"
+    },
+    "lastSyncFailedSuffix": " — thất bại",
+    "lastSyncPartialSuffix": " — đang cập nhật",
+    "lastSyncTruncatedSuffix": " — một số sự kiện chưa được lấy",
+    "never": "Không bao giờ",
+    "deletingInBackground": "Đang xóa…"
+  },
+  "dnsSecurityEditDnsRetentionModal": {
+    "title": "Dữ liệu đã lưu trữ",
+    "description": "Chọn những truy vấn DNS nào mà Breeze lưu trữ cho tích hợp này và thời gian lưu giữ.",
+    "fieldLabel": "Giữ lại sự kiện và thống kê DNS trong (ngày)",
+    "fieldHelp": "1–365 ngày. Để trống để sử dụng mặc định của hệ thống (90 ngày trừ khi quản trị viên của bạn đã thay đổi).",
+    "invalid": "Nhập một số nguyên từ 1 đến 365, hoặc để trống.",
+    "actions": {
+      "dismiss": "Hủy",
+      "submit": "Lưu",
+      "saving": "Đang lưu…"
+    },
+    "messages": {
+      "saved": "Đã cập nhật cài đặt dữ liệu lưu trữ cho {{name}}",
+      "saveFailed": "Không thể cập nhật cài đặt dữ liệu lưu trữ cho {{name}}"
+    },
+    "storeAllowedTraffic": {
+      "label": "Lưu lượng truy cập được phép",
+      "helpOff": "Chỉ các truy vấn bị chặn và chuyển hướng mới được lưu trữ. Truy vấn được phép thường chiếm gần như toàn bộ lưu lượng, và nhà cung cấp DNS của bạn sẽ giữ chúng trong báo cáo riêng của họ.",
+      "helpOn": "Truy vấn được phép cũng được lưu trữ, thường tạo ra số dòng nhiều hơn khoảng 100 lần. Tắt tính năng này sau đó sẽ không xóa các truy vấn được phép đã lưu trữ; thời hạn lưu giữ sẽ xóa chúng."
+    }
+  },
+  "dnsSecurityDnsSecurityPoliciesTab": {
+    "title": "Chính sách Chặn / Cho phép",
+    "actions": {
+      "newPolicy": "Chính sách mới",
+      "hide": "Ẩn",
+      "editDomains": "Sửa tên miền",
+      "removeDomain": "Xóa {{domain}}",
+      "add": "Thêm"
+    },
+    "messages": {
+      "loadHttpError": "Không thể tải chính sách (HTTP {{status}})",
+      "loadFailed": "Không thể tải chính sách",
+      "updateDomainsFailed": "Không thể cập nhật tên miền",
+      "domainsUpdated": "Đã cập nhật tên miền"
+    },
+    "loading": "Đang tải chính sách…",
+    "empty": {
+      "title": "Chưa cấu hình chính sách DNS nào",
+      "description": "Tạo danh sách chặn hoặc danh sách cho phép gắn liền với một trong các tích hợp DNS của bạn."
+    },
+    "policyTypes": {
+      "blocklist": "danh sách chặn",
+      "allowlist": "danh sách cho phép"
+    },
+    "domainCount": "{{integrationName}} · {{count}} tên miền",
+    "domainCount_one": "{{integrationName}} · {{count}} tên miền",
+    "domainCount_other": "{{integrationName}} · {{count}} tên miền",
+    "noDomains": "Chưa có tên miền nào.",
+    "fields": {
+      "addDomains": "Thêm tên miền"
+    },
+    "addDomainsHelp": "(mỗi dòng một tên miền, phân tách bằng dấu phẩy, hoặc dán danh sách)",
+    "placeholders": {
+      "domains": "malware.example.com\nphish.example.com"
+    }
+  },
+  "dnsSecurityDnsSecurityEventsTab": {
+    "title": "Sự kiện truy vấn DNS",
+    "messages": {
+      "loadHttpError": "Không thể tải sự kiện (HTTP {{status}})",
+      "loadFailed": "Không thể tải sự kiện"
+    },
+    "loading": "Đang tải…",
+    "eventCount_one": "{{shown}} / {{total}} sự kiện",
+    "eventCount_other": "{{shown}} / {{total}} sự kiện",
+    "blockedEventCount_one": "{{shown}} / {{total}} sự kiện bị chặn",
+    "blockedEventCount_other": "{{shown}} / {{total}} sự kiện bị chặn",
+    "eventCountCapped": "{{shown}} / {{total}}+ sự kiện",
+    "blockedEventCountCapped": "{{shown}} / {{total}}+ sự kiện bị chặn",
+    "loadMore": "Tải thêm",
+    "window": {
+      "label": "Khoảng thời gian",
+      "last24h": "24 giờ qua",
+      "last7d": "7 ngày qua",
+      "last30d": "30 ngày qua",
+      "last90d": "90 ngày qua"
+    },
+    "showAll": "Hiển thị tất cả (không chỉ bị chặn)",
+    "actions": {
+      "refresh": "Làm mới",
+      "allowed": "đã cho phép",
+      "blocked": "đã chặn",
+      "redirected": "đã chuyển hướng"
+    },
+    "loadingEvents": "Đang tải sự kiện…",
+    "empty": {
+      "allTitle": "Không có sự kiện DNS nào được ghi lại",
+      "blockedTitle": "Không có sự kiện DNS nào bị chặn",
+      "allDescription": "Cấu hình tích hợp và đợi quá trình đồng bộ 15 phút đầu tiên hoàn tất.",
+      "blockedDescription": "Không có mối đe dọa nào bị chặn trong thời gian gần đây. Hãy thử bật \"Hiển thị tất cả\" để xem lưu lượng được cho phép."
+    },
+    "table": {
+      "when": "Thời gian",
+      "device": "Thiết bị",
+      "domain": "Miền",
+      "category": "Danh mục",
+      "action": "Hành động"
+    },
+    "unknown": "không xác định"
+  },
+  "cisHardeningCisHardeningPage": {
+    "title": "Tiêu chuẩn CIS",
+    "description": "Cơ sở cấu hình, chấm điểm tuân thủ và theo dõi khắc phục.",
+    "messages": {
+      "loadFailed": "Không thể tải dữ liệu CIS"
+    },
+    "actions": {
+      "refresh": "Làm mới"
+    },
+    "tabs": {
+      "compliance": "Tuân thủ",
+      "baselines": "Cơ sở",
+      "remediations": "Khắc phục"
+    }
+  },
+  "cisHardeningCisSummaryCards": {
+    "averageScore": "Điểm trung bình",
+    "averageScoreTooltip": "Tỷ lệ kiểm tra đạt trên tất cả thiết bị và cơ sở. Điểm càng cao càng tốt.",
+    "failingDevices": "Thiết bị không đạt",
+    "activeBaselines": "Cơ sở đang hoạt động",
+    "pendingRemediations": "Khắc phục chờ xử lý",
+    "pendingRemediationsTooltip": "Bản sửa lỗi tự động đang chờ phê duyệt. Xem lại trước khi áp dụng -- một số thay đổi có thể ảnh hưởng đến hành vi hệ thống."
+  },
+  "cisHardeningCisComplianceTab": {
+    "searchPlaceholder": "Tìm kiếm tên máy hoặc cơ sở...",
+    "osFilterLabel": "Hệ điều hành",
+    "os": {
+      "all": "Tất cả loại HĐH",
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "table": {
+      "device": "Thiết bị",
+      "baseline": "Cơ sở",
+      "os": "HĐH",
+      "score": "Điểm",
+      "failedChecks": "Kiểm tra không đạt",
+      "lastScanned": "Đã quét lần cuối"
+    },
+    "loading": "Đang tải dữ liệu tuân thủ...",
+    "empty": "Không tìm thấy kết quả tuân thủ nào."
+  },
+  "cisHardeningCisComplianceRow": {
+    "severity": {
+      "low": "thấp",
+      "medium": "trung bình",
+      "high": "cao",
+      "critical": "nghiêm trọng"
+    },
+    "noFailedFindings": "Không có phát hiện không đạt."
+  },
+  "cisHardeningCisBaselinesTab": {
+    "title": "Cơ sở",
+    "actions": {
+      "newBaseline": "Cơ sở mới",
+      "edit": "Sửa",
+      "triggerScan": "Kích hoạt quét"
+    },
+    "messages": {
+      "triggerScanFailed": "Không thể kích hoạt quét",
+      "triggerScanQueued": "Đã xếp hàng quét cho {{name}}"
+    },
+    "table": {
+      "name": "Tên",
+      "os": "HĐH",
+      "level": "Mức",
+      "version": "Phiên bản",
+      "schedule": "Lịch trình",
+      "status": "Trạng thái",
+      "actions": "Hành động"
+    },
+    "loading": "Đang tải cơ sở...",
+    "empty": "Không có cơ sở nào được cấu hình.",
+    "levels": {
+      "l1": "l1",
+      "l2": "l2",
+      "custom": "tùy chỉnh"
+    },
+    "schedule": {
+      "everyHours": "Mỗi {{hours}}h",
+      "manual": "Thủ công",
+      "reapprovalRequired": "Cần phê duyệt lại",
+      "reapprovalTitle": "Quét theo lịch trình bị tạm dừng cho đến khi người dùng có quyền devices:execute lưu lại cơ sở này.",
+      "approverInvalidTitle": "Quét theo lịch đã dừng: người phê duyệt {{name}} không còn quyền devices:execute. Người dùng có quyền đó phải lưu lại cơ sở này.",
+      "unknownApprover": "(người dùng không xác định)"
+    },
+    "status": {
+      "active": "Hoạt động",
+      "inactive": "Không hoạt động"
+    },
+    "badges": {
+      "allOrgs": "Tất cả tổ chức",
+      "partnerWideTitle": "Cơ sở toàn đối tác — áp dụng cho thiết bị ở mọi tổ chức"
+    },
+    "scanAll": {
+      "title": "Quét tất cả tổ chức?",
+      "message": "“{{name}}” là cơ sở toàn đối tác. Khi không chọn tổ chức nào, hệ thống sẽ quét tất cả {{orgCount}} tổ chức. Hãy chọn một tổ chức trước nếu chỉ muốn quét thiết bị của tổ chức đó.",
+      "confirm": "Quét tất cả"
+    }
+  },
+  "cisHardeningCisBaselineForm": {
+    "title": {
+      "edit": "Sửa cơ sở",
+      "new": "Cơ sở mới"
+    },
+    "messages": {
+      "saveFailed": "Không thể lưu cơ sở",
+      "saveSuccess": "Đã lưu cơ sở “{{name}}”"
+    },
+    "fields": {
+      "name": "Tên",
+      "osType": "Loại HĐH",
+      "level": "Mức",
+      "benchmarkVersion": "Phiên bản chuẩn",
+      "enableScheduledScans": "Bật quét theo lịch",
+      "active": "Hoạt động"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "levels": {
+      "l1": "L1",
+      "l2": "L2",
+      "custom": "Tùy chỉnh"
+    },
+    "tooltips": {
+      "level": "Kiểm tra L1 thiết thực cho hầu hết môi trường. L2 tăng cường bảo mật nhưng có thể ảnh hưởng đến tính năng."
+    },
+    "placeholders": {
+      "benchmarkVersion": "ví dụ: 3.0.0"
+    },
+    "hours": "giờ",
+    "actions": {
+      "cancel": "Hủy",
+      "saving": "Đang lưu...",
+      "save": "Lưu"
+    },
+    "ownership": {
+      "scope": "Phạm vi",
+      "allOrganizations": "Tất cả tổ chức",
+      "partnerWideBaselineParenthetical": "(cơ sở toàn đối tác)",
+      "thisOrganizationOnly": "Chỉ tổ chức này"
+    }
+  },
+  "cisHardeningCisRemediationsTab": {
+    "title": "Khắc phục",
+    "tooltip": "Bản sửa lỗi tự động cho các kiểm tra CIS không đạt. Mỗi bản sửa lỗi phải được phê duyệt trước khi thực thi trên thiết bị mục tiêu.",
+    "filters": {
+      "allStatuses": "Tất cả trạng thái",
+      "statusFilterLabel": "Trạng thái"
+    },
+    "status": {
+      "pending_approval": "Chờ phê duyệt",
+      "queued": "Đã xếp hàng",
+      "in_progress": "Đang thực hiện",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy"
+    },
+    "approval": {
+      "pending": "Đang chờ",
+      "approved": "Đã phê duyệt",
+      "rejected": "Đã từ chối"
+    },
+    "actions": {
+      "apply": "áp dụng",
+      "rollback": "hoàn tác"
+    },
+    "table": {
+      "checkId": "Mã kiểm tra",
+      "device": "Thiết bị",
+      "baseline": "Baseline",
+      "action": "Thao tác",
+      "status": "Trạng thái",
+      "approval": "Phê duyệt",
+      "requested": "Đã yêu cầu",
+      "completed": "Đã hoàn thành",
+      "decision": "Quyết định"
+    },
+    "loading": "Đang tải bản khắc phục...",
+    "empty": "Không tìm thấy bản khắc phục nào.",
+    "decision": {
+      "approve": "Phê duyệt",
+      "reject": "Từ chối",
+      "approveTitle": "Phê duyệt bản khắc phục?",
+      "rejectTitle": "Từ chối bản khắc phục?",
+      "approveMessage": "Thao tác này đưa kiểm tra CIS {{checkId}} vào hàng đợi chạy trên {{device}}. Tác nhân sẽ thay đổi cấu hình thiết bị.",
+      "rejectMessage": "Thao tác này hủy bản khắc phục đang chờ cho kiểm tra CIS {{checkId}} trên {{device}}. Sẽ không có gì chạy trên thiết bị.",
+      "noteLabel": "Ghi chú (tùy chọn)",
+      "approved": "Đã phê duyệt và đưa vào hàng đợi bản khắc phục cho {{checkId}}.",
+      "rejected": "Đã từ chối bản khắc phục cho {{checkId}}.",
+      "approveFailed": "Không thể phê duyệt bản khắc phục",
+      "rejectFailed": "Không thể từ chối bản khắc phục",
+      "queueFailed": "Đã ghi nhận phê duyệt nhưng không thể đưa bản khắc phục vào hàng đợi. Trạng thái đã quay lại chờ phê duyệt; hãy thử lại.",
+      "mfaRequired": "Việc phê duyệt hoặc từ chối bản khắc phục yêu cầu phiên đăng nhập bằng xác thực đa yếu tố. Hãy đăng xuất và đăng nhập lại bằng MFA.",
+      "ownRequest": "Bạn đã yêu cầu bản khắc phục này, vì vậy người dùng khác phải phê duyệt."
+    },
+    "detail": {
+      "toggle": "Bật/tắt chi tiết",
+      "approvedBy": "Được phê duyệt bởi",
+      "approvedAt": "Được phê duyệt lúc",
+      "note": "Ghi chú phê duyệt",
+      "beforeState": "Trước",
+      "afterState": "Sau",
+      "rollbackHint": "Gợi ý hoàn tác",
+      "noEvidence": "Chưa có bằng chứng nào được ghi lại cho bản khắc phục này.",
+      "unknownApprover": "Người dùng ẩn danh"
+    }
+  },
+  "auditBaselinesAuditBaselinesPage": {
+    "title": "Kiểm toán Baseline",
+    "description": "Định nghĩa baseline tuân thủ, đánh giá độ lệch của thiết bị và khắc phục bằng quy trình có phê duyệt.",
+    "tabs": {
+      "dashboard": "Tổng quan",
+      "baselines": "Baseline",
+      "approvals": "Phê duyệt"
+    }
+  },
+  "auditBaselinesBaselineFormModal": {
+    "title": {
+      "edit": "Sửa Baseline",
+      "new": "Baseline Mới"
+    },
+    "messages": {
+      "invalidJson": "JSON không hợp lệ trong cài đặt",
+      "saveFailed": "Không thể lưu baseline",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "fields": {
+      "name": "Tên",
+      "osType": "Loại HĐH",
+      "profile": "Cấu hình",
+      "active": "Đang hoạt động",
+      "settingsJson": "Cài đặt (JSON)"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "profiles": {
+      "cisL1": "CIS Level 1",
+      "cisL2": "CIS Level 2",
+      "custom": "Tùy chỉnh"
+    },
+    "placeholders": {
+      "name": "ví dụ: Windows CIS L1 Baseline",
+      "customSettings": "{\n  \"key\": \"value\"\n}",
+      "templateSettings": "Tùy chọn — sẽ dùng mặc định của mẫu"
+    },
+    "activeHelp": "(Chỉ một baseline cho mỗi loại HĐH được hoạt động)",
+    "templateDefaultsHelp": "Để trống để dùng mặc định của mẫu",
+    "actions": {
+      "cancel": "Hủy",
+      "update": "Cập nhật",
+      "create": "Tạo"
+    }
+  },
+  "auditBaselinesBaselineList": {
+    "messages": {
+      "fetchFailed": "Không thể tải danh sách baseline",
+      "deleteFailed": "Không thể xóa baseline",
+      "toggleFailed": "Không thể chuyển đổi trạng thái baseline",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "loading": "Đang tải danh sách baseline...",
+    "actions": {
+      "tryAgain": "Thử lại",
+      "newBaseline": "Baseline Mới",
+      "edit": "Sửa",
+      "delete": "Xóa",
+      "cancel": "Hủy",
+      "deleting": "Đang xóa..."
+    },
+    "baselineCount": "{{count}} baseline",
+    "baselineCount_one": "{{count}} baseline",
+    "baselineCount_other": "{{count}} baseline",
+    "table": {
+      "name": "Tên",
+      "os": "HĐH",
+      "profile": "Cấu hình",
+      "active": "Hoạt động",
+      "updated": "Đã cập nhật",
+      "actions": "Thao tác"
+    },
+    "empty": "Không tìm thấy baseline nào. Hãy tạo một cái để bắt đầu.",
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "profiles": {
+      "cisL1": "CIS L1",
+      "cisL2": "CIS L2",
+      "custom": "Tùy chỉnh"
+    },
+    "status": {
+      "active": "Hoạt động",
+      "inactive": "Không hoạt động"
+    },
+    "deleteModal": {
+      "title": "Xóa Baseline",
+      "confirmPrefix": "Bạn có chắc chắn muốn xóa",
+      "confirmSuffix": "? Thao tác này cũng sẽ xóa tất cả kết quả tuân thủ. Không thể hoàn tác hành động này."
+    }
+  },
+  "auditBaselinesBaselineDetailPage": {
+    "tabs": {
+      "overview": "Tổng quan",
+      "compliance": "Tuân thủ",
+      "apply": "Áp dụng"
+    },
+    "messages": {
+      "fetchFailed": "Không thể tải baseline",
+      "notFound": "Không tìm thấy baseline",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "loading": "Đang tải baseline...",
+    "backToAuditBaselines": "Quay lại Kiểm toán Baseline",
+    "actions": {
+      "tryAgain": "Thử lại"
+    },
+    "breadcrumbs": {
+      "auditBaselines": "Kiểm toán Baseline",
+      "baseline": "Baseline"
+    },
+    "status": {
+      "active": "Hoạt động",
+      "inactive": "Không hoạt động"
+    }
+  },
+  "auditBaselinesBaselineOverviewTab": {
+    "title": "Chi tiết Baseline",
+    "actions": {
+      "edit": "Sửa"
+    },
+    "fields": {
+      "name": "Tên",
+      "osType": "Loại HĐH",
+      "profile": "Cấu hình",
+      "status": "Trạng thái",
+      "created": "Đã tạo",
+      "lastUpdated": "Cập nhật lần cuối"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "profiles": {
+      "cisL1": "CIS Level 1",
+      "cisL2": "CIS Level 2",
+      "custom": "Tùy chỉnh"
+    },
+    "status": {
+      "active": "Đang hoạt động",
+      "inactive": "Không hoạt động"
+    },
+    "settings": "Cài đặt"
+  },
+  "auditBaselinesBaselineComplianceTab": {
+    "messages": {
+      "fetchFailed": "Không thể tải dữ liệu tuân thủ",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "loading": "Đang tải kết quả tuân thủ...",
+    "actions": {
+      "tryAgain": "Thử lại"
+    },
+    "empty": {
+      "title": "Không có kết quả tuân thủ",
+      "description": "Chưa có thiết bị nào được đánh giá theo tiêu chuẩn cơ sở này.",
+      "inactiveSuffix": " Kích hoạt tiêu chuẩn cơ sở này để bắt đầu đánh giá độ lệch."
+    },
+    "cards": {
+      "devicesEvaluated": "Thiết bị đã đánh giá",
+      "compliant": "Tuân thủ",
+      "averageScore": "Điểm trung bình"
+    },
+    "deviceResults": "Kết quả thiết bị",
+    "filters": {
+      "all": "Tất cả",
+      "compliant": "Tuân thủ",
+      "nonCompliant": "Không tuân thủ"
+    },
+    "summary": "Tóm tắt hiển thị {{compliant}} thiết bị tuân thủ và {{nonCompliant}} thiết bị không tuân thủ. Nhấp vào một thiết bị trong trang Thiết bị để xem chi tiết kiểm toán tiêu chuẩn cơ sở cho từng thiết bị."
+  },
+  "auditBaselinesComplianceDashboard": {
+    "messages": {
+      "fetchFailed": "Không thể tải tóm tắt tuân thủ",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "loading": "Đang tải dữ liệu tuân thủ...",
+    "actions": {
+      "tryAgain": "Thử lại"
+    },
+    "empty": {
+      "title": "Chưa có dữ liệu tuân thủ",
+      "description": "Kích hoạt tiêu chuẩn cơ sở và đợi chu kỳ đánh giá độ lệch tiếp theo để xem kết quả tại đây."
+    },
+    "cards": {
+      "devicesEvaluated": "Thiết bị đã đánh giá",
+      "compliant": "Tuân thủ",
+      "nonCompliant": "Không tuân thủ",
+      "averageScore": "Điểm trung bình"
+    },
+    "byBaseline": "Tuân thủ theo Tiêu chuẩn cơ sở",
+    "table": {
+      "baseline": "Tiêu chuẩn cơ sở",
+      "os": "HĐH",
+      "devices": "Thiết bị",
+      "avgScore": "Điểm TB",
+      "status": "Trạng thái"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "compliantRatio": "{{compliant}}/{{total}} tuân thủ"
+  },
+  "auditBaselinesBaselineApplyTab": {
+    "status": {
+      "pending": "Đang chờ",
+      "approved": "Đã duyệt",
+      "rejected": "Đã từ chối",
+      "expired": "Đã hết hạn",
+      "consumed": "Đã sử dụng"
+    },
+    "messages": {
+      "fetchApprovalsFailed": "Không thể tải yêu cầu phê duyệt",
+      "fetchDevicesFailed": "Không thể tải danh sách thiết bị",
+      "dryRunFailed": "Chạy thử thất bại",
+      "createApprovalFailed": "Không thể tạo yêu cầu phê duyệt",
+      "processDecisionFailed": "Không thể xử lý quyết định",
+      "applyFailed": "Không thể áp dụng tiêu chuẩn cơ sở",
+      "genericError": "Đã xảy ra lỗi"
+    },
+    "steps": {
+      "select": "1. Chọn thiết bị",
+      "preview": "2. Xem trước",
+      "requested": "3. Phê duyệt"
+    },
+    "noDevices": "Không tìm thấy thiết bị {{osType}} nào trong tổ chức này.",
+    "table": {
+      "hostname": "Tên máy",
+      "os": "HĐH",
+      "status": "Trạng thái"
+    },
+    "selectedDevices": "Đã chọn {{selected}} trên tổng số {{total}} thiết bị",
+    "actions": {
+      "previewChanges": "Xem trước thay đổi",
+      "back": "Quay lại",
+      "requestApproval": "Yêu cầu phê duyệt",
+      "approve": "Phê duyệt",
+      "reject": "Từ chối",
+      "execute": "Thực thi"
+    },
+    "dryRun": {
+      "title": "Kết quả chạy thử",
+      "eligibleDevices": "Thiết bị đủ điều kiện",
+      "skipped": "Đã bỏ qua",
+      "skippedDevices": "Thiết bị đã bỏ qua"
+    },
+    "approvalRequired": {
+      "title": "Yêu cầu phê duyệt",
+      "description": "Việc áp dụng tiêu chuẩn cơ sở yêu cầu sự phê duyệt từ người dùng khác trước khi thực thi."
+    },
+    "emptyApprovals": {
+      "title": "Không có yêu cầu phê duyệt",
+      "withBaselineDescription": "Chọn thiết bị và chạy thử để tạo yêu cầu phê duyệt.",
+      "description": "Chưa có yêu cầu áp dụng tiêu chuẩn cơ sở nào được tạo."
+    },
+    "approvalsTable": {
+      "baseline": "Tiêu chuẩn cơ sở",
+      "status": "Trạng thái",
+      "devices": "Thiết bị",
+      "created": "Đã tạo",
+      "expires": "Hết hạn",
+      "actions": "Thao tác"
+    }
+  },
+  "securityScansPage": {
+    "sweepsTab": "Quét",
+    "iocScans": "Quét IOC",
+    "subtitle": "Quét phần mềm độc hại dựa trên chữ ký và IOC trên toàn bộ hệ thống của bạn. Không thay thế cho giải pháp bảo vệ endpoint toàn diện.",
+    "scansTab": "Quét",
+    "threatsTab": "Mối đe dọa",
+    "backToThreats": "Quay lại mối đe dọa"
+  },
+  "securityAgentCoverage": {
+    "title": "Phạm vi bảo mật agent",
+    "states": {
+      "covered": "Đã phủ",
+      "gap": "Khoảng trống",
+      "vendorOnly": "Chỉ nhà cung cấp",
+      "vendorOffline": "Nhà cung cấp ngoại tuyến",
+      "mismatchedOrg": "Lệch tổ chức",
+      "notApplicable": "Không áp dụng",
+      "pending": "Đang chờ"
+    },
+    "reasons": {
+      "orgNotMapped": "Tổ chức chưa được liên kết với nhà cung cấp",
+      "integrationInactive": "Tích hợp không hoạt động",
+      "orgKeyMissing": "Thiếu mã khóa tổ chức",
+      "accountKeyMissing": "Thiếu mã khóa tài khoản",
+      "platformUnsupported": "Nền tảng không được hỗ trợ",
+      "requiresMdmApproval": "Yêu cầu phê duyệt MDM",
+      "platformNotSelected": "Chưa chọn nền tảng",
+      "varMissing": "Thiếu biến triển khai",
+      "varSecret": "Biến triển khai được đánh dấu là bí mật",
+      "installerMissing": "Chưa tải lên trình cài đặt",
+      "vendorUnavailable": "Nhà cung cấp không khả dụng",
+      "installFailed": "Cài đặt thất bại",
+      "installNotArmed": "Cài đặt chưa sẵn sàng",
+      "installPending": "Cài đặt đang chờ",
+      "awaitingVendorReport": "Đang chờ báo cáo từ nhà cung cấp",
+      "awaitingEvaluation": "Đang chờ đánh giá",
+      "vendorOrgMismatch": "Nhà cung cấp báo cáo một tổ chức khác"
+    },
+    "setupLink": {
+      "installerMissing": "Tải lên trình cài đặt",
+      "default": "Mở thiết lập"
+    }
+  },
+  "sweeps": {
+    "title": "Quét IOC",
+    "started": "Đã bắt đầu quét",
+    "cancelled": "Đã hủy quét. Dừng trước khi gửi: {{queued}}. Đang chạy và hoàn tất trên thiết bị: {{stillRunning}}.",
+    "detectOnly": "Quét chỉ phát hiện. Không có mục nào bị cách ly tự động và không có quá trình quét Defender nào được khởi chạy.",
+    "version": "Phiên bản {{version}}",
+    "sweepNow": "Quét ngay",
+    "sweepNowUnpublished": "Xuất bản bộ quy tắc này trước khi quét.",
+    "sweepNowDisabled": "Bật bộ quy tắc này trước khi quét.",
+    "progress": {
+      "finished_one": "{{finished}} / {{count}} thiết bị đã hoàn tất",
+      "finished_other": "{{finished}} / {{count}} thiết bị đã hoàn tất",
+      "completed_one": "Đã xong {{count}}",
+      "completed_other": "Đã xong {{count}}",
+      "timedOut_one": "Đã quá thời gian {{count}}",
+      "timedOut_other": "Đã quá thời gian {{count}}",
+      "failed_one": "Thất bại {{count}}",
+      "failed_other": "Thất bại {{count}}",
+      "cancelled_one": "Đã hủy {{count}}",
+      "cancelled_other": "Đã hủy {{count}}",
+      "expired_one": "Đã hết hạn {{count}}",
+      "expired_other": "Đã hết hạn {{count}}"
+    },
+    "errors": {
+      "orgOutOfScope": "Một hoặc nhiều tổ chức nằm ngoài quyền truy cập của bạn.",
+      "siteOutOfScope": "Một hoặc nhiều chi nhánh nằm ngoài quyền truy cập của bạn.",
+      "deviceOutOfScope": "Một hoặc nhiều thiết bị nằm ngoài quyền truy cập của bạn.",
+      "ruleSetNotFound": "Bộ quy tắc đã chọn không còn tồn tại.",
+      "ruleSetNotPublished": "Bộ quy tắc đã chọn bị tắt hoặc chưa từng được xuất bản.",
+      "sweepTooLarge": "Lược đồ quét này sẽ quét {{targeted}} thiết bị; giới hạn mỗi lần quét là {{max}}. Hãy thu hẹp phạm vi.",
+      "noEligibleDevices": "Không có thiết bị nào trong phạm vi này có thể chạy quét lúc này. Hãy kiểm tra phiên bản agent và phạm vi.",
+      "scopeChanged": "Thiết bị hoặc bộ quy tắc đã thay đổi kể từ bản xem trước. Hãy xem lại các con số mới.",
+      "alreadyRunning": "Quét này đang chạy trên các thiết bị này.",
+      "tooManyActive": "Tổ chức này đã có {{max}} tiến trình quét hoạt động. Hãy đợi một tiến trình hoàn tất hoặc hủy bớt.",
+      "mfaRequired": "Tiến trình quét này nhắm mục tiêu {{targeted}} thiết bị, vượt quá {{threshold}}. Đăng nhập bằng xác thực đa yếu tố hoặc thu hẹp phạm vi.",
+      "rateLimited": "Quá nhiều tiến trình quét được khởi chạy gần đây. Vui lòng thử lại sau."
+    },
+    "skipReasons": {
+      "agent_too_old_one": "{{count}} thiết bị có agent quá cũ",
+      "agent_too_old_other": "{{count}} thiết bị có agent quá cũ",
+      "busy_same_sweep_one": "{{count}} thiết bị đang chạy quét này",
+      "busy_same_sweep_other": "{{count}} thiết bị đang chạy quét này",
+      "rule_set_not_eligible_one": "{{count}} thiết bị không áp dụng bộ quy tắc",
+      "rule_set_not_eligible_other": "{{count}} thiết bị không áp dụng bộ quy tắc"
+    },
+    "skipExplain": {
+      "agent_too_old": "Agent phải được cập nhật trước khi có thể chạy bộ quy tắc YARA.",
+      "busy_same_sweep": "Một tiến trình quét giống hệt vẫn đang hoạt động trên các thiết bị này.",
+      "rule_set_not_eligible": "Hệ điều hành hoặc tổ chức của thiết bị nằm ngoài phạm vi của bộ quy tắc."
+    },
+    "dialog": {
+      "title": "Quét thiết bị để tìm kết quả khớp IOC",
+      "ruleSets": "Bộ quy tắc: {{names}}",
+      "rescopeNote": "Quét không ghi nhớ thiết bị của nó. Hãy chọn lại phạm vi; bộ quy tắc, loại quét và bất kỳ đường dẫn tùy chỉnh nào được giữ nguyên.",
+      "back": "Quay lại",
+      "next": "Tiếp",
+      "previewAction": "Xem trước",
+      "confirm_one": "Quét {{count}} thiết bị",
+      "confirm_other": "Quét {{count}} thiết bị",
+      "viewRunning": "Xem tiến trình quét đang chạy",
+      "confirmSummary_one": "{{devices}} trong {{orgs}} sẽ được quét theo các phiên bản bộ quy tắc hiển thị trong bản xem trước. Các kết quả khớp được báo cáo là mối đe dọa; không có gì thay đổi trên thiết bị.",
+      "confirmSummary_other": "{{devices}} trong {{orgs}} sẽ được quét theo các phiên bản bộ quy tắc hiển thị trong bản xem trước. Các kết quả khớp được báo cáo là mối đe dọa; không có gì thay đổi trên các thiết bị.",
+      "counts": {
+        "devices_one": "{{count}} thiết bị",
+        "devices_other": "{{count}} thiết bị",
+        "orgs_one": "{{count}} tổ chức",
+        "orgs_other": "{{count}} tổ chức"
+      },
+      "steps": {
+        "scope": "Phạm vi",
+        "type": "Loại quét",
+        "duration": "Thời lượng",
+        "preview": "Xem trước",
+        "confirm": "Xác nhận"
+      },
+      "scope": {
+        "legend": "Thiết bị nào?",
+        "all": "Tất cả thiết bị có thể truy cập",
+        "orgs": "Tổ chức",
+        "sites": "Chi nhánh",
+        "groups": "Nhóm thiết bị",
+        "devices": "Thiết bị",
+        "allHelp": "Mọi thiết bị bạn có thể truy cập có thể chạy quét.",
+        "noOrgs": "Không có tổ chức nào.",
+        "siteOrg": "Tổ chức",
+        "pickOrg": "Chọn một tổ chức",
+        "noSites": "Tổ chức này không có chi nhánh nào.",
+        "sitesFailed": "Không thể tải các chi nhánh.",
+        "sitesSelected": "Chi nhánh đã chọn: {{selected}}"
+      },
+      "type": {
+        "label": "Loại quét",
+        "quick": "Nhanh",
+        "full": "Toàn diện",
+        "custom": "Đường dẫn tùy chỉnh",
+        "paths": "Đường dẫn, mỗi dòng một mục",
+        "pathsHelp": "Tối đa {{max}} đường dẫn, mỗi đường dẫn {{chars}} ký tự.",
+        "pathsCount": "{{paths}} / {{max}} đường dẫn",
+        "pathsTooMany": "{{paths}} / {{max}} đường dẫn: xóa {{remove}}.",
+        "pathTooLong": "Dòng {{line}} dài hơn {{chars}} ký tự."
+      },
+      "duration": {
+        "label": "Chạy trong (giờ)",
+        "help": "Thiết bị ngoại tuyến sẽ chạy quét khi kết nối lại trong khoảng thời gian này. Từ 1 đến {{max}} giờ.",
+        "invalid": "Nhập một số nguyên giờ từ 1 đến {{max}}."
+      },
+      "preview": {
+        "targeted": "{{devices}} trong {{orgs}}",
+        "org": "{{org}}: {{devices}}",
+        "ruleSets": "Bộ quy tắc",
+        "skipped": "Đã bỏ qua",
+        "scopeChanged": "Thiết bị hoặc bộ quy tắc đã thay đổi kể từ bản xem trước. Hãy xem lại các con số mới, sau đó xác nhận lại."
+      }
+    },
+    "panel": {
+      "empty": "Chưa có quét IOC nào. Hãy bắt đầu một quét từ bộ quy tắc phát hiện.",
+      "refreshFailed": "Không thể làm mới danh sách. Thông tin hiển thị có thể đã lỗi thời.",
+      "allSweeps": "Tất cả quét",
+      "openGroup": "Mở nhóm",
+      "cancel": "Hủy",
+      "cancelAll": "Hủy tất cả",
+      "resweep": "Quét lại với quy tắc hiện tại",
+      "rulesChanged": "Quy tắc đã thay đổi kể từ khi quét này bắt đầu",
+      "queued": "Đang xếp hàng: {{queued}}",
+      "running": "Đang chạy: {{running}}",
+      "columns": {
+        "ruleSets": "Bộ quy tắc",
+        "origin": "Bắt đầu từ",
+        "progress": "Tiến độ",
+        "skipped": "Đã bỏ qua",
+        "degraded": "Bị suy giảm",
+        "threats": "Mối đe dọa",
+        "created": "Đã tạo",
+        "state": "Trạng thái"
+      },
+      "state": {
+        "active": "Hoạt động",
+        "completed": "Đã hoàn thành",
+        "cancelled": "Đã hủy",
+        "expired": "Đã hết hạn"
+      },
+      "origin": {
+        "web": "Web",
+        "api": "API",
+        "ai_chat": "Breeze AI",
+        "mcp": "MCP"
+      },
+      "scanType": {
+        "quick": "Quét nhanh",
+        "full": "Quét toàn diện",
+        "custom": "Đường dẫn tùy chỉnh"
+      }
+    }
+  },
+  "detectionRules": {
+    "title": "Quy tắc phát hiện",
+    "subtitle": "Bộ quy tắc quét IOC và săn lùng mối đe dọa. Mọi thay đổi đều được kiểm tra trên máy chủ trước khi thiết bị nhận được.",
+    "listHelp": "Đính kèm bộ quy tắc vào tab Bảo mật của Chính sách cấu hình để sử dụng chúng trong quá trình quét IOC.",
+    "newRuleSet": "Bộ quy tắc mới",
+    "back": "Quay lại bộ quy tắc",
+    "loadFailed": "Không thể tải bộ quy tắc.",
+    "empty": "Chưa có bộ quy tắc nào.",
+    "rulesLabel": "Quy tắc: {{total}}",
+    "publishedVersion": "v{{version}}",
+    "created": "Đã tạo bộ quy tắc",
+    "deleted": "Đã xóa bộ quy tắc",
+    "columns": {
+      "name": "Tên",
+      "owner": "Chủ sở hữu",
+      "rules": "Quy tắc",
+      "published": "Đã xuất bản"
+    },
+    "owner": {
+      "builtin": "Breeze (có sẵn)",
+      "allOrgs": "Tất cả tổ chức",
+      "organization": "Tổ chức"
+    },
+    "badges": {
+      "builtin": "Có sẵn",
+      "allOrgs": "Tất cả tổ chức",
+      "errors": "Có lỗi",
+      "checkerUnavailable": "Trình biên dịch không khả dụng",
+      "unpublished": "Chưa xuất bản",
+      "disabled": "Đã tắt"
+    },
+    "create": {
+      "title": "Bộ quy tắc mới",
+      "name": "Tên",
+      "description": "Mô tả (tùy chọn)",
+      "owner": "Chủ sở hữu",
+      "ownerAllOrgs": "Tất cả tổ chức (toàn đối tác)",
+      "ownerOrganization": "Một tổ chức",
+      "organization": "Tổ chức",
+      "selectOrganization": "Chọn một tổ chức",
+      "submit": "Tạo bộ quy tắc"
+    },
+    "errors": {
+      "autoQuarantineExecuteRequired": "Bật tính năng tự động cách ly yêu cầu quyền devices:execute, vì tính năng này di chuyển tệp trên mọi thiết bị quét bằng bộ này.",
+      "iocBatchAlreadyImported": "Các IOC này đã được nhập vào bộ này.",
+      "iocRuleNameTaken": "Một quy tắc có tên đã tạo trùng lặp đã tồn tại trong bộ này với nội dung khác. Hãy đổi tên hoặc xóa quy tắc đó, rồi nhập lại.",
+      "iocTooManyRules": "Việc nhập này sẽ khiến bộ quy tắc vượt quá giới hạn {{max}} quy tắc. Hãy nhập vào bộ khác.",
+      "iocInvalid": "Một số IOC không hợp lệ. Sửa các dòng được đánh dấu và thử lại."
+    },
+    "test": {
+      "requestFailed": "Quá trình kiểm tra không hoàn tất. Kiểm tra kết nối và thử lại.",
+      "privacy": "Tệp được quét trên máy chủ Breeze trong môi trường cô lập, dựa trên các quy tắc hiện tại của bộ này, bao gồm cả các thay đổi chưa được xuất bản. Tệp không được lưu trữ. Chỉ có mã SHA-256, kích thước và số lượng khớp được ghi lại trong nhật ký kiểm toán.",
+      "sandboxUnavailable": "Không hỗ trợ kiểm tra tệp trên máy chủ này",
+      "sandboxUnavailableHelp": "Máy chủ không thể cô lập quá trình quét nên không chạy các tệp đã tải lên. Việc chỉnh sửa quy tắc, nhập IOC và quét thiết bị không bị ảnh hưởng.",
+      "file": "Tệp cần kiểm tra",
+      "filepath": "Đường dẫn trên thiết bị (tùy chọn)",
+      "filepathHelp": "Vị trí tệp sẽ nằm trên thiết bị. Các quy tắc khớp theo đường dẫn sẽ sử dụng giá trị này; mặc định là tên tệp.",
+      "run": "Chạy kiểm tra",
+      "running": "Đang kiểm tra…",
+      "testedVersion": "Đã kiểm tra phiên bản {{version}}",
+      "unpublishedChanges": "Đang kiểm tra các thay đổi chưa xuất bản của bạn.",
+      "noMatches": "Không có quy tắc nào khớp.",
+      "errors": {
+        "tooLarge": "Tệp lớn hơn {{max}} MB. Hãy chọn tệp nhỏ hơn.",
+        "busy": "Một bài kiểm tra khác đang chạy. Thử lại sau vài giây.",
+        "rateLimited": "Bạn đã chạy quá nhiều bài kiểm tra trong vài phút qua. Thử lại sau.",
+        "unavailable": "Trình kiểm tra quy tắc không khả dụng. Thử lại sau.",
+        "noRules": "Bộ này không có quy tắc nào được bật để kiểm tra.",
+        "compileFailed": "Bộ này không thể biên dịch với các quy tắc hiện tại, nên không có gì được quét:",
+        "bodyTimeout": "Quá trình tải lên mất quá nhiều thời gian. Thử lại.",
+        "unexpected": "Không thể hoàn tất kiểm tra. Thử lại."
+      }
+    },
+    "severity": {
+      "low": "Thấp",
+      "medium": "Trung bình",
+      "high": "Cao",
+      "critical": "Nghiêm trọng"
+    },
+    "publish": {
+      "saved": "Đã lưu",
+      "autoQuarantineOnly": "Tính năng tự động cách ly hiện đã tắt trên các thiết bị. Các thay đổi khác của bạn chưa được áp dụng trực tiếp.",
+      "published": "Đã lưu và xuất bản dưới dạng phiên bản {{version}}",
+      "savedDisabled": "Đã lưu. Bộ quy tắc đã bị tắt nên thiết bị không sử dụng.",
+      "checkerUnavailable": "Đã lưu, chưa xuất bản: trình biên dịch YARA không khả dụng trên máy chủ này nên không thể kiểm tra quy tắc. {{devices}}",
+      "compileErrors_one": "Đã lưu, chưa xuất bản: {{count}} quy tắc có lỗi. {{devices}}",
+      "compileErrors_other": "Đã lưu, chưa xuất bản: {{count}} quy tắc có lỗi. {{devices}}",
+      "setErrors": "Đã lưu, chưa xuất bản: {{message}}. {{devices}}",
+      "noEnabledRules": "Không có quy tắc nào được bật: thiết bị không còn quét bằng bộ này nữa.",
+      "unknown": "Đã lưu, nhưng không thể đọc kết quả xuất bản. Tải lại bộ quy tắc để xem thiết bị đang sử dụng phiên bản nào.",
+      "devicesKeep": "Thiết bị giữ nguyên phiên bản {{version}}.",
+      "neverPublished": "Bộ này chưa được xuất bản nên thiết bị không sử dụng.",
+      "setDisabled": "Bộ này đã bị tắt nên thiết bị không sử dụng.",
+      "staleBanner": "Chưa xuất bản: khắc phục các lỗi bên dưới. {{devices}}",
+      "staleCheckerUnavailable": "Chưa xuất bản: trình biên dịch YARA không khả dụng trên máy chủ này nên không thể kiểm tra hoặc xuất bản thay đổi quy tắc. {{devices}}"
+    },
+    "editor": {
+      "tabs": {
+        "rules": "Quy tắc",
+        "import": "Nhập IOC",
+        "test": "Kiểm tra tệp"
+      },
+      "rename": "Đổi tên bộ quy tắc",
+      "enabled": "Đã bật",
+      "autoQuarantine": "Tự động cách ly",
+      "autoQuarantineHelp": "Di chuyển các tệp khớp vào khu vực cách ly trên mọi thiết bị quét bằng bộ này.",
+      "deleteSet": "Xóa",
+      "deleteSetTitle": "Xóa bộ quy tắc này?",
+      "deleteSetMessage": "Các quy tắc trong bộ này cũng sẽ bị xóa. Các chính sách vẫn liệt kê bộ này sẽ ghi nhận là không tìm thấy trong lần quét tiếp theo.",
+      "deleteRuleTitle": "Xóa quy tắc này?",
+      "deleteRuleMessage": "Bộ quy tắc được kiểm tra và xuất bản lại mà không có quy tắc đó.",
+      "addRule": "Thêm quy tắc",
+      "noRules": "Chưa có quy tắc nào trong bộ này.",
+      "columns": {
+        "name": "Quy tắc",
+        "severity": "Mức độ nghiêm trọng",
+        "tags": "Thẻ",
+        "state": "Trạng thái"
+      },
+      "viewSource": "Xem mã nguồn",
+      "hideSource": "Ẩn mã nguồn",
+      "editRule": "Sửa quy tắc",
+      "deleteRule": "Xóa quy tắc",
+      "errorLine": "Dòng {{line}}:",
+      "publishedVersion": "Phiên bản đã xuất bản {{version}}",
+      "readOnlyBuiltin": "Bộ quy tắc có sẵn là chỉ đọc. Các quy tắc sẽ được cập nhật theo các bản phát hành của Breeze.",
+      "refreshFailed": "Đã gửi thay đổi nhưng không thể tải lại bộ quy tắc. Nội dung bạn thấy có thể đã lỗi thời."
+    },
+    "dialog": {
+      "titleAdd": "Thêm quy tắc",
+      "titleEdit": "Sửa quy tắc",
+      "name": "Tên quy tắc",
+      "nameHelp": "Chữ cái, chữ số và dấu gạch dưới, bắt đầu bằng chữ cái hoặc dấu gạch dưới (tối đa 128).",
+      "severity": "Mức độ nghiêm trọng",
+      "tags": "Thẻ",
+      "tagsHelp": "Phân tách bằng dấu phẩy, ví dụ: ransomware, advisory-42",
+      "enabled": "Đã bật",
+      "source": "Mã nguồn YARA",
+      "sourceTooLarge": "Mã nguồn quy tắc lớn hơn {{max}} KB.",
+      "checkedOnSave": "Bộ quy tắc được kiểm tra bằng chính trình biên dịch mà thiết bị sử dụng khi bạn lưu. Các quy tắc có lỗi sẽ không được xuất bản."
+    },
+    "ioc": {
+      "help": {
+        "title": "Cách thức hoạt động của trình nhập",
+        "format": "Một IOC trên mỗi dòng (# bắt đầu chú thích) hoặc một mảng JSON. Thêm tiền tố loại vào đầu dòng, như sha256: hoặc domain:, để tự thiết lập loại.",
+        "exactMatch": "Chỉ khớp chính xác: không dùng ký tự đại diện hoặc mẫu.",
+        "contentNotTraffic": "Tên miền và địa chỉ IP khớp với văn bản bên trong tệp được quét, không phải lưu lượng mạng.",
+        "partialOverlap": "Hệ thống phát hiện việc nhập trùng lặp các IOC. Một lô chỉ trùng một phần với lượt nhập trước đó sẽ không được khử trùng lặp."
+      },
+      "label": "Nhãn",
+      "labelPlaceholder": "Ví dụ: Khuyến cáo nhà cung cấp 2026-10",
+      "labelRequired": "Nhập nhãn để xem trước các quy tắc được tạo.",
+      "paste": "Dán IOC",
+      "textTooLong": "Văn bản đã dán lớn hơn {{max}} KB. Hãy chia nhỏ nội dung nhập.",
+      "skippedLines": "Các dòng sau bị bỏ qua:",
+      "lineError": "Dòng {{line}}: {{error}}",
+      "validCount": "{{valid}} / {{total}} IOC sẵn sàng nhập",
+      "kind": "Loại",
+      "value": "Giá trị",
+      "kinds": {
+        "md5": "Mã băm MD5",
+        "sha1": "Mã băm SHA-1",
+        "sha256": "Mã băm SHA-256",
+        "filename": "Tên tệp",
+        "filepath": "Đường dẫn tệp",
+        "domain": "Tên miền",
+        "ip": "Địa chỉ IP",
+        "string": "Chuỗi văn bản"
+      },
+      "errors": {
+        "empty": "Giá trị trống",
+        "unknown_kind": "Loại không xác định",
+        "bad_hash": "Mã băm không hợp lệ cho loại này",
+        "too_short": "Văn bản phải có ít nhất 4 byte",
+        "too_long": "Quá dài",
+        "bad_path": "Đường dẫn không hợp lệ cho loại này",
+        "bad_ip": "Địa chỉ IP không hợp lệ",
+        "bad_domain": "Tên miền không hợp lệ",
+        "duplicate": "Bị trùng lặp với dòng trước"
+      },
+      "overCap": "Tối đa {{max}} IOC mỗi lần nhập. Hãy chia nhỏ danh sách.",
+      "hashNote": "IOC mã băm khiến thiết bị băm toàn bộ mọi tệp được quét, do đó quét toàn bộ sẽ mất nhiều thời gian hơn.",
+      "generateFailed": "Không thể tạo quy tắc từ các IOC này.",
+      "generatedTitle": "Các quy tắc sẽ được lưu: {{total}}",
+      "import": "Nhập {{total}} IOC"
+    }
+  },
+  "sensitiveDataAccess": {
+    "noOrgAccess": "Bạn không có quyền truy cập vào tổ chức này"
+  },
+  "sensitiveDataLabels": {
+    "risk": {
+      "critical": "Nghiêm trọng",
+      "high": "Cao",
+      "medium": "Trung bình",
+      "low": "Thấp"
+    },
+    "findingStatus": {
+      "open": "Đang mở",
+      "remediated": "Đã xử lý",
+      "accepted": "Đã chấp nhận",
+      "falsePositive": "Dương tính giả"
+    },
+    "scanStatus": {
+      "queued": "Đang chờ",
+      "running": "Đang chạy",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy"
+    },
+    "dataType": {
+      "credential": "Thông tin đăng nhập",
+      "financial": "Tài chính"
+    },
+    "a11y": {
+      "editPolicy": "Sửa chính sách {{name}}",
+      "deletePolicy": "Xóa chính sách {{name}}",
+      "togglePolicyActive": "Đang hoạt động: {{name}}"
+    }
+  }
+}

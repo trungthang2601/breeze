@@ -1,0 +1,675 @@
+{
+  "assetDetailModal": {
+    "assetInfoTitle": "Thông tin tài sản",
+    "confirmUnlink": "Hủy liên kết thiết bị này?",
+    "detailsUnavailableDescription": "Chúng tôi không thể tải bản ghi của thiết bị này. Thiết bị có thể đã bị xóa hoặc bạn không có quyền truy cập.",
+    "detailsUnavailableTitle": "Chi tiết không khả dụng",
+    "deviceDetailsTitle": "Chi tiết thiết bị",
+    "errors": {
+      "generic": "Đã xảy ra lỗi"
+    },
+    "fields": {
+      "assetType": "Loại tài sản",
+      "displayName": "Tên hiển thị",
+      "notesDescription": "Ghi chú / Mô tả",
+      "osFingerprint": "Dấu vân tay HĐH",
+      "ping": "Ping",
+      "tags": "Thẻ (phân tách bằng dấu phẩy)"
+    },
+    "lastSeen": "Lần cuối thấy {{time}}",
+    "loadingDetails": "Đang tải chi tiết thiết bị…",
+    "networkDetailsTitle": "Chi tiết mạng",
+    "noOpenPorts": "Không phát hiện cổng mở nào.",
+    "noSnmpData": "Không có dữ liệu SNMP nào được thu thập — thiết bị có thể không phản hồi hoặc SNMP chưa được dò quét. Kiểm tra xem phương thức SNMP đã được bật và chuỗi cộng đồng đã được đặt trên cấu hình dò quét chưa.",
+    "openPorts": "Cổng mở",
+    "proxy": {
+      "manageOnDevicePage": "Quản lý quyền truy cập proxy trên trang thiết bị mạng",
+      "title": "Truy cập Proxy"
+    },
+    "snmpDataTitle": "Dữ liệu SNMP",
+    "snmpFields": {
+      "systemName": "Tên hệ thống",
+      "objectId": "ID đối tượng"
+    },
+    "sameDeviceAs": "Cùng thiết bị với {{name}}",
+    "peek": {
+      "manageTitle": "Quản lý tài sản này",
+      "manageDescription": "Nhận diện, giám sát, liên kết và xóa đều nằm trên trang thiết bị.",
+      "openDevicePage": "Mở trang thiết bị",
+      "settings": "Cài đặt…",
+      "reachabilityLine": "{{state}} · {{source}} {{age}}",
+      "lastSeenLine": "Lần cuối thấy · {{source}} {{age}}",
+      "state": {
+        "responding": "Đang phản hồi",
+        "notResponding": "Không phản hồi",
+        "unverified": "Chưa xác minh"
+      },
+      "source": {
+        "networkCheck": "kiểm tra mạng",
+        "probe": "kiểm tra ngay",
+        "scan": "quét",
+        "unifi": "UniFi",
+        "snmp": "SNMP"
+      }
+    }
+  },
+  "discoveredAssetList": {
+    "actions": {
+      "approve": "Phê duyệt",
+      "approveSelected": "Phê duyệt mục đã chọn ({{count}})",
+      "approving": "Đang phê duyệt...",
+      "clearAll": "Xóa tất cả",
+      "clearSelection": "Bỏ chọn",
+      "deselectAllVisible": "Bỏ chọn tất cả mục hiển thị",
+      "dismiss": "Bỏ qua",
+      "dismissSelected": "Bỏ qua mục đã chọn ({{count}})",
+      "dismissing": "Đang bỏ qua...",
+      "selectAllVisible": "Chọn tất cả hiển thị",
+      "selectAllVisibleAssets": "Chọn tất cả tài sản hiển thị",
+      "selectAsset": "Chọn tài sản {{asset}}",
+      "viewDetails": "Xem chi tiết",
+      "settings": "Cài đặt…"
+    },
+    "columns": {
+      "approval": "Phê duyệt",
+      "host": "Máy chủ",
+      "lastSeen": "Lần cuối thấy"
+    },
+    "description": "Xem lại các tài sản được phát hiện trong môi trường của bạn.",
+    "empty": "Chưa có tài sản nào được khám phá.",
+    "emptyFiltered": "Không có tài sản nào khớp với bộ lọc hiện tại.",
+    "errors": {
+      "approve": "Không thể phê duyệt tài sản",
+      "bulkApprove": "Không thể phê duyệt các tài sản đã chọn",
+      "bulkDismiss": "Không thể bỏ qua các tài sản đã chọn",
+      "dismiss": "Không thể bỏ qua tài sản",
+      "fetch": "Không thể tải các tài sản được khám phá",
+      "generic": "Đang xảy ra lỗi"
+    },
+    "filters": {
+      "profile": "Cấu hình",
+      "subnet": "Mạng con"
+    },
+    "loading": "Đang tải tài sản được khám phá...",
+    "monitored": "Đã giám sát",
+    "title": "Tài sản được khám phá",
+    "tryAgain": "Thử lại",
+    "agentInstalled": "Agent"
+  },
+  "discoveryJobList": {
+    "actions": {
+      "assets": "Tài sản",
+      "cancelJob": "Hủy tác vụ",
+      "clearAll": "Xóa tất cả",
+      "clearFilter": "Xóa bộ lọc",
+      "viewDiscoveredAssets": "Xem tài sản được khám phá"
+    },
+    "columns": {
+      "duration": "Thời lượng",
+      "finished": "Đã hoàn thành",
+      "hostsDiscovered": "Máy chủ được khám phá",
+      "newAssets": "Tài sản mới",
+      "profile": "Cấu hình",
+      "progress": "Tiến độ",
+      "scheduled": "Đã lên lịch",
+      "started": "Đã bắt đầu"
+    },
+    "description": "Theo dõi các lần quét đang chạy và đã lên lịch.",
+    "empty": "Chưa có tác vụ khám phá nào.",
+    "emptyForProfile": "Chưa có tác vụ nào cho cấu hình này.",
+    "errors": {
+      "cancel": "Không thể hủy tác vụ",
+      "fetch": "Không thể tải các tác vụ khám phá",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "filteredByProfile": "Lọc theo cấu hình:",
+    "filters": {
+      "subnet": "Mạng con"
+    },
+    "loading": "Đang tải tác vụ khám phá...",
+    "status": {
+      "scheduled": "Đã lên lịch",
+      "running": "Đang chạy",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy",
+      "pending": "Đang chờ"
+    },
+    "title": "Tác vụ khám phá",
+    "tryAgain": "Thử lại",
+    "unknownProfile": "Cấu hình không xác định"
+  },
+  "discoveryPage": {
+    "actions": {
+      "newProfile": "Cấu hình mới"
+    },
+    "allOrgs": {
+      "description": "Khám phá mạng được giới hạn trong một tổ chức, chi nhánh và agent duy nhất. Chọn một tổ chức trong trình chuyển đổi phạm vi để xem tài sản, cấu hình, tác vụ quét và sơ đồ mạng được khám phá của tổ chức đó."
+    },
+    "confirmDeleteProfile": "Xóa cấu hình \"{{name}}\"? Thao tác này cũng sẽ xóa tất cả các tác vụ quét liên quan.",
+    "description": "Cấu hình dò quét, giám sát quét và quản lý tài sản mạng.",
+    "errors": {
+      "deleteProfile": "Không thể xóa cấu hình",
+      "fetchProfiles": "Không thể tải cấu hình dò quét",
+      "generic": "Đã xảy ra lỗi",
+      "loadProfileDetails": "Không thể tải chi tiết cấu hình",
+      "loadProfileDetailsHttp": "Không thể tải chi tiết cấu hình (HTTP {{status}})",
+      "profileDeletedRefresh": "Cấu hình này có thể đã bị xóa. Vui lòng làm mới trang.",
+      "profileDetailsUnavailable": "Điểm cuối chi tiết cấu hình không khả dụng. Thông tin xác thực SNMP có thể chưa được tải.",
+      "runProfile": "Không thể chạy cấu hình dò quét \"{{name}}\"",
+      "saveProfile": "Không thể lưu cấu hình",
+      "selectSite": "Vui lòng chọn một chi nhánh cho cấu hình dò quét này.",
+      "snmpAuthPassphrase": "Cần có mật khẩu xác thực SNMPv3.",
+      "snmpUsername": "Cần có tên người dùng SNMPv3."
+    },
+    "modal": {
+      "closeAria": "Đóng cửa sổ cài đặt cấu hình",
+      "createProfile": "Tạo cấu hình",
+      "creating": "Đang tạo...",
+      "description": "Cấu hình phạm vi mạng, phương thức quét và cài đặt lịch trình.",
+      "editTitle": "Sửa Hồ sơ Phát hiện",
+      "newTitle": "Hồ sơ Phát hiện Mới",
+      "updateProfile": "Cập nhật Hồ sơ",
+      "updating": "Đang cập nhật..."
+    },
+    "relative": {
+      "daysAgo": "{{count}}d trước",
+      "hoursAgo": "{{count}}h trước",
+      "justNow": "vừa xong",
+      "minutesAgo": "{{count}}m trước",
+      "monthsAgo": "{{count}}mo trước"
+    },
+    "schedule": {
+      "cron": "Lịch trình Cron",
+      "cronValue": "Cron: {{cron}}",
+      "daily": "Hàng ngày lúc {{time}}",
+      "everyHours": "Mỗi {{count}} giờ",
+      "everyMinutes": "Mỗi {{count}} phút",
+      "interval": "Lịch trình định kỳ",
+      "manual": "Thủ công",
+      "monthly": "Hàng tháng vào ngày {{day}} lúc {{time}}",
+      "weekly": "Hàng tuần vào {{day}} lúc {{time}}"
+    },
+    "tabs": {
+      "assets": "Tài sản",
+      "baselines": "Đường cơ sở",
+      "changes": "Thay đổi",
+      "jobs": "Tác vụ",
+      "profiles": "Hồ sơ",
+      "topology": "Sơ đồ mạng"
+    },
+    "title": "Phát hiện Mạng",
+    "toasts": {
+      "scanQueued": "Đã xếp hàng quét phát hiện cho \"{{name}}\"",
+      "profileCreated": "Đã tạo hồ sơ phát hiện \"{{name}}\"",
+      "profileUpdated": "Đã cập nhật hồ sơ phát hiện \"{{name}}\"",
+      "profileDeleted": "Đã xóa hồ sơ phát hiện \"{{name}}\"",
+      "profileMoved": "Đã chuyển hồ sơ sang {{site}}.",
+      "assetsMoved_one": "Đã chuyển {{count}} thiết bị mạng",
+      "assetsMoved_other": "Đã chuyển {{count}} thiết bị mạng",
+      "agentLinksRemoved_one": "Đã gỡ liên kết {{count}} agent",
+      "agentLinksRemoved_other": "Đã gỡ liên kết {{count}} agent",
+      "monitorsReattached_one": "Đã kết nối lại {{count}} monitor",
+      "monitorsReattached_other": "Đã kết nối lại {{count}} monitor",
+      "topologyPoliciesDisabled_one": "Đã vô hiệu hóa {{count}} chính sách sơ đồ mạng",
+      "topologyPoliciesDisabled_other": "Đã vô hiệu hóa {{count}} chính sách sơ đồ mạng"
+    },
+    "days": {
+      "monday": "Thứ Hai",
+      "tuesday": "Thứ Ba",
+      "wednesday": "Thứ Tư",
+      "thursday": "Thứ Năm",
+      "friday": "Thứ Sáu",
+      "saturday": "Thứ Bảy",
+      "sunday": "Chủ Nhật"
+    }
+  },
+  "discoveryProfileForm": {
+    "alerting": {
+      "alertOnChanged": "Thiết bị đã thay đổi",
+      "alertOnDisappeared": "Thiết bị biến mất",
+      "alertOnNew": "Thiết bị mới",
+      "description": "Cảnh báo khi phát hiện thiết bị mới hoặc thay đổi trên subnet này.",
+      "enable": "Bật cảnh báo mạng",
+      "title": "Cảnh báo Mạng"
+    },
+    "cadence": {
+      "daily": "Hàng ngày",
+      "hourly": "Hàng giờ",
+      "interval": "Khoảng thời gian tùy chỉnh",
+      "monthly": "Hàng tháng",
+      "weekly": "Hàng tuần"
+    },
+    "days": {
+      "monday": "Thứ Hai",
+      "tuesday": "Thứ Ba",
+      "wednesday": "Thứ Tư",
+      "thursday": "Thứ Năm",
+      "friday": "Thứ Sáu",
+      "saturday": "Thứ Bảy",
+      "sunday": "Chủ Nhật"
+    },
+    "fields": {
+      "authPassphrase": "Cụm mật khẩu xác thực",
+      "authProtocol": "Giao thức xác thực",
+      "community": "Chuỗi cộng đồng (Community string)",
+      "dayOfMonth": "Ngày trong tháng",
+      "dayOfWeek": "Ngày trong tuần",
+      "methods": "Phương thức phát hiện",
+      "port": "Cổng",
+      "privacyPassphrase": "Cụm mật khẩu bảo mật",
+      "privacyProtocol": "Giao thức bảo mật",
+      "profileName": "Tên hồ sơ",
+      "repeatEvery": "Lặp lại mỗi",
+      "repeatEveryMinutes": "Lặp lại mỗi (phút)",
+      "retainChangeLog": "Lưu nhật ký thay đổi (ngày)",
+      "retries": "Số lần thử lại",
+      "scheduleCadence": "Tần suất lịch trình",
+      "snmpVersion": "Phiên bản SNMP",
+      "subnets": "Subnet cần quét",
+      "time": "Thời gian",
+      "timeout": "Hết thời gian (ms)",
+      "timezone": "Múi giờ",
+      "username": "Tên đăng nhập",
+      "scanAgent": "Agent quét"
+    },
+    "options": {
+      "everyHours": "Mỗi {{count}} giờ",
+      "selectSite": "Chọn một chi nhánh...",
+      "automaticAgent": "Tự động (ưu tiên agent trên các subnet này)",
+      "agentOffline": "{{name}} (ngoại tuyến)",
+      "pinnedAgentUnlisted": "Agent được ghim (không ở chi nhánh này)"
+    },
+    "placeholders": {
+      "profileName": "Quét trụ sở",
+      "subnets": "10.0.0.0/24\\n10.0.1.0/24"
+    },
+    "profileDetails": {
+      "description": "Xác định phạm vi mạng và phương thức phát hiện.",
+      "title": "Chi tiết Hồ sơ"
+    },
+    "schedule": {
+      "description": "Đặt thời gian chạy tác vụ phát hiện.",
+      "title": "Lịch trình"
+    },
+    "snmp": {
+      "description": "Thông tin xác thực dùng cho các lệnh thăm dò SNMP.",
+      "title": "Cài đặt SNMP"
+    },
+    "subnetsHelp": "Nhập dải CIDR cách nhau bằng dấu phẩy hoặc xuống dòng.",
+    "validation": {
+      "invalidCidr": "\"{{value}}\": không phải dải CIDR hoặc địa chỉ IP hợp lệ",
+      "octet": "\"{{value}}\": giá trị octet vượt quá 255",
+      "prefix": "\"{{value}}\": độ dài tiền tố phải từ 0–32",
+      "subnetRequired": "Cần có ít nhất một subnet hoặc địa chỉ IP.",
+      "subnetTooLarge": "\"{{value}}\": subnet quá lớn. Agent sẽ bỏ qua các subnet có trên {{limit}} địa chỉ (lớn hơn /16); hãy chia thành các dải nhỏ hơn"
+    },
+    "actions": {
+      "saveProfile": "Lưu Hồ sơ"
+    },
+    "methods": {
+      "ping": "ICMP Ping",
+      "arp": "ARP Sweep",
+      "snmp": "Thăm dò SNMP",
+      "portScan": "Quét cổng TCP"
+    },
+    "siteMove": {
+      "notice": "Hồ sơ này sẽ quét từ chi nhánh mới kể từ bây giờ. Các thiết bị đã phát hiện vẫn ở chi nhánh hiện tại trừ khi bạn chuyển chúng.",
+      "moveAssets_one": "Đồng thời chuyển {{count}} thiết bị mạng do hồ sơ này phát hiện sang chi nhánh mới",
+      "moveAssets_other": "Đồng thời chuyển {{count}} thiết bị mạng do hồ sơ này phát hiện sang chi nhánh mới",
+      "moveAssetsUnknown": "Đồng thời chuyển các thiết bị mạng do hồ sơ này phát hiện sang chi nhánh mới"
+    },
+    "scanAgentHelp": {
+      "automatic": "Ưu tiên agent trực tuyến ở chi nhánh này có địa chỉ thuộc một trong các subnet.",
+      "pinned": "Quét chỉ chạy từ agent này. Nếu ngoại tuyến, quá trình quét sẽ thất bại thay vì dùng agent khác.",
+      "loadError": "Không thể tải agent của chi nhánh này. Vẫn có sẵn tính năng chọn tự động."
+    },
+    "subnetTopologyNote": "Các subnet ở đây cũng xác định mạng của chi nhánh này trên bản đồ sơ đồ mạng."
+  },
+  "discoveryProfileList": {
+    "actions": {
+      "deleteProfile": "Xóa hồ sơ",
+      "editProfile": "Sửa hồ sơ",
+      "runNow": "Chạy ngay",
+      "runProfile": "Chạy {{name}}",
+      "running": "Đang chạy...",
+      "runningProfile": "Đang chạy {{name}}",
+      "viewJobs": "Xem tác vụ"
+    },
+    "columns": {
+      "methods": "Phương thức",
+      "profile": "Hồ sơ",
+      "schedule": "Lịch chạy",
+      "subnets": "Dải mạng con"
+    },
+    "configuredCount": "Đã cấu hình {{count}} hồ sơ",
+    "configuredCount_one": "Đã cấu hình {{count}} hồ sơ",
+    "configuredCount_other": "Đã cấu hình {{count}} hồ sơ",
+    "empty": "Chưa có hồ sơ phát hiện nào. Tạo hồ sơ đầu tiên để bắt đầu quét.",
+    "lastRun": "Chạy lần cuối {{time}}",
+    "loading": "Đang tải hồ sơ phát hiện...",
+    "nextRun": "Tiếp theo: {{time}}",
+    "notRunYet": "Chưa chạy lần nào",
+    "scheduleHint": "Lịch chạy tự động hoặc theo yêu cầu",
+    "status": {
+      "active": "Hoạt động",
+      "paused": "Đã tạm dừng",
+      "draft": "Bản nháp",
+      "error": "Lỗi"
+    },
+    "title": "Hồ sơ phát hiện",
+    "tryAgain": "Thử lại"
+  },
+  "networkBaselinesPanel": {
+    "actions": {
+      "changes": "Thay đổi",
+      "create": "Tạo mốc chuẩn",
+      "creating": "Đang tạo...",
+      "runNow": "Chạy ngay",
+      "saveSettings": "Lưu cài đặt mốc chuẩn",
+      "viewChanges": "Xem thay đổi"
+    },
+    "alertLabels": {
+      "changed": "Thiết bị đã đổi",
+      "disappeared": "Thiết bị biến mất",
+      "newDevice": "Thiết bị mới",
+      "rogue": "Thiết bị lạ"
+    },
+    "alertNames": {
+      "changed": "đã đổi",
+      "gone": "đã mất",
+      "new": "mới",
+      "rogue": "lạ"
+    },
+    "alertsSummary": "Cảnh báo: {{alerts}}",
+    "columns": {
+      "knownDevices": "Thiết bị đã biết",
+      "lastScan": "Lần quét cuối",
+      "schedule": "Lịch chạy",
+      "subnet": "Dải mạng con"
+    },
+    "deleteDialog": {
+      "confirm": "Xóa mốc chuẩn",
+      "message": "Bạn có chắc muốn xóa mốc chuẩn {{subnet}} không? Các sự kiện thay đổi liên quan cũng sẽ bị xóa. Thao tác này không thể hoàn tác.",
+      "title": "Xóa mốc chuẩn mạng"
+    },
+    "empty": "Chưa có mốc chuẩn mạng nào. Tạo một cái để bật tính năng phát hiện thay đổi liên tục.",
+    "errors": {
+      "create": "Không thể tạo mốc chuẩn",
+      "delete": "Không thể xóa mốc chuẩn",
+      "load": "Không thể tải mốc chuẩn mạng",
+      "run": "Không thể kích hoạt quét mốc chuẩn",
+      "save": "Không thể lưu mốc chuẩn",
+      "update": "Không thể cập nhật mốc chuẩn"
+    },
+    "everyHoursShort": "Mỗi {{count}}h",
+    "fields": {
+      "alertSettings": "Cài đặt cảnh báo",
+      "enableScheduledScans": "Bật quét theo lịch",
+      "scanInterval": "Tần suất quét (giờ)",
+      "subnetCidr": "Mạng con (CIDR)"
+    },
+    "form": {
+      "createDescription": "Tạo mốc chuẩn mạng con để so sánh phát hiện theo lịch.",
+      "createTitle": "Tạo mốc chuẩn",
+      "editDescription": "Cập nhật tần suất quét và hành vi cảnh báo.",
+      "editTitle": "Sửa mốc chuẩn",
+      "immutableHint": "Chi nhánh và mạng con không thể thay đổi sau khi tạo."
+    },
+    "loading": "Đang tải mốc chuẩn mạng...",
+    "messages": {
+      "created": "Đã tạo mốc chuẩn.",
+      "deleted": "Đã xóa mốc chuẩn {{subnet}}.",
+      "scanQueued": "Đã đưa vào hàng đợi quét.",
+      "scanQueuedWithId": "Đã đưa vào hàng đợi quét ({{id}}).",
+      "updated": "Đã cập nhật cài đặt mốc chuẩn."
+    },
+    "next": "Tiếp theo: {{time}}",
+    "options": {
+      "selectSite": "Chọn chi nhánh"
+    },
+    "paused": "Đã tạm dừng",
+    "scheduleBlocked": "Quét định kỳ đã tạm dừng: cần phê duyệt lại",
+    "permissionManage": "Các hành động thay đổi bị vô hiệu hóa do lỗi kiểm tra quyền. Yêu cầu `devices:write`.",
+    "placeholders": {
+      "subnet": "192.168.1.0/24"
+    },
+    "title": "Mốc chuẩn mạng",
+    "validation": {
+      "cidr": "Mạng con phải ở định dạng CIDR (ví dụ: 192.168.1.0/24).",
+      "interval": "Tần suất quét phải từ 1 đến 168 giờ.",
+      "selectSite": "Chọn chi nhánh trước khi lưu."
+    },
+    "configuredCount": "Đã cấu hình {{count}} mốc chuẩn",
+    "configuredCount_one": "Đã cấu hình {{count}} mốc chuẩn",
+    "configuredCount_other": "Đã cấu hình {{count}} mốc chuẩn",
+    "subnetTopologyNote": "Các mạng con ở đây cũng xác định mạng của chi nhánh này trên bản đồ cấu trúc."
+  },
+  "networkChangeDetailModal": {
+    "acknowledgeTitle": "Xác nhận sự kiện",
+    "actions": {
+      "acknowledge": "Xác nhận",
+      "acknowledging": "Đang xác nhận...",
+      "linkDevice": "Liên kết thiết bị",
+      "linking": "Đang liên kết..."
+    },
+    "alreadyAcknowledged": "Sự kiện này đã được xác nhận.",
+    "currentState": "Trạng thái hiện tại",
+    "errors": {
+      "acknowledge": "Không thể xác nhận sự kiện",
+      "linkDevice": "Không thể liên kết thiết bị",
+      "selectDeviceBeforeLinking": "Chọn thiết bị trước khi liên kết."
+    },
+    "eventDetailsTitle": "Chi tiết sự kiện",
+    "fields": {
+      "acknowledgedAt": "Đã xác nhận lúc",
+      "alertId": "ID cảnh báo",
+      "assetType": "Loại tài sản",
+      "linkedDevice": "Thiết bị đã liên kết",
+      "subnet": "Mạng con"
+    },
+    "linkManagedDeviceTitle": "Liên kết thiết bị quản lý",
+    "noNotes": "Không có ghi chú nào.",
+    "notLinked": "Chưa liên kết",
+    "notesTitle": "Ghi chú",
+    "options": {
+      "selectDevice": "Chọn thiết bị"
+    },
+    "permissionAcknowledge": "Ẩn do lỗi kiểm tra quyền. Yêu cầu `alerts:acknowledge`.",
+    "permissionLinkDevice": "Ẩn do lỗi kiểm tra quyền. Yêu cầu `devices:write`.",
+    "placeholders": {
+      "ackNotes": "Ghi chú xác nhận tùy chọn"
+    },
+    "previousState": "Trạng thái trước",
+    "status": {
+      "acknowledged": "Đã xác nhận",
+      "unacknowledged": "Chưa xác nhận"
+    },
+    "summary": "IP {{ip}} • MAC {{mac}} • Phát hiện {{detected}}"
+  },
+  "networkChangesPanel": {
+    "actions": {
+      "ack": "Xác nhận",
+      "acknowledgeSelected": "Xác nhận mục đã chọn",
+      "acknowledging": "Đang xác nhận...",
+      "details": "Chi tiết",
+      "goToProfiles": "Đi tới Hồ sơ",
+      "link": "Liên kết",
+      "resetFilters": "Đặt lại bộ lọc"
+    },
+    "columns": {
+      "detected": "Đã phát hiện",
+      "event": "Sự kiện",
+      "linkedDevice": "Thiết bị đã liên kết"
+    },
+    "description": "Xem lại và phân loại sự kiện thay đổi mạng trên các cấu hình phát hiện.",
+    "empty": {
+      "alertingDisabled": "Quét phát hiện sẽ không ghi nhận thay đổi cho đến khi bật tính năng Cảnh báo trên cấu hình phát hiện.",
+      "enableAlerting": "Bật Cảnh báo",
+      "filtered": "Không có sự kiện thay đổi nào khớp với bộ lọc đã chọn.",
+      "noEventsTitle": "Chưa có sự kiện thay đổi nào được ghi nhận.",
+      "noProfilesDescription": "Sự kiện thay đổi mạng được tạo bởi cấu hình phát hiện. Hãy tạo cấu hình và bật Cảnh báo để ghi nhận thiết bị mới, thay đổi hoặc biến mất.",
+      "noProfilesTitle": "Thiết lập cấu hình phát hiện mạng để bắt đầu theo dõi thay đổi.",
+      "profileAlertingDisabled": "Quét phát hiện trên “{{profile}}” sẽ không ghi nhận thay đổi cho đến khi bật Cảnh báo trên cấu hình đó.",
+      "enableAlertingSuffix": "trong cài đặt của cấu hình (tab Cấu hình) để bắt đầu theo dõi thay đổi mạng."
+    },
+    "errors": {
+      "acknowledgeEvent": "Không thể xác nhận sự kiện",
+      "acknowledgeSelected": "Không thể xác nhận các sự kiện đã chọn",
+      "linkDevice": "Không thể liên kết thiết bị",
+      "loadChanges": "Không thể tải thay đổi mạng",
+      "loadDevices": "Không thể tải thiết bị",
+      "loadMetadata": "Không thể tải siêu dữ liệu mạng",
+      "loadProfileFilters": "Không thể tải bộ lọc cấu hình"
+    },
+    "eventsLoaded": "Đã tải {{count}} sự kiện",
+    "fields": {
+      "acknowledged": "Đã xác nhận",
+      "eventType": "Loại sự kiện",
+      "profile": "Cấu hình",
+      "since": "Từ"
+    },
+    "loading": "Đang tải thay đổi mạng...",
+    "messages": {
+      "acknowledgedCount": "Đã xác nhận {{count}} sự kiện.",
+      "deviceLinked": "Đã liên kết thiết bị.",
+      "eventAcknowledged": "Đã xác nhận sự kiện."
+    },
+    "noMac": "Không có MAC",
+    "notLinked": "Chưa liên kết",
+    "options": {
+      "allProfiles": "Tất cả cấu hình",
+      "allSites": "Tất cả chi nhánh",
+      "allTypes": "Tất cả loại"
+    },
+    "permissionAcknowledge": "Hành động xác nhận bị vô hiệu hóa do lỗi kiểm tra quyền. Yêu cầu `alerts:acknowledge`.",
+    "permissionLink": "Liên kết thiết bị bị vô hiệu hóa do lỗi kiểm tra quyền. Yêu cầu `devices:write`.",
+    "placeholders": {
+      "bulkNotes": "Ghi chú xác nhận hàng loạt tùy chọn"
+    },
+    "selectedUnacknowledged": "Đã chọn {{count}} sự kiện chưa xác nhận",
+    "status": {
+      "acknowledged": "Đã xác nhận",
+      "unacknowledged": "Chưa xác nhận"
+    },
+    "title": "Thay đổi mạng",
+    "unknownHost": "Host không xác định"
+  },
+  "networkEvents": {
+    "type": {
+      "device_changed": "Đã thay đổi",
+      "device_disappeared": "Đã biến mất",
+      "new_device": "Thiết bị mới",
+      "rogue_device": "Không rõ nguồn gốc"
+    }
+  },
+  "networkTopologyMap": {
+    "actions": {
+      "addPlaceholderTitle": "Thêm vị trí giữ chỗ {{role}}",
+      "autoArrange": "Tự động sắp xếp",
+      "clearSelection": "Xóa lựa chọn",
+      "collapse": "Thu gọn",
+      "confirmDelete": "Xác nhận xóa?",
+      "confirmDeleteConnection": "Xác nhận xóa kết nối",
+      "confirmDeleteNode": "Xác nhận xóa nút",
+      "deleteConnection": "Xóa kết nối",
+      "deleteNode": "Xóa nút",
+      "doneEditing": "Hoàn tất chỉnh sửa",
+      "editMap": "Sửa sơ đồ",
+      "exitFullScreenTitle": "Thoát toàn màn hình (Esc)",
+      "expand": "Mở rộng",
+      "expandTitle": "Mở rộng sơ đồ toàn màn hình",
+      "fit": "Vừa vặn",
+      "fitTitle": "Vừa vặn toàn bộ sơ đồ",
+      "selectSingleSiteTitle": "Chọn một chi nhánh duy nhất để thêm nút thủ công",
+      "viewDetails": "Xem chi tiết"
+    },
+    "addNodeAria": "Thêm nút:",
+    "addNodeLabel": "Thêm nút",
+    "adjacencyNote": "Đường kết nối chỉ xuất hiện khi đo được liền kề thực tế (LLDP/CDP/SNMP). Chưa có dữ liệu nào được thu thập, vì vậy các tài nguyên được nhóm theo subnet mà không có liên kết suy luận.",
+    "allDevices": "Tất cả thiết bị ({{count}})",
+    "canvasAriaEmpty": "Sơ đồ topology mạng: chưa phát hiện thiết bị nào.",
+    "canvasAriaWithDevices": "Sơ đồ topology mạng: {{count}} thiết bị{{suffix}}. Sử dụng danh sách thiết bị bên dưới để kiểm tra từng thiết bị bằng bàn phím.",
+    "confidence": "Độ tin cậy {{confidence}}",
+    "connectHint": "Chạm vào nút khác để kết nối",
+    "connection": "Kết nối",
+    "edgeMethods": {
+      "fdb": "Bridge FDB",
+      "manual": "Thủ công",
+      "lldp": "LLDP",
+      "cdp": "CDP"
+    },
+    "editHint": "Kéo để sắp xếp · chạm hai nút để liên kết",
+    "empty": {
+      "description": "Chạy quét phát hiện mạng để điền dữ liệu vào sơ đồ topology.",
+      "title": "Chưa phát hiện tài nguyên nào"
+    },
+    "errors": {
+      "addNode": "Không thể thêm nút",
+      "addNodeSentence": "Không thể thêm nút.",
+      "connectNodes": "Không thể kết nối các nút",
+      "connectNodesSentence": "Không thể kết nối các nút.",
+      "deleteConnection": "Không thể xóa kết nối",
+      "deleteConnectionSentence": "Không thể xóa kết nối.",
+      "deleteNode": "Không thể xóa nút",
+      "deleteNodeSentence": "Không thể xóa nút.",
+      "fetch": "Không thể lấy topology",
+      "generic": "Đã xảy ra lỗi",
+      "savePosition": "Không thể lưu vị trí nút"
+    },
+    "handMapped": "Ánh xạ thủ công",
+    "legend": {
+      "lldpCdp": "LLDP/CDP",
+      "title": "Chú giải"
+    },
+    "loading": "Đang tải topology...",
+    "manualBadge": "Thủ công",
+    "measuredAdjacency": "Liền kề được đo",
+    "measuredNotEditable": "Được đo bằng quét — không thể chỉnh sửa",
+    "messages": {
+      "connectionAdded": "Đã thêm kết nối",
+      "connectionRemoved": "Đã xóa kết nối",
+      "layoutSaved": "Đã lưu bố cục",
+      "nodeAdded": "Đã thêm nút",
+      "nodeRemoved": "Đã xóa nút"
+    },
+    "title": "Topology mạng",
+    "tryAgain": "Thử lại",
+    "vlan": "VLAN {{vlan}}",
+    "escToCancel": "· Esc để hủy"
+  },
+  "proxyConnect": {
+    "title": "Proxy đến {{target}}",
+    "throughAgent": "Qua agent",
+    "connect": "Kết nối",
+    "allowSelfSigned": "Cho phép chứng chỉ tự ký (thường dùng cho máy in, iLO/IPMI, switch)",
+    "discoveredThisAsset": "đã phát hiện tài nguyên này",
+    "pickAgentHint": "Chọn một agent trên cùng mạng với {{ip}}.",
+    "scheme": "Giao thức",
+    "allowSelfSignedHint": "Bỏ qua xác thực chứng chỉ chỉ cho phiên này.",
+    "throughAgentHelp": "Lưu lượng đến thiết bị này được chuyển tiếp qua agent Breeze đã chọn, agent này phải ở trên cùng mạng."
+  },
+  "assetTypes": {
+    "workstation": "Máy trạm",
+    "server": "Máy chủ",
+    "printer": "Máy in",
+    "router": "Router",
+    "switch": "Switch",
+    "firewall": "Firewall",
+    "accessPoint": "Access Point",
+    "phone": "Điện thoại",
+    "iot": "IoT",
+    "camera": "Camera",
+    "nas": "NAS",
+    "website": "Website",
+    "service": "Dịch vụ",
+    "unknown": "Không xác định",
+    "patchPanel": "Patch Panel",
+    "other": "Khác"
+  },
+  "approvalStatus": {
+    "pending": "Đang chờ",
+    "approved": "Đã duyệt",
+    "dismissed": "Đã bỏ qua"
+  }
+}

@@ -1,0 +1,2988 @@
+{
+  "contracts": {
+    "shared": {
+      "status": {
+        "draft": "Bản nháp",
+        "active": "Đang hoạt động",
+        "paused": "Đã tạm dừng",
+        "cancelled": "Đã hủy",
+        "expired": "Đã hết hạn"
+      },
+      "cadence": {
+        "monthly": "Hàng tháng",
+        "quarterly": "Hàng quý",
+        "annual": "Hàng năm",
+        "custom": "Mỗi {{count}} tháng"
+      },
+      "billingTiming": {
+        "advance": "Trả trước",
+        "arrears": "Trả sau"
+      },
+      "lineType": {
+        "flat": "Phí cố định",
+        "perDevice": "Mỗi thiết bị",
+        "perDeviceRole": "Mỗi vai trò thiết bị",
+        "perDeviceGroup": "Mỗi nhóm thiết bị",
+        "perSeat": "Mỗi người dùng",
+        "manual": "Số lượng thủ công",
+        "hourBlock": "Khối giờ"
+      },
+      "dynamicGroup": "động",
+      "deletedGroup": "{{name}} (nhóm đã xóa)",
+      "coverage": {
+        "uncovered": "{{count}} thiết bị trong tổ chức này không được tính phí bởi bất kỳ dòng nào trong hợp đồng này: {{breakdown}}",
+        "allCovered": "Mọi thiết bị trong tổ chức này đều được tính phí bởi một dòng trong hợp đồng này.",
+        "uncoveredLead": "{{count}} thiết bị trong tổ chức này không được tính phí bởi bất kỳ dòng nào trong hợp đồng này:",
+        "roleBucket": "{{count}} {{role}}"
+      },
+      "allowance": {
+        "includedOf": "Đã bao gồm {{counted}} / {{included}}",
+        "includedOnly": "Đã bao gồm {{included}}",
+        "overBilled": "Đã bao gồm {{included}} · vượt {{overage}} (đã tính phí)",
+        "overFlagged": "Đã bao gồm {{included}} · vượt {{overage}} (đã gắn cờ)"
+      },
+      "overage": {
+        "flagged": "{{description}} — vượt {{overage}} trên {{included}} đã bao gồm, không tính phí",
+        "billed": "{{description}} — vượt {{overage}} trên {{included}} đã bao gồm, tính phí theo giá vượt mức"
+      },
+      "transition": {
+        "activate": "Kích hoạt",
+        "pause": "Tạm dừng",
+        "resume": "Tiếp tục",
+        "cancel": "Hủy"
+      },
+      "values": {
+        "auto": "tự động",
+        "groupDeleted": "nhóm đã xóa",
+        "siteDeleted": "chi nhánh đã xóa",
+        "siteDeletedNamed": "chi nhánh đã xóa: {{name}}",
+        "manualQuantityMissing": "thiếu số lượng"
+      },
+      "lineScope": {
+        "site": "Chi nhánh: {{name}}"
+      }
+    },
+    "contractDetail": {
+      "fields": {
+        "billingTiming": "Thời điểm tính phí",
+        "cadence": "Tần suất",
+        "startDate": "Ngày bắt đầu",
+        "endDate": "Ngày kết thúc",
+        "nextBilling": "Kỳ thanh toán tiếp theo",
+        "autoIssue": "Tự động phát hành",
+        "renewal": "Gia hạn",
+        "estimatedPerPeriod": "Ước tính / kỳ",
+        "notes": "Ghi chú nội bộ",
+        "invoiceNote": "Ghi chú hóa đơn"
+      },
+      "values": {
+        "noDrafts": "Không (bản nháp)"
+      },
+      "renewal": {
+        "autoRenews": "Tự động gia hạn",
+        "everyMonths": "mỗi {{count}} tháng",
+        "currentTermEnds": "· kỳ hiện tại kết thúc vào {{date}}",
+        "noticeDays": "· thông báo trước {{count}} ngày",
+        "doesNotAutoRenew": "Không tự động gia hạn"
+      },
+      "table": {
+        "unitPrice": "Đơn giá",
+        "qty": "SL",
+        "tax": "Thuế",
+        "empty": "Hợp đồng này không có dòng nào."
+      },
+      "billingHistory": {
+        "title": "Lịch sử thanh toán",
+        "period": "Kỳ",
+        "generated": "Đã tạo",
+        "invoice": "Hóa đơn",
+        "outcome": "Kết quả",
+        "outcomeAllBilled": "Đã tính phí tất cả",
+        "outcomeUncovered": "{{count}} chưa được bao phủ",
+        "outcomeFlagged": "{{count}} đã gắn cờ",
+        "outcomeNoDeviceLines": "Không có dòng thiết bị",
+        "outcomeNotRecorded": "Chưa ghi nhận",
+        "outcomeToggle": "Xem kết quả kỳ",
+        "outcomeDevicesEvaluated": "Số thiết bị đã đánh giá: {{count}}",
+        "outcomeBilledOverage": "Số vượt mức tính phí: {{count}}",
+        "empty": "Chưa có hóa đơn nào được tạo.",
+        "viewInvoice": "Xem hóa đơn"
+      },
+      "summary": {
+        "active": "Hợp đồng này đang hoạt động và sẽ tạo hóa đơn theo tần suất.",
+        "inactive": "Hóa đơn được tạo khi hợp đồng đang hoạt động."
+      },
+      "actions": {
+        "generateInvoiceNow": "Tạo hóa đơn ngay",
+        "deleteDraft": "Xóa bản nháp"
+      },
+      "errors": {
+        "transition": {
+          "activate": "Không thể kích hoạt hợp đồng.",
+          "pause": "Không thể tạm dừng hợp đồng.",
+          "resume": "Không thể tiếp tục hợp đồng.",
+          "cancel": "Không thể hủy hợp đồng."
+        },
+        "generateInvoice": "Không thể tạo hóa đơn.",
+        "deleteDraft": "Không thể xóa bản nháp."
+      },
+      "toast": {
+        "transition": {
+          "activate": "Đã kích hoạt hợp đồng",
+          "pause": "Đã tạm dừng hợp đồng",
+          "resume": "Đã tiếp tục hợp đồng",
+          "cancel": "Đã hủy hợp đồng"
+        },
+        "invoiceGenerated": "Đã tạo hóa đơn",
+        "flaggedOverage": "{{count}} dòng đã vượt số lượng được bao gồm và không được tính phí: {{names}}",
+        "uncoveredDevices": "Đã tạo hóa đơn, nhưng {{count}} thiết bị không được tính phí bởi bất kỳ dòng nào trong hợp đồng này: {{breakdown}}",
+        "priceBookGaps": "{{count}} dòng danh mục được tính phí theo bản chụp hợp đồng — không có giá {{currency}} trong danh mục: {{lines}}",
+        "draftDeleted": "Đã xóa bản nháp",
+        "skipped": {
+          "already_billed": "Không tạo hóa đơn — kỳ thanh toán này đã được tính phí rồi.",
+          "not_due": "Không tạo hóa đơn — hợp đồng này chưa đến hạn thanh toán.",
+          "renewal_pending": "Không tạo hóa đơn — hợp đồng này đã qua ngày kết thúc và đang chờ gia hạn.",
+          "expired": "Không tạo hóa đơn — hợp đồng này đã hết hạn.",
+          "unknown": "Không có hóa đơn nào được tạo cho hợp đồng này."
+        }
+      },
+      "cancelConfirm": {
+        "title": "Hủy hợp đồng này?",
+        "message": "Việc hủy sẽ dừng mọi hóa đơn trong tương lai cho hợp đồng này. Thao tác này không thể hoàn tác — bạn sẽ cần tạo hợp đồng mới để tiếp tục tính phí.",
+        "confirm": "Hủy hợp đồng"
+      },
+      "deleteConfirm": {
+        "title": "Xóa hợp đồng nháp",
+        "message": "Thao tác này sẽ xóa vĩnh viễn hợp đồng nháp. Không thể hoàn tác.",
+        "confirm": "Xóa bản nháp"
+      },
+      "documents": {
+        "title": "Thỏa thuận đã ký",
+        "subtitle": "Được chấp nhận cùng báo giá, gắn liền với phiên bản mẫu mà khách hàng đã xem.",
+        "columns": {
+          "template": "Mẫu",
+          "signer": "Người ký",
+          "signedAt": "Đã ký",
+          "quote": "Báo giá"
+        },
+        "templateVersion": "{{name}} — v{{number}}",
+        "empty": "Chưa có thỏa thuận nào được ký.",
+        "loadError": "Không thể tải các thỏa thuận đã ký.",
+        "downloadError": "Không thể tải xuống PDF.",
+        "download": "Tải xuống PDF",
+        "preparing": "Đang chuẩn bị…",
+        "viewQuote": "Xem báo giá"
+      }
+    },
+    "contractEditor": {
+      "validation": {
+        "enterMonths": "Nhập số tháng",
+        "enterRenewalTermBeforeSaving": "Nhập thời hạn gia hạn (tháng) trước khi lưu.",
+        "enterContractName": "Nhập tên hợp đồng.",
+        "enterStartDate": "Nhập ngày bắt đầu.",
+        "renewalTermRange": "Nhập kỳ gia hạn từ 1 đến 120 tháng.",
+        "advanceNoticeRange": "Nhập thời gian thông báo trước từ 0 đến 365 ngày."
+      },
+      "errors": {
+        "loadOrganizations": "Không thể tải danh sách tổ chức.",
+        "loadSites": "Không thể tải danh sách chi nhánh.",
+        "createContract": "Không thể tạo hợp đồng.",
+        "saveContract": "Không thể lưu hợp đồng.",
+        "addLine": "Không thể thêm dòng.",
+        "removeLine": "Không thể xóa dòng.",
+        "activateContract": "Không thể kích hoạt hợp đồng.",
+        "noPriceForCurrency": "Không có giá {{currency}} cho mục này. Hãy thêm trong danh mục hoặc xóa liên kết danh mục.",
+        "updateLine": "Không thể cập nhật dòng.",
+        "lineNotFound": "Dòng đó không còn tồn tại. Hãy làm mới hợp đồng.",
+        "contractNotEditable": "Chỉ có thể chỉnh sửa dòng trên hợp đồng nháp hoặc đang hoạt động.",
+        "siteNotInOrg": "Chi nhánh đó thuộc về một tổ chức khác.",
+        "groupNotInOrg": "Nhóm thiết bị đó thuộc về một tổ chức khác.",
+        "invalidLinePatch": "Các thay đổi đó không hợp lệ cho loại dòng này.",
+        "priceNotRepresentable": "Giá đó có quá nhiều chữ số thập phân cho {{currency}}.",
+        "catalogItemNotFound": "Mục danh mục đó không khả dụng trên hợp đồng này."
+      },
+      "toast": {
+        "contractCreated": "Đã tạo hợp đồng",
+        "lineAdded": "Đã thêm dòng",
+        "lineRemoved": "Đã xóa dòng",
+        "contractActivated": "Đã kích hoạt hợp đồng",
+        "lineUpdated": "Đã cập nhật dòng"
+      },
+      "schedule": {
+        "title": "Lịch",
+        "selectOrganization": "Chọn tổ chức…",
+        "namePlaceholder": "vd: Dịch vụ Quản trị — Acme Co",
+        "billingTiming": "Thời điểm xuất hóa đơn",
+        "billingCadence": "Tần suất xuất hóa đơn",
+        "customCadence": "Tùy chỉnh…",
+        "intervalMonths": "Khoảng thời gian (tháng)",
+        "startDate": "Ngày bắt đầu"
+      },
+      "renewal": {
+        "title": "Gia hạn",
+        "endDateOptional": "Ngày kết thúc (tùy chọn)",
+        "autoIssue": "Tự động phát hành hóa đơn (nợ lại dưới dạng bản nháp nếu không chọn)",
+        "autoRenewAtEnd": "Tự động gia hạn khi hết hạn",
+        "autoRenewSetEndDate": "Tự động gia hạn khi hết hạn (cần đặt ngày kết thúc trước)",
+        "renewalTermMonths": "Kỳ gia hạn (tháng)",
+        "advanceNoticeDays": "Thông báo trước (ngày)"
+      },
+      "content": {
+        "title": "Nội dung",
+        "notesOptional": "Ghi chú nội bộ (không bao giờ hiển thị cho khách hàng)",
+        "termsOptional": "Ghi chú hóa đơn (tùy chọn, in trên mọi hóa đơn được tạo)",
+        "termsPlaceholder": "vd: Net 30. Tự động gia hạn trừ khi hủy trước 30 ngày."
+      },
+      "lines": {
+        "unitPrice": "Đơn giá",
+        "qty": "SL",
+        "tax": "Thuế",
+        "empty": "Chưa có dòng nào. Thêm dòng định kỳ bên dưới.",
+        "edit": "Sửa"
+      },
+      "addLine": {
+        "integrationHint": "Thêm từ tích hợp — tự động điền sẵn một dòng.",
+        "linkPax8Subscription": "Liên kết thuê bao Pax8",
+        "addFromPax8Catalog": "Thêm từ danh mục Pax8",
+        "importFromTdSynnex": "Nhập từ TD SYNNEX",
+        "lineType": "Loại dòng",
+        "allowanceToggle": "Bao gồm số lượng cố định, sau đó xử lý phần phát sinh",
+        "allowanceHint": "Dòng này tính phí số lượng đã bao gồm mỗi kỳ, kể cả khi số lượng thiết bị ít hơn.",
+        "includedQuantity": "Số lượng đã bao gồm",
+        "overageMode": "Phần phát sinh ngoài số lượng đã bao gồm",
+        "overageBill": "Tính phí phần phát sinh",
+        "overageFlag": "Đánh dấu phần phát sinh để xem xét",
+        "overageUnitPrice": "Giá cho mỗi đơn vị phát sinh",
+        "allowanceRequired": "Nhập số lượng đã bao gồm và đơn giá khi tính phí phần phát sinh.",
+        "deviceRoles": "Vai trò thiết bị (thiết bị được tính phí khi có vai trò này)",
+        "deviceRolesRequired": "Chọn ít nhất một vai trò.",
+        "deviceGroup": "Nhóm thiết bị (tính phí các thành viên; nhóm động được đánh giá tại thời điểm tính phí)",
+        "selectGroup": "Chọn một nhóm",
+        "deviceGroupRequired": "Chọn một nhóm.",
+        "deviceGroupsLoadFailed": "Không thể tải nhóm thiết bị của tổ chức này.",
+        "descriptionPlaceholder": "vd: Quản lý máy trạm",
+        "unitPrice": "Đơn giá",
+        "quantity": "Số lượng",
+        "quantityInvalid": "Nhập số lượng (tối đa 2 chữ số thập phân).",
+        "quantityTooLarge": "Số lượng quá lớn (tối đa 10 chữ số trước phần thập phân).",
+        "siteOptional": "Chi nhánh (tùy chọn — giới hạn phạm vi đếm thiết bị)",
+        "allSites": "Tất cả chi nhánh",
+        "linkCatalogItemOptional": "Liên kết mục danh mục (tùy chọn)",
+        "itemFallback": "Mục",
+        "clearCatalogLink": "Xóa liên kết danh mục",
+        "searchCatalog": "Tìm kiếm danh mục…",
+        "taxable": "Chịu thuế",
+        "quantityResolvedAutomatically": "Số lượng được tự động xác định tại thời điểm tính phí.",
+        "lineTotal": "Tổng dòng: {{total}}",
+        "addLine": "Thêm dòng",
+        "noPriceInCurrency": "Không có giá {{currency}} cho mục này — hãy thêm trong danh mục, hoặc xóa liên kết danh mục và nhập dòng thủ công.",
+        "priceFromCatalog": "Đơn giá (từ danh mục, tính bằng {{currency}})",
+        "resolvingPrice": "Đang tra cứu giá {{currency}}…",
+        "priceLookupFailed": "Không thể tra cứu giá {{currency}}.",
+        "priceNotRepresentable": "Giá {{currency}} đã lưu cho mục này không hợp lệ trong {{currency}} — hãy sửa lại trong danh mục, hoặc xóa liên kết danh mục và nhập dòng thủ công.",
+        "priceSourceOrgOverride": "Giá riêng cho tổ chức {{org}}"
+      },
+      "editLine": {
+        "save": "Lưu dòng",
+        "cancel": "Hủy",
+        "typeLocked": "Không thể thay đổi loại dòng. Hãy xóa dòng này và thêm dòng mới.",
+        "priceFromCatalog": "Giá lấy từ danh mục. Xóa liên kết danh mục để tự nhập giá.",
+        "refreshPrice": "Làm mới giá từ danh mục",
+        "restoreCatalogLink": "Khôi phục liên kết danh mục",
+        "unlinkNeedsPrice": "Nhập đơn giá và cài đặt thuế để xóa liên kết danh mục.",
+        "noChanges": "Chưa có gì để lưu."
+      },
+      "estimate": {
+        "title": "Ước tính kỳ này",
+        "saveFirst": "Lưu hợp đồng, sau đó thêm các dòng để xem ước tính.",
+        "plusAuto": "+ tự động",
+        "includesLiveCounts": "Bao gồm số lượng thiết bị / chỗ ngồi thực tế tính đến hôm nay.",
+        "loadLiveCountsFailed": "Không thể tải số lượng thực tế.",
+        "loadLiveCountsFailedWithAuto": "Không thể tải số lượng thực tế — các dòng tính theo thiết bị/chỗ ngồi không được bao gồm trong tổng này."
+      },
+      "actions": {
+        "createContract": "Tạo hợp đồng",
+        "activateContract": "Kích hoạt hợp đồng",
+        "activateHint": "Thêm ít nhất một dòng để kích hoạt."
+      },
+      "removeLineConfirm": {
+        "title": "Xóa dòng",
+        "message": "Thao tác này sẽ xóa \"{{description}}\" khỏi hợp đồng. Không thể hoàn tác.",
+        "thisLine": "dòng này",
+        "confirm": "Xóa dòng"
+      }
+    },
+    "contractWorkspace": {
+      "errors": {
+        "missingContractId": "Thiếu ID hợp đồng",
+        "notFound": "Không tìm thấy hợp đồng.",
+        "loadContract": "Không thể tải hợp đồng",
+        "unavailable": "Hợp đồng không khả dụng."
+      },
+      "backToContracts": "← Hợp đồng",
+      "backToContractsText": "Quay lại danh sách hợp đồng",
+      "newContract": "Hợp đồng mới",
+      "doneEditing": "Xong"
+    },
+    "list": {
+      "estimateUnavailable": "Không có ước tính: không thể đánh giá nhóm thiết bị trên hợp đồng này",
+      "estimateExcluded": "Loại trừ {{count}} hợp đồng không có ước tính"
+    },
+    "contractsList": {
+      "currencyBanner": {
+        "count": "{{count}} hợp đồng tính phí bằng loại tiền tệ khác với tổ chức của họ.",
+        "countPlus": "{{count}}+ hợp đồng lập hóa đơn bằng loại tiền tệ khác với tổ chức của họ.",
+        "review": "Xem lại"
+      },
+      "title": "Hợp đồng",
+      "description": "Thỏa thuận định kỳ tự động tạo bản nháp hóa đơn theo lịch trình.",
+      "newContract": "Hợp đồng mới",
+      "accessDenied": "Bạn không có quyền xem hợp đồng.",
+      "errors": {
+        "loadOrganizations": "Không thể tải danh sách tổ chức.",
+        "loadContracts": "Không thể tải hợp đồng"
+      },
+      "filters": {
+        "allStatuses": "Tất cả trạng thái",
+        "searchPlaceholder": "Tìm theo tên hoặc tổ chức",
+        "searchAria": "Tìm kiếm hợp đồng"
+      },
+      "stats": {
+        "estimatedMonthlyRecurring": "Ước tính định kỳ hàng tháng",
+        "activeContractCount": "{{count}} hợp đồng đang hoạt động",
+        "activeContractCount_one": "{{count}} hợp đồng đang hoạt động",
+        "activeContractCount_other": "{{count}} hợp đồng đang hoạt động"
+      },
+      "actions": {
+        "tryAgain": "Thử lại",
+        "clearFilters": "Xóa bộ lọc"
+      },
+      "empty": {
+        "noMatches": "Không có hợp đồng nào khớp với bộ lọc này.",
+        "title": "Chưa có hợp đồng nào",
+        "description": "Hợp đồng lập hóa đơn cho tổ chức theo chu kỳ lặp lại và tự động tạo hóa đơn cho bạn.",
+        "createFirst": "Tạo hợp đồng đầu tiên"
+      },
+      "table": {
+        "selectAllAria": "Chọn tất cả hợp đồng",
+        "startDate": "Ngày bắt đầu",
+        "cadence": "Chu kỳ",
+        "nextBill": "Hóa đơn tiếp theo",
+        "estimatedPerPeriod": "Ước tính / kỳ",
+        "selectContractAria": "Chọn hợp đồng {{name}}"
+      },
+      "bulk": {
+        "deleteDrafts": "Xóa bản nháp",
+        "deleteDrafts_one": "Xóa bản nháp",
+        "deleteDrafts_other": "Xóa bản nháp"
+      },
+      "toast": {
+        "bulkLimit": "Chọn tối đa {{limit}} mục mỗi lần.",
+        "bulkFailed": "Thao tác hàng loạt {{verb}} thất bại. Thử lại.",
+        "bulkPartial": "Đã {{verb}} thành công {{succeeded}}, bỏ qua {{skipped}}{{failedText}}",
+        "failedSuffix": ", thất bại {{failed}}",
+        "bulkSuccess": "{{succeeded}} {{verb}}"
+      },
+      "cancelConfirm": {
+        "title": "Hủy hợp đồng",
+        "message": "Hủy {{count}} hợp đồng đã chọn? Các hợp đồng đang hoạt động và tạm dừng sẽ bị hủy; hành động này không thể hoàn tác.",
+        "confirm": "Hủy hợp đồng"
+      },
+      "deleteConfirm": {
+        "title": "Xóa hợp đồng nháp",
+        "message": "Xóa {{count}} hợp đồng nháp? Chỉ các bản nháp bị xóa{{untouched}}; hành động này không thể hoàn tác.",
+        "message_one": "Xóa {{count}} hợp đồng nháp? Chỉ các bản nháp bị xóa{{untouched}}; hành động này không thể hoàn tác.",
+        "message_other": "Xóa {{count}} hợp đồng nháp? Chỉ các bản nháp bị xóa{{untouched}}; hành động này không thể hoàn tác.",
+        "untouchedSuffix": " — mọi hợp đồng đang hoạt động hoặc tạm dừng trong lựa chọn của bạn sẽ được giữ nguyên",
+        "confirm": "Xóa bản nháp"
+      },
+      "fromQuoteReady": "Từ {{number}} · sẵn sàng kích hoạt",
+      "fromQuoteReadyUnnumbered": "Từ báo giá · sẵn sàng kích hoạt"
+    },
+    "contractPax8Drawer": {
+      "title": "Liên kết gói đăng ký Pax8",
+      "subtitlePicked": "Chọn một dòng trên hợp đồng này (hoặc tạo mới) để liên kết.",
+      "subtitleChoose": "Chọn gói đăng ký đã đồng bộ để thêm vào hợp đồng này.",
+      "loadingSubscriptions": "Đang tải gói đăng ký...",
+      "empty": "Chưa có gói đăng ký Pax8 nào được đồng bộ cho tổ chức này. Hãy đồng bộ trong phần Tích hợp → Pax8.",
+      "subscriptionFallback": "Gói đăng ký Pax8",
+      "quantity": "SL {{quantity}}",
+      "priceEach": "{{currency}} {{price}}/cái",
+      "alreadyLinked": "đã liên kết",
+      "relink": "Liên kết lại",
+      "link": "Liên kết",
+      "errors": {
+        "loadSubscriptions": "Không thể tải gói đăng ký Pax8 cho tổ chức này."
+      }
+    },
+    "tabs": {
+      "contracts": "Hợp đồng",
+      "templates": "Mẫu thỏa thuận",
+      "documents": "Thỏa thuận đã ký",
+      "currencyMismatches": "Lệch tiền tệ"
+    },
+    "currencyMismatches": {
+      "title": "Lệch tiền tệ",
+      "description": "Các hợp đồng vẫn mang đơn vị tiền tệ mà tổ chức của chúng không còn sử dụng để lập hóa đơn. Mở hợp đồng để xem lại — không có thay đổi hàng loạt nào được thực hiện từ đây.",
+      "loading": "Đang tải…",
+      "loadError": "Không thể tải báo cáo lệch tiền tệ.",
+      "loadMore": "Tải thêm",
+      "emptyTitle": "Không có lệch tiền tệ",
+      "emptyBody": "Mọi hợp đồng đều mang đơn vị tiền tệ lập hóa đơn của tổ chức.",
+      "eligible": "Sẵn sàng cập nhật tiền tệ",
+      "currencyPair": "{{contractCurrency}} → {{orgCurrency}}",
+      "blockingDrafts": "{{count}} hóa đơn nháp",
+      "blockingDrafts_one": "{{count}} hóa đơn nháp",
+      "columns": {
+        "contract": "Hợp đồng",
+        "organization": "Tổ chức",
+        "status": "Trạng thái",
+        "currencies": "Hợp đồng → tổ chức",
+        "nextBilling": "Kỳ hóa đơn tiếp theo",
+        "eligibility": "Độ đủ điều kiện cập nhật tiền tệ"
+      },
+      "reason": {
+        "STATUS_NOT_ACTIVE": "Không hoạt động — chỉ hợp đồng đang hoạt động mới có thể cập nhật tiền tệ",
+        "ORPHANED_CONTRACT_SOURCE": "Dòng hóa đơn nguồn từ hợp đồng không thể quy đổi",
+        "ORPHANED_BILLING_PERIOD": "Một kỳ lập hóa đơn không có hóa đơn liên kết",
+        "BROKEN_CONTRACT_LINEAGE": "Kiểm tra chuỗi hóa đơn thất bại",
+        "UNBILLED_MONETARY_ROWS": "Hóa đơn nháp vẫn giữ số tiền được lập hóa đơn theo hợp đồng này"
+      }
+    },
+    "currency": {
+      "actions": {
+        "change": "Đổi tiền tệ"
+      },
+      "dialog": {
+        "title": "Đổi tiền tệ hợp đồng",
+        "description": "Hợp đồng này lập hóa đơn bằng {{currency}}. Việc cập nhật tiền tệ chỉ áp dụng cho các hóa đơn trong tương lai — hóa đơn đã phát hành và kỳ lập hóa đơn trước đó sẽ không bao giờ thay đổi.",
+        "currencyLabel": "Tiền tệ mới",
+        "modeLegend": "Điều gì xảy ra với các dòng hợp đồng",
+        "modeClear": "Xóa tất cả dòng hợp đồng",
+        "modeClearHint": "Các dòng sẽ bị xóa và thêm thủ công bằng tiền tệ mới. Bắt buộc khi có bất kỳ dòng thủ công nào.",
+        "modeReprice": "Định giá lại dòng danh mục",
+        "modeRepriceHint": "Mọi dòng danh mục được lấy từ bảng giá của tiền tệ mới. Chỉ khả thi khi tất cả các dòng đều đến từ danh mục.",
+        "confirm": "Tôi hiểu rằng thao tác này cập nhật tiền tệ cho hợp đồng đang hoạt động và không thể hoàn tác hàng loạt.",
+        "submit": "Đổi tiền tệ"
+      },
+      "blockers": {
+        "UNBILLED_MONETARY_ROWS": "Hãy phát hành hoặc xóa các hóa đơn nháp này trước — chúng vẫn mang số tiền từ hợp đồng này:",
+        "ORPHANED_BILLING_PERIOD": "Các kỳ lập hóa đơn này không có hóa đơn liên kết. Hãy giải quyết chúng trước khi cập nhật tiền tệ:",
+        "ORPHANED_CONTRACT_SOURCE": "Các dòng hóa đơn nguồn từ hợp đồng này không thể gán cho hợp đồng. Hãy giải quyết chúng trước khi cập nhật tiền tệ:",
+        "BROKEN_CONTRACT_LINEAGE": "Kiểm tra chuỗi hóa đơn thất bại đối với các hóa đơn này. Hãy giải quyết chúng trước khi cập nhật tiền tệ:"
+      },
+      "toast": {
+        "changed": "Đã đổi tiền tệ hợp đồng thành {{currency}}."
+      },
+      "errors": {
+        "change": "Không thể đổi tiền tệ hợp đồng."
+      }
+    },
+    "templatesTab": {
+      "title": "Mẫu thỏa thuận",
+      "description": "Thỏa thuận MSA và điều khoản tiêu chuẩn của bạn. Thêm vào báo giá và khách hàng sẽ ký kết cùng đề xuất; bản sao đã ký sẽ được lưu vào hợp đồng do báo giá đó tạo ra.",
+      "newTemplate": "Mẫu thỏa thuận mới",
+      "includeArchived": "Hiển thị đã lưu trữ",
+      "allOrgs": "Tất cả tổ chức",
+      "ownerOrg": "Tổ chức",
+      "noVersions": "Chưa có phiên bản nào",
+      "versionLabel": "v{{number}} · {{status}}",
+      "archive": "Lưu trữ",
+      "loadError": "Không thể tải mẫu thỏa thuận",
+      "createError": "Không thể tạo mẫu",
+      "created": "Đã tạo mẫu",
+      "archiveError": "Không thể lưu trữ mẫu",
+      "archiveSuccess": "Đã lưu trữ mẫu",
+      "columns": {
+        "name": "Tên",
+        "owner": "Người sở hữu",
+        "status": "Trạng thái",
+        "latestVersion": "Phiên bản mới nhất"
+      },
+      "status": {
+        "active": "Đang hoạt động",
+        "archived": "Đã lưu trữ"
+      },
+      "empty": {
+        "title": "Chưa có mẫu thỏa thuận nào",
+        "description": "Thêm MSA hoặc điều khoản tiêu chuẩn một lần, sau đó đưa vào bất kỳ báo giá nào. Khách hàng sẽ ký khi chấp nhận."
+      },
+      "createDialog": {
+        "title": "Mẫu thỏa thuận mới",
+        "name": "Tên",
+        "namePlaceholder": "ví dụ: Thỏa thuận Dịch vụ Tổng thể (MSA)",
+        "description": "Mô tả",
+        "descriptionPlaceholder": "Tóm tắt tùy chọn cho mẫu này",
+        "scope": "Quyền sở hữu",
+        "allOrganizations": "Tất cả tổ chức",
+        "partnerWide": "Mẫu toàn đối tác",
+        "thisOrgOnly": "Chỉ tổ chức này",
+        "organization": "Tổ chức",
+        "selectOrg": "Chọn một tổ chức",
+        "orgRequired": "Chọn một tổ chức cho mẫu thuộc sở hữu của tổ chức.",
+        "nameRequired": "Nhập tên mẫu.",
+        "cancel": "Hủy",
+        "create": "Tạo mẫu thỏa thuận",
+        "creating": "Đang tạo…"
+      }
+    },
+    "documentsTab": {
+      "title": "Thỏa thuận đã ký",
+      "description": "Các thỏa thuận đã ký chưa liên kết với hợp đồng. Hãy liên kết từng thỏa thuận để hiển thị trên hợp đồng tương ứng.",
+      "empty": {
+        "title": "Không có thỏa thuận đã ký chưa liên kết",
+        "description": "Các thỏa thuận đã ký xuất hiện ở đây cho đến khi được liên kết với hợp đồng."
+      },
+      "loadError": "Không thể tải các thỏa thuận đã ký.",
+      "columns": {
+        "template": "Mẫu",
+        "signer": "Người ký",
+        "signedAt": "Đã ký",
+        "quote": "Báo giá",
+        "organization": "Tổ chức"
+      },
+      "download": "Tải xuống PDF",
+      "preparing": "Đang chuẩn bị…",
+      "viewQuote": "Xem báo giá",
+      "linkAction": "Liên kết với hợp đồng",
+      "linkDialog": {
+        "title": "Liên kết với một hợp đồng",
+        "contractLabel": "Hợp đồng",
+        "selectContract": "Chọn một hợp đồng",
+        "noContracts": "Không tìm thấy hợp đồng nào cho tổ chức này.",
+        "loadContractsError": "Không thể tải hợp đồng. Vui lòng thử lại.",
+        "cancel": "Hủy",
+        "confirm": "Liên kết",
+        "linking": "Đang liên kết…"
+      },
+      "linkSuccess": "Đã liên kết thỏa thuận đã ký với hợp đồng.",
+      "linkError": "Không thể liên kết thỏa thuận đã ký với hợp đồng đó."
+    },
+    "templateEditor": {
+      "back": "Quay lại",
+      "loadError": "Không thể tải mẫu",
+      "newVersion": "Phiên bản mới",
+      "newVersionConfirm": {
+        "title": "Hủy bỏ các thay đổi chưa lưu?",
+        "message": "Bắt đầu phiên bản mới sẽ xóa trắng trình soạn thảo. Các chỉnh sửa chưa lưu của bạn trong bản nháp này sẽ bị mất.",
+        "confirm": "Bắt đầu phiên bản mới"
+      },
+      "uploadPdf": "Tải lên PDF",
+      "versions": "Phiên bản",
+      "noVersions": "Chưa có phiên bản nào",
+      "versionNumber": "v{{number}}",
+      "versionStatus": {
+        "draft": "Bản nháp",
+        "published": "Đã xuất bản"
+      },
+      "sourceType": {
+        "authored": "Đã tạo",
+        "uploaded": "PDF đã tải lên"
+      },
+      "publish": "Xuất bản",
+      "publishDirtyHint": "Lưu bản nháp trước khi xuất bản",
+      "body": "Nội dung",
+      "bodyAria": "Nội dung mẫu thỏa thuận",
+      "preview": "Xem trước",
+      "edit": "Sửa",
+      "saveDraft": "Lưu bản nháp",
+      "saving": "Đang lưu…",
+      "emptyBody": "Thêm nội dung trước khi lưu.",
+      "autoVariables": "Biến tự động",
+      "manualVariables": "Biến thủ công",
+      "noManualVariables": "Không phát hiện thấy",
+      "archivedNotice": "Mẫu này đã lưu trữ. Không thể thêm phiên bản mới.",
+      "saveError": "Không thể lưu phiên bản nháp",
+      "saveSuccess": "Đã lưu phiên bản nháp",
+      "uploadError": "Không thể tải lên PDF",
+      "uploadSuccess": "Đã tải lên phiên bản PDF",
+      "publishError": "Không thể xuất bản phiên bản",
+      "publishSuccess": "Đã xuất bản phiên bản",
+      "warnings": {
+        "markupRemoved": "Đã lưu, nhưng một số định dạng không được hỗ trợ đã bị xóa: {{tags}}. Nội dung thỏa thuận hỗ trợ tiêu đề, đậm, nghiêng, gạch chân, danh sách và liên kết."
+      }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Số giờ bao gồm mỗi kỳ",
+        "extraRate": "Đơn giá giờ vượt mức",
+        "rolloverMode": "Giờ chưa dùng cuối kỳ",
+        "rolloverExpire": "Hết hạn",
+        "rolloverCarry": "Chuyển tiếp",
+        "carryCap": "Giới hạn giờ chuyển tiếp (để trống nếu không giới hạn)",
+        "alertPct": "Cảnh báo khi đạt % gói đã dùng (tùy chọn)",
+        "required": "Nhập số giờ bao gồm và đơn giá cho giờ vượt mức.",
+        "firstPeriod": "Số giờ tính từ kỳ thanh toán đầu tiên chưa lập hóa đơn; trên hợp đồng nháp, mục này được thiết lập khi kích hoạt. Thời gian trước đó tính tiền bình thường.",
+        "midPeriodEdit": "Thay đổi áp dụng cho kỳ hiện tại đang mở ({{start}} – {{end}}) vào thời điểm đóng kỳ.",
+        "midPeriodEditNoDates": "Thay đổi áp dụng cho kỳ hiện tại đang mở vào thời điểm đóng kỳ.",
+        "onlyOne": "Tổ chức này đã có gói giờ hoạt động. Hãy hủy kích hoạt gói đó trước khi thêm gói mới."
+      },
+      "row": {
+        "perPeriod": "{{hours}} giờ mỗi kỳ",
+        "retiredBadge": "Đã ngừng hoạt động",
+        "startsOn": "Tính từ {{date}}"
+      },
+      "errors": {
+        "exists": "Tổ chức này đã có dòng giờ hoạt động. Hãy hủy kích hoạt trước, sau đó thêm dòng mới.",
+        "locked": "Không thể thay đổi trường đó trên dòng giờ hoạt động."
+      },
+      "retire": {
+        "title": "Ngừng giờ hoạt động",
+        "message": "\"{{description}}\" có lịch sử thanh toán, do đó gói này được cho ngừng hoạt động thay vì xóa. Không có kỳ mới; các kỳ đã lập hóa đơn vẫn được quyết toán. Các kỳ đã đóng vẫn giữ nguyên trên hợp đồng.",
+        "confirm": "Ngừng gói",
+        "toast": "Đã ngừng giờ hoạt động"
+      },
+      "detail": {
+        "title": "Giờ hoạt động",
+        "usage": "Đã dùng {{used}} / {{included}} giờ · Còn lại {{remaining}} · Kỳ kết thúc vào {{end}}",
+        "carried": "Bao gồm {{hours}} giờ chuyển tiếp.",
+        "unapproved": "{{hours}} giờ trong số này chưa được phê duyệt.",
+        "foreign": "{{hours}} giờ được ghi nhận bằng loại tiền tệ khác; các giờ này vẫn trừ vào gói.",
+        "over": "{{hours}} giờ vượt gói → {{amount}} vào cuối kỳ",
+        "advanceNote": "Phí vượt mức tính vào hóa đơn tiếp theo.",
+        "arrearsNote": "Phí vượt mức tính vào hóa đơn của kỳ này.",
+        "lateEntry": "{{hours}} giờ được nhập sau khi kỳ kết thúc và được lập hóa đơn riêng.",
+        "startsLater": "Gói bắt đầu từ {{date}}.",
+        "extraRate": "Giờ vượt mức: {{rate}} mỗi giờ",
+        "loadFailed": "Không thể tải mức sử dụng gói."
+      },
+      "history": {
+        "title": "Các kỳ gói đã đóng",
+        "empty": "Chưa có kỳ gói nào đóng.",
+        "included": "Bao gồm",
+        "carriedIn": "Chuyển vào",
+        "used": "Đã dùng",
+        "over": "Vượt",
+        "carriedOut": "Chuyển ra",
+        "loadMore": "Tải thêm",
+        "invoiceRemoved": "Đã xóa hóa đơn vượt mức — giờ chưa lập hóa đơn"
+      }
+    },
+    "relatedNotice": {
+      "title_one": "Tổ chức này có {{count}} hợp đồng khác",
+      "title_other": "Tổ chức này có {{count}} hợp đồng khác",
+      "overlapWarning": "Một hợp đồng khác ở đây tính tiền theo cùng lịch trình trong khoảng thời gian chồng chéo. Kích hoạt cả hai sẽ lập hóa đơn cho khách hàng cho cả hai.",
+      "sameCadence": "Trùng lịch, chồng chéo ngày",
+      "perPeriod": "{{amount}} mỗi kỳ",
+      "estimateUnavailable": "Không có ước tính theo kỳ",
+      "deliverables_one": "{{count}} sản phẩm bàn giao",
+      "deliverables_other": "{{count}} sản phẩm bàn giao",
+      "signedAgreements_one": "{{count}} thỏa thuận đã ký",
+      "signedAgreements_other": "{{count}} thỏa thuận đã ký",
+      "activateConfirm": {
+        "title": "Kích hoạt cùng với hợp đồng khác?",
+        "message": "Tổ chức này đã có hợp đồng tính tiền theo cùng lịch trình trong khoảng thời gian chồng chéo. Việc kích hoạt hợp đồng này sẽ tính phí khách hàng cho cả hai.",
+        "confirm": "Vẫn kích hoạt"
+      },
+      "adopt": {
+        "action": "Gộp vào hợp đồng này",
+        "title": "Gộp “{{name}}” vào hợp đồng này?",
+        "message": "Sử dụng tùy chọn này khi “{{name}}” bao gồm các dịch vụ giống hợp đồng này, để khách hàng không bị tính phí hai lần.",
+        "deliverables_one": "{{count}} sản phẩm bàn giao sẽ chuyển đến đây, cùng với lịch sử.",
+        "deliverables_other": "{{count}} sản phẩm bàn giao sẽ chuyển đến đây, cùng với lịch sử.",
+        "agreements_one": "{{count}} thỏa thuận đã ký được liên kết lại với hợp đồng này.",
+        "agreements_other": "{{count}} thỏa thuận đã ký được liên kết lại với hợp đồng này.",
+        "noLines": "Các dòng không được sao chép. Dòng và giá của hợp đồng này được giữ nguyên.",
+        "deleted": "“{{name}}” sau đó sẽ bị xóa. Thao tác này không thể hoàn tác.",
+        "confirm": "Gộp và xóa bản nháp",
+        "success": "Đã gộp “{{name}}” vào hợp đồng này",
+        "error": "Không thể gộp bản nháp vào hợp đồng này",
+        "collision": "Các tên sản phẩm bàn giao này đã tồn tại trong hợp đồng này: {{names}}. Hãy đổi tên hoặc xóa chúng ở một bên, sau đó thử lại."
+      }
+    }
+  },
+  "agreements": {
+    "tabs": {
+      "templates": "Mẫu thỏa thuận",
+      "signed": "Thỏa thuận đã ký"
+    },
+    "signedPage": {
+      "title": "Thỏa thuận đã ký",
+      "description": "Mọi thỏa thuận khách hàng đã ký. Liên kết thỏa thuận với hợp đồng để hiển thị trên hợp đồng mà nó chi phối.",
+      "unlinkedOnly": "Chỉ chưa liên kết",
+      "empty": {
+        "title": "Chưa có thỏa thuận đã ký nào",
+        "description": "Thỏa thuận được ký khi khách hàng chấp nhận một báo giá có đính kèm thỏa thuận."
+      },
+      "emptyUnlinked": {
+        "title": "Không có thỏa thuận đã ký nào chưa liên kết",
+        "description": "Mọi thỏa thuận đã ký đều đã được lưu vào hợp đồng."
+      },
+      "columns": {
+        "contract": "Hợp đồng"
+      },
+      "viewContract": "Xem hợp đồng",
+      "notLinked": "Chưa liên kết",
+      "rowSubtitle": "Được chấp nhận với báo giá {{quoteNumber}} bởi {{signer}} vào {{date}}",
+      "rowSubtitleNoQuote": "Được ký bởi {{signer}} vào {{date}}",
+      "evidenceUnavailable": "Được chấp nhận qua báo giá — không có bằng chứng chấp nhận",
+      "recordSigned": "Ghi nhận thỏa thuận đã ký",
+      "source": {
+        "quote": "qua báo giá {{number}}",
+        "recorded": "được ghi nhận bởi MSP — {{method}}"
+      },
+      "fileType": {
+        "image": "bản sao quét"
+      },
+      "sendForSignature": "Gửi để ký",
+      "filter": {
+        "pending": "Đang chờ ký",
+        "signed": "Đã ký",
+        "closed": "Đã từ chối / hủy bỏ / hết hạn"
+      },
+      "downloadOriginal": "Bản gốc",
+      "certifiedUnavailable": "Không thể tạo bản sao có chứng thực cho thỏa thuận này — tệp gốc đã được tải xuống thay thế."
+    },
+    "templateEditor": {
+      "usage": "Được dùng trên {{quotes}} báo giá · {{signed}} thỏa thuận đã ký",
+      "usageUnavailable": "Không có dữ liệu sử dụng",
+      "backToTemplates": "Quay lại mẫu thỏa thuận",
+      "archiveConfirm": {
+        "title": "Lưu trữ mẫu thỏa thuận này?",
+        "message": "Được dùng trên {{quotes}} báo giá · {{signed}} thỏa thuận đã ký. Các báo giá đã gắn với mẫu vẫn hoạt động bình thường, nhưng không thể thêm phần thỏa thuận mới.",
+        "messageUnknownUsage": "Chúng tôi không thể kiểm tra mẫu này đang được sử dụng bởi gì. Các báo giá đã gắn với mẫu vẫn hoạt động bình thường, nhưng không thể thêm phần thỏa thuận mới.",
+        "confirm": "Lưu trữ mẫu"
+      }
+    },
+    "contractPill": {
+      "under": "Theo {{template}} v{{n}}",
+      "fromQuote": "Từ báo giá {{number}}"
+    },
+    "recordSigned": {
+      "title": "Ghi nhận thỏa thuận đã ký",
+      "organization": "Tổ chức",
+      "organizationPlaceholder": "Chọn một tổ chức",
+      "orgFallback": "tổ chức này",
+      "template": "Mẫu thỏa thuận",
+      "templatePlaceholder": "Chọn một mẫu thỏa thuận",
+      "templatesError": "Không thể tải mẫu thỏa thuận.",
+      "orgsError": "Không thể tải tổ chức.",
+      "contractError": "Không thể tải hợp đồng này.",
+      "contractsError": "Không thể tải hợp đồng của tổ chức này. Bạn vẫn có thể ghi nhận thỏa thuận và liên kết với hợp đồng sau.",
+      "contract": "Hợp đồng (tùy chọn)",
+      "contractNone": "Chưa liên kết với hợp đồng",
+      "method": "Phương thức thỏa thuận",
+      "reference": "Mã tham chiếu",
+      "referenceHelp": "Nơi người duyệt có thể tìm thấy thỏa thuận đã ký — số PO, email và ngày, hoặc phiếu hỗ trợ.",
+      "signerName": "Người đồng ý",
+      "signerEmail": "Email của họ (tùy chọn)",
+      "signedAt": "Ngày ký",
+      "file": "Bản sao đã ký (tùy chọn)",
+      "fileHelp": "PDF, PNG hoặc JPEG, tối đa 10 MB. Nếu đính kèm bản sao đã ký, tệp đó sẽ được lưu trữ.",
+      "fileTooLarge": "Tệp có dung lượng lớn hơn 10 MB.",
+      "fileWrongType": "Đính kèm tệp PDF, PNG hoặc JPEG.",
+      "variables": "Chi tiết thỏa thuận",
+      "unresolved": "Cung cấp giá trị cho: {{names}}",
+      "needsSignedCopy": "Breeze không thể điền {{names}} nếu thiếu báo giá. Hãy đính kèm bản sao đã ký để ghi nhận thỏa thuận này.",
+      "consequence": "Thao tác này lưu trữ thỏa thuận đã ký cho {{org}}. Không thể xóa sau khi đã lưu.",
+      "submit": "Ghi nhận thỏa thuận đã ký",
+      "success": "Đã ghi nhận thỏa thuận đã ký.",
+      "error": "Không thể ghi nhận thỏa thuận đã ký."
+    },
+    "requests": {
+      "columns": {
+        "template": "Mẫu",
+        "organization": "Tổ chức",
+        "recipients": "Người nhận",
+        "sent": "Đã gửi",
+        "expires": "Hết hạn",
+        "status": "Trạng thái"
+      },
+      "status": {
+        "draft": "Bản nháp",
+        "sent": "Đang chờ ký",
+        "viewed": "Đã xem",
+        "signed": "Đã ký",
+        "declined": "Đã từ chối",
+        "voided": "Đã hủy bỏ",
+        "expired": "Đã hết hạn"
+      },
+      "empty": {
+        "pending": {
+          "title": "Không có gì chờ ký",
+          "description": "Các thỏa thuận bạn gửi để ký sẽ xuất hiện ở đây cho đến khi khách hàng ký."
+        },
+        "closed": {
+          "title": "Không có yêu cầu bị từ chối, hủy bỏ hoặc hết hạn",
+          "description": "Các yêu cầu đã bị từ chối, hủy bỏ hoặc quá hạn sẽ hiển thị ở đây."
+        }
+      },
+      "loadError": "Không thể tải yêu cầu thỏa thuận.",
+      "recipientsMore": "+{{count}} mục nữa",
+      "notSent": "Chưa gửi",
+      "declinedReason": "Đã từ chối: {{reason}}",
+      "voidedReason": "Đã hủy bỏ: {{reason}}",
+      "copyLink": {
+        "label": "Sao chép liên kết",
+        "success": "Đã sao chép liên kết ký",
+        "error": "Không thể sao chép liên kết ký.",
+        "clipboardError": "Không thể sao chép vào bộ nhớ tạm. Liên kết ký: {{link}}"
+      },
+      "void": {
+        "label": "Hủy bỏ",
+        "title": "Hủy bỏ yêu cầu thỏa thuận này?",
+        "description": "Liên kết ký sẽ ngừng hoạt động và người nhận không thể ký thỏa thuận này nữa.",
+        "reasonLabel": "Lý do (tùy chọn)",
+        "confirm": "Hủy bỏ yêu cầu",
+        "confirming": "Đang hủy bỏ...",
+        "success": "Đã hủy bỏ yêu cầu thỏa thuận.",
+        "error": "Không thể hủy bỏ yêu cầu thỏa thuận."
+      },
+      "deleteDraft": {
+        "label": "Xóa bản nháp",
+        "success": "Đã xóa bản nháp.",
+        "error": "Không thể xóa bản nháp."
+      },
+      "remind": {
+        "label": "Nhắc nhở",
+        "success_one": "Đã gửi nhắc nhở tới {{count}} người nhận",
+        "success_other": "Đã gửi nhắc nhở tới {{count}} người nhận",
+        "error": "Không thể gửi nhắc nhở.",
+        "notEmailed": {
+          "no_email_service": "Đã ghi nhận nhắc nhở, nhưng email chưa được cấu hình. Hãy sao chép liên kết ký và chia sẻ.",
+          "no_recipients": "Đã ghi nhận nhắc nhở, nhưng không có người nhận nào để gửi email. Hãy sao chép liên kết ký và chia sẻ.",
+          "send_failed": "Đã ghi nhận nhắc nhở, nhưng gửi email thất bại. Hãy sao chép liên kết ký và chia sẻ."
+        }
+      },
+      "remindedCount_one": "Đã nhắc {{count}} lần",
+      "remindedCount_other": "Đã nhắc {{count}} lần"
+    },
+    "send": {
+      "title": "Gửi để ký",
+      "contract": "Đính kèm hợp đồng (tùy chọn)",
+      "contractsError": "Không thể tải hợp đồng của tổ chức này. Bạn vẫn có thể gửi thỏa thuận và liên kết với hợp đồng sau.",
+      "recipients": "Người nhận",
+      "recipientsHelp": "Địa chỉ email, phân tách bằng dấu phẩy hoặc xuống dòng. Tự động điền từ liên hệ thanh toán của tổ chức.",
+      "recipientsRequired": "Thêm ít nhất một email người nhận.",
+      "recipientsInvalid": "Các mục này có vẻ không phải là địa chỉ email: {{emails}}",
+      "recipientsTooMany": "Tối đa 50 người nhận.",
+      "cover": "Lời nhắn (tùy chọn)",
+      "expiry": "Liên kết hết hạn vào",
+      "expiryPast": "Chọn ngày hết hạn trong tương lai.",
+      "expiryDefaultHint_one": "Mặc định: {{count}} ngày, từ Cài đặt thanh toán → Thỏa thuận.",
+      "expiryDefaultHint_other": "Mặc định: {{count}} ngày, từ Cài đặt thanh toán → Thỏa thuận.",
+      "autoReminderHint_one": "Nhắc nhở tự động được gửi mỗi ngày, tối đa tổng cộng {{max}} lần.",
+      "autoReminderHint_other": "Nhắc nhở tự động được gửi mỗi {{count}} ngày, tối đa tổng cộng {{max}} lần.",
+      "expiryDefaultUnavailable": "Không thể tải thời gian hết hạn mặc định từ Cài đặt thanh toán. Hãy để trống ngày và thời gian mặc định của bạn sẽ được áp dụng khi thỏa thuận được tạo.",
+      "expiryBlankHint": "Để trống để dùng mặc định từ Cài đặt thanh toán → Thỏa thuận.",
+      "label": "Nhãn (tùy chọn)",
+      "labelHint": "Chỉ hiển thị nội bộ. Khách hàng sẽ thấy tên mẫu.",
+      "createDraft": "Tạo bản nháp & xem trước",
+      "creating": "Đang tạo…",
+      "preview": {
+        "title": "Xem trước",
+        "loading": "Đang tải bản xem trước…",
+        "error": "Không thể tải bản xem trước.",
+        "uploaded": "Mẫu này là một tài liệu đã tải lên. Khách hàng sẽ ký trên tệp đã tải lên này."
+      },
+      "unresolved": {
+        "title": "Điền các giá trị còn thiếu trước khi gửi"
+      },
+      "updatePreview": "Cập nhật bản xem trước",
+      "updating": "Đang cập nhật…",
+      "submit": "Gửi",
+      "sending": "Đang gửi…",
+      "createError": "Không thể tạo bản nháp.",
+      "updateError": "Không thể cập nhật thỏa thuận.",
+      "sendError": "Không thể gửi thỏa thuận.",
+      "discardError": "Không thể hủy bản nháp — bản nháp vẫn nằm trong mục Chờ ký, nơi bạn có thể xóa nó.",
+      "sent_one": "Đã gửi thỏa thuận tới {{count}} người nhận",
+      "sent_other": "Đã gửi thỏa thuận tới {{count}} người nhận",
+      "notEmailed": {
+        "no_email_service": "Đã gửi, nhưng email chưa được cấu hình. Hãy sao chép liên kết ký từ mục Chờ ký và chia sẻ.",
+        "no_recipients": "Đã gửi, nhưng không có người nhận nào để gửi email. Hãy sao chép liên kết ký từ mục Chờ ký và chia sẻ.",
+        "send_failed": "Đã gửi, nhưng gửi email thất bại. Hãy sao chép liên kết ký từ mục Chờ ký và chia sẻ."
+      }
+    }
+  },
+  "quotes": {
+    "deviceSet": {
+      "roleNoun": {
+        "workstation": "máy trạm",
+        "server": "máy chủ",
+        "printer": "máy in",
+        "router": "router",
+        "switch": "switch",
+        "firewall": "tường lửa",
+        "access_point": "điểm truy cập",
+        "phone": "điện thoại",
+        "iot": "thiết bị IoT",
+        "camera": "camera",
+        "nas": "thiết bị NAS"
+      }
+    },
+    "editor": {
+      "deviceSet": {
+        "toggle": "Tính phí theo tập thiết bị",
+        "typeLabel": "Tập thiết bị",
+        "types": {
+          "per_device": "Mỗi thiết bị",
+          "per_device_role": "Theo vai trò thiết bị",
+          "per_device_group": "Theo nhóm thiết bị",
+          "per_seat": "Mỗi người dùng (seat)"
+        },
+        "rolesLabel": "Vai trò thiết bị",
+        "groupLabel": "Nhóm thiết bị",
+        "siteLabel": "Chi nhánh (tùy chọn)",
+        "allSites": "Tất cả chi nhánh",
+        "quantityAuto": "Số lượng được tính tự động",
+        "autoSummary": "Số lượng tự động · {{count}} {{set}} · ước tính",
+        "driftChip": "số lượng đã đổi: {{stored}} → {{live}}",
+        "refresh": "Làm mới số lượng",
+        "estimateError": "Không thể kiểm tra số lượng thiết bị thực tế.",
+        "pickerError": "Không thể tải nhóm thiết bị hoặc chi nhánh. Hãy làm mới và thử lại.",
+        "groupDeleted": "Nhóm thiết bị “{{name}}” đã bị xóa — hãy chọn nhóm khác",
+        "siteDeleted": "Chi nhánh “{{name}}” đã bị xóa — hãy chọn chi nhánh khác",
+        "typeLocked": "Không thể thay đổi tập thiết bị sau khi dòng được tạo — hãy xóa dòng đó và thêm lại.",
+        "allowanceGroupLabel": "Hạn mức số lượng",
+        "allowanceToggle": "Bao gồm số lượng cố định, sau đó xử lý phần vượt mức",
+        "includedLabel": "Số lượng đã bao gồm",
+        "overageModeLabel": "Vượt quá hạn mức",
+        "overageBill": "Tính phí mỗi đơn vị vượt",
+        "overageFlag": "Báo cáo để xem xét",
+        "overagePriceLabel": "Giá vượt mức",
+        "driftToast": "{{count}} dòng không còn khớp với số lượng thiết bị thực tế: {{lines}}",
+        "retargetToast": "{{count}} dòng cần chọn lại nhóm thiết bị hoặc chi nhánh cho tổ chức này"
+      },
+      "actions": {
+        "addImage": "Thêm hình ảnh",
+        "addLine": "Thêm dòng",
+        "addSection": "Thêm phần",
+        "adding": "Đang thêm…",
+        "cancel": "Hủy",
+        "collapseSection": "Thu gọn phần",
+        "dragLine": "Kéo để sắp xếp lại dòng",
+        "dragLineTitle": "Kéo để sắp xếp lại trong bảng này. Bàn phím: dùng lệnh Di chuyển lên / Di chuyển xuống trong menu dòng.",
+        "dragSection": "Kéo để sắp xếp lại phần",
+        "expandSection": "Mở rộng phần",
+        "fetch": "Lấy",
+        "fetchAddImage": "Lấy & thêm hình ảnh",
+        "fromUrl": "Từ URL",
+        "hideCostMargin": "Ẩn chi phí & lợi nhuận gộp",
+        "imageFromUrl": "Thêm hình ảnh từ URL…",
+        "lineActions": "Thao tác dòng",
+        "moveLineDown": "Chuyển dòng xuống",
+        "moveLineTo": "Chuyển dòng đến",
+        "moveLineToAnotherTable": "Chuyển dòng sang bảng giá khác",
+        "moveLineUp": "Chuyển dòng lên",
+        "moveSectionDown": "Chuyển phần xuống",
+        "moveSectionUp": "Chuyển phần lên",
+        "moveTo": "Chuyển đến",
+        "remove": "Xóa",
+        "removeImage": "Xóa hình ảnh",
+        "removeLine": "Xóa dòng",
+        "removeSection": "Xóa phần",
+        "replaceImage": "Thay thế hình ảnh",
+        "sectionActions": "Thao tác phần",
+        "showCostMargin": "Hiện chi phí & lợi nhuận gộp",
+        "tidyAllDescriptions": "Làm sạch tất cả mô tả",
+        "uploadAddImage": "Tải lên & thêm ảnh",
+        "uploading": "Đang tải lên..."
+      },
+      "addLine": {
+        "addFromCatalog": "Thêm từ danh mục",
+        "aiLookupAction": "Tra cứu AI",
+        "catalogItem": "Mục trong danh mục",
+        "manualLine": "Dòng thủ công",
+        "moreDetails": "Thêm chi tiết",
+        "searchDistributor": "Tìm nhà phân phối",
+        "searchPax8": "Tìm Pax8"
+      },
+      "addSection": {
+        "captionPlaceholder": "Chú thích (tùy chọn)",
+        "headingPlaceholder": "Văn bản tiêu đề",
+        "imageHelp": "PNG hoặc JPEG, tối đa 5 MB.",
+        "imageUrlPlaceholder": "https://example.com/photo.png",
+        "insertHere": "Thêm phần",
+        "richTextPlaceholder": "Nội dung báo giá...",
+        "title": "Thêm phần",
+        "uploadFile": "Tải tệp lên"
+      },
+      "autoFill": {
+        "filledDescription": "mô tả",
+        "filledEstimatedCost": "chi phí dự kiến {{amount}}",
+        "filledName": "tên",
+        "filledPriceWithDefaultMarkup": "giá {{amount}} (mức lợi nhuận mặc định {{markup}}%)",
+        "filledTaxableOff": "tính thuế: tắt",
+        "filledTaxableOn": "tính thuế: bật",
+        "help": "Tìm kiếm trên web và điền tên, mô tả, thuế và chi phí dự kiến. Bạn tự đặt giá.",
+        "helpWithDefaultMarkup": "Tìm kiếm trên web, điền tên, mô tả và thuế, ước tính chi phí và định giá dòng theo mức lợi nhuận mặc định {{markup}}% của bạn.",
+        "label": "Đã tự động điền:",
+        "review": "Xem lại và điều chỉnh trước khi thêm."
+      },
+      "autosaveHint": "Thay đổi được lưu tự động. Viền màu hổ phách đánh dấu chỉnh sửa chưa được lưu.",
+      "block": {
+        "imageSectionPdf": "Phần hình ảnh (hiển thị trong PDF).",
+        "richTextContentAria": "Nội dung văn bản định dạng",
+        "tableEmpty": "Bảng trống.",
+        "calloutEmpty": "Khung chú thích trống.",
+        "edit": "Sửa",
+        "saveEdit": "Lưu"
+      },
+      "blockTypes": {
+        "heading": "Tiêu đề",
+        "image": "Hình ảnh",
+        "pricingTable": "Bảng giá",
+        "richText": "Văn bản định dạng",
+        "contract": "Thỏa thuận / điều khoản",
+        "table": "Bảng",
+        "callout": "Khung chú thích"
+      },
+      "bulk": {
+        "applied_one": "Đã cập nhật {{count}} dòng.",
+        "applied_other": "Đã cập nhật {{count}} dòng.",
+        "apply": "Áp dụng",
+        "barAria": "Sửa hàng loạt các dòng đã chọn",
+        "clearSelection": "Bỏ chọn",
+        "invalidMarkup": "Nhập phần trăm lợi nhuận hợp lệ.",
+        "markupHint": "Áp dụng cho các dòng đã chọn có chi phí.",
+        "partialFailure": "Không thể cập nhật {{failed}} trên tổng số {{total}} dòng.",
+        "selectAllAria": "Chọn tất cả dòng trong {{label}}",
+        "selectLineAria": "Chọn {{name}}",
+        "selectedCount_one": "Đã chọn {{count}} dòng",
+        "selectedCount_other": "Đã chọn {{count}} dòng",
+        "setCost": "Đặt chi phí",
+        "setMarkup": "Đặt % lợi nhuận",
+        "skippedNoCost_one": "Đã bỏ qua {{count}} dòng không có chi phí.",
+        "skippedNoCost_other": "Đã bỏ qua {{count}} dòng không có chi phí.",
+        "taxableOff": "Không tính thuế",
+        "taxableOn": "Có tính thuế"
+      },
+      "catalog": {
+        "addSome": "Thêm một số vào Danh mục sản phẩm",
+        "empty": "Không có mục nào trong danh mục.",
+        "loadError": "Không thể tải danh mục. Mở lại trình chỉnh sửa để thử lại — các mục hiện tại của bạn vẫn được an toàn.",
+        "searchPlaceholder": "Tìm kiếm danh mục theo tên hoặc SKU",
+        "capNote": "Hiển thị {{count}} mục danh mục đầu tiên — hãy tìm kiếm để xem các mục còn lại."
+      },
+      "categories": {
+        "hardware": "Phần cứng",
+        "other": "Khác",
+        "service": "Dịch vụ",
+        "software": "Phần mềm"
+      },
+      "confirm": {
+        "removeLineMessage": "Thao tác này sẽ xóa \"{{name}}\" khỏi báo giá. Không thể hoàn tác.",
+        "removeLineTitle": "Xóa dòng",
+        "removeSectionMessage": "Thao tác này sẽ xóa phần này. Không thể hoàn tác.",
+        "removeSectionTitle": "Xóa phần",
+        "removeSectionWithLines_one": "Thao tác này sẽ xóa bảng giá và mục {{count}} của bảng. Không thể hoàn tác.",
+        "removeSectionWithLines_other": "Thao tác này sẽ xóa bảng giá và các mục {{count}} của bảng. Không thể hoàn tác.",
+        "thisLine": "dòng này",
+        "removeSectionWithLines": "Thao tác này sẽ xóa bảng giá và các dòng của bảng. Không thể hoàn tác."
+      },
+      "customer": {
+        "confirmLabel": "Di chuyển báo giá",
+        "confirmMessage": "Di chuyển báo giá này sang {{name}}? Thao tác này sẽ xóa phân công chi nhánh và tùy chọn ghi đè thanh toán, đồng thời áp dụng mức thuế của công ty mới.",
+        "confirmTitle": "Thay đổi khách hàng?",
+        "help": "Di chuyển bản nháp sang công ty khác sẽ xóa phân công chi nhánh và áp dụng mức thuế của công ty đó.",
+        "label": "Khách hàng",
+        "success": "Đã chuyển báo giá sang {{name}}."
+      },
+      "deposit": {
+        "due": "Tiền đặt cọc đến hạn",
+        "dueUpFront": "Tiền đặt cọc trả trước",
+        "eligibleAria": "Đủ điều kiện đặt cọc",
+        "label": "Đặt cọc",
+        "none": "Không đặt cọc",
+        "percent": "Phần trăm",
+        "percentOfDue": "Phần trăm số tiền đến hạn",
+        "selectedLines": "Các dòng đã chọn",
+        "selectedLinesHelp": "Chọn các dòng một lần đủ điều kiện đặt cọc trong mỗi bảng giá.",
+        "selectedLinesStagedHint": "Đánh dấu ít nhất một dòng một lần bên dưới là đủ điều kiện đặt cọc — chế độ này sẽ lưu ngay khi có một dòng được đánh dấu.",
+        "short": "Đặt cọc"
+      },
+      "emptyBlocks": "Chưa có nội dung. Thêm tiêu đề, văn bản định dạng hoặc bảng giá bên dưới.",
+      "errors": {
+        "addCatalogItem": "Không thể thêm mục danh mục.",
+        "addContractSection": "Không thể thêm phần thỏa thuận",
+        "addDistributorItem": "Không thể thêm mục của nhà phân phối.",
+        "addImageSection": "Không thể thêm phần hình ảnh.",
+        "addLine": "Không thể thêm dòng.",
+        "addPax8Product": "Không thể thêm sản phẩm Pax8.",
+        "addSection": "Không thể thêm phần.",
+        "costZeroOrMore": "Nhập chi phí từ 0 trở lên.",
+        "depositPercentRange": "Nhập phần trăm từ 0.01 đến 99.99.",
+        "fetchImageFromUrl": "Không thể lấy hình ảnh từ URL đó.",
+        "imageAddedSectionFailed": "Đã thêm hình ảnh nhưng không thể thêm phần.",
+        "imageTooLarge": "Hình ảnh phải có kích thước từ 5 MB trở xuống.",
+        "importDistributorItem": "Không thể nhập mục của nhà phân phối.",
+        "importPax8Product": "Không thể nhập sản phẩm Pax8.",
+        "lineAddedCatalogSaveFailed": "Đã thêm dòng nhưng không thể lưu vào danh mục.",
+        "lineNeedsNameOrDescription": "Dòng cần phải có tên hoặc mô tả.",
+        "loadContractTemplates": "Không thể tải mẫu thỏa thuận",
+        "moveLine": "Không thể di chuyển dòng.",
+        "quantityWholeGreaterThanZero": "Nhập số lượng nguyên lớn hơn 0.",
+        "removeLine": "Không thể xóa dòng.",
+        "removeSection": "Không thể xóa phần.",
+        "reorderBlocks": "Không thể sắp xếp lại các khối.",
+        "reorderLines": "Không thể sắp xếp lại các dòng.",
+        "reorderSections": "Không thể sắp xếp lại các phần.",
+        "saveCoverPage": "Không thể lưu trang bìa",
+        "saveCustomer": "Không thể thay đổi khách hàng.",
+        "saveTerms": "Không thể lưu điều khoản.",
+        "saveFooter": "Không thể lưu dòng chân trang.",
+        "saveTitle": "Không thể lưu tiêu đề.",
+        "unitPriceZeroOrMore": "Nhập đơn giá từ 0 trở lên.",
+        "updateBlock": "Không thể cập nhật khối.",
+        "updateDeposit": "Không thể cập nhật tiền đặt cọc.",
+        "updateLine": "Không thể cập nhật dòng.",
+        "updateSection": "Không thể cập nhật phần.",
+        "uploadImage": "Không thể tải lên hình ảnh.",
+        "noPriceForCurrency": "Không có giá {{currency}} cho mục này. Thêm vào danh mục hoặc nhập dòng thủ công.",
+        "sectionAddedListStale": "Đã thêm phần, nhưng không thể làm mới danh sách. Tải lại trang để xem.",
+        "lineAddedListStale": "Đã thêm dòng, nhưng không thể làm mới danh sách. Tải lại trang để xem.",
+        "saveExpiry": "Không thể lưu ngày hết hạn.",
+        "saveIntroNotes": "Không thể lưu ghi chú mở đầu."
+      },
+      "image": {
+        "alt": "Hình ảnh báo giá",
+        "previewUnavailable": "Không xem trước được hình ảnh."
+      },
+      "internal": {
+        "full": "Nội bộ · khách hàng không thấy",
+        "short": "Nội bộ"
+      },
+      "lastSaved": {
+        "saved": "Đã lưu {{time}}",
+        "saving": "Đang lưu…"
+      },
+      "line": {
+        "addDescription": "mô tả",
+        "billing": "Thanh toán",
+        "billingFrequencyAria": "Tần suất thanh toán",
+        "cost": "Giá vốn",
+        "costMissingAria": "Chưa nhập giá vốn — dòng này bị loại khỏi ước tính lợi nhuận.",
+        "descriptionAria": "Mô tả dòng",
+        "descriptionOptional": "Mô tả (tùy chọn)",
+        "enterCostFirstMarkup": "Nhập giá vốn trước để đặt % lợi nhuận gộp",
+        "enterCostFirstMarkupSentence": "Nhập giá vốn trước để đặt % lợi nhuận gộp.",
+        "imageUrlAria": "URL hình ảnh",
+        "markup": "Lợi nhuận gộp",
+        "markupPercent": "% Lợi nhuận gộp",
+        "nameAria": "Tên dòng",
+        "namePlaceholder": "Tên",
+        "noCost": "Không có giá vốn",
+        "noCostHelp": "Đánh dấu dòng này cố ý không có giá vốn (VD: nhân công hoặc dịch vụ) — loại bỏ khỏi cảnh báo thiếu giá vốn.",
+        "partNumberAbbr": "Mã PN",
+        "partNumberHelp": "Mã linh kiện của nhà sản xuất cho mặt hàng này.",
+        "partNumberOptional": "Mã linh kiện # (tùy chọn)",
+        "profit": "Lợi nhuận",
+        "quantityAria": "Số lượng",
+        "quantityForAria": "Số lượng cho {{item}}",
+        "saveToCatalog": "Lưu vào danh mục",
+        "showLess": "Thu gọn",
+        "showMore": "Xem thêm",
+        "sku": "Mã SKU",
+        "skuHelp": "Mã kho danh mục hoặc nhà phân phối của bạn cho mặt hàng này.",
+        "skuOptional": "Mã SKU (tùy chọn)",
+        "tidyWithAi": "Làm gọn bằng AI",
+        "unitCost": "Giá vốn đơn vị",
+        "unitPriceForAria": "Đơn giá cho {{item}}",
+        "partNumberRequiredHint": "Thêm mã linh kiện để đưa vào đơn đặt hàng linh kiện."
+      },
+      "liveTotals": {
+        "annualRecurring": "Định kỳ hàng năm",
+        "dueOnAcceptance": "Thanh toán khi chấp nhận",
+        "firstPeriodSubtotal": "Tổng phụ kỳ đầu",
+        "firstPeriodTotal": "Tổng kỳ đầu (gồm định kỳ)",
+        "monthlyRecurring": "Định kỳ hàng tháng",
+        "oneTime": "Một lần (chưa thuế)",
+        "srUpdated": "Đã cập nhật tổng. Một lần {{oneTime}}, định kỳ hàng tháng {{monthly}}, định kỳ hàng năm {{annual}}, thanh toán khi chấp nhận {{due}}.",
+        "srUpdatedWithTax": "Đã cập nhật tổng. Một lần {{oneTime}}, định kỳ hàng tháng {{monthly}}, định kỳ hàng năm {{annual}}, thuế {{tax}}, thanh toán khi chấp nhận {{due}}.",
+        "subtotal": "Tổng phụ",
+        "tax": "Thuế",
+        "taxRate": "Thuế suất",
+        "taxRateHelp": "Áp dụng cho các dòng chịu thuế. Lấy từ cài đặt thuế của tổ chức, hoặc thuế suất mặc định của bạn khi tổ chức không có. Giá trị này tuân theo các cài đặt đó khi báo giá ở dạng bản nháp và được cố định khi gửi báo giá.",
+        "title": "Tổng thời gian thực",
+        "total": "Tổng cộng"
+      },
+      "outline": {
+        "aria": "Nội dung báo giá",
+        "shortcutHint": "Alt+Down / Alt+Up để nhảy đến phần tiếp theo hoặc trước đó khi đang chỉnh sửa.",
+        "title": "Nội dung"
+      },
+      "recurrence": {
+        "annual": "Hàng năm",
+        "monthly": "Hàng tháng",
+        "one_time": "Một lần"
+      },
+      "status": {
+        "saved": "Đã lưu"
+      },
+      "success": {
+        "imageSectionAdded": "Đã thêm phần hình ảnh",
+        "itemAdded": "Đã thêm mục",
+        "lineAdded": "Đã thêm dòng",
+        "lineMoved": "Đã di chuyển dòng",
+        "lineRemoved": "Đã xóa dòng",
+        "savedToCatalog": "Đã lưu vào danh mục",
+        "sectionAdded": "Đã thêm phần",
+        "sectionRemoved": "Đã xóa phần",
+        "contractSectionAdded": "Đã thêm phần thỏa thuận"
+      },
+      "symbols": {
+        "check": "✓",
+        "notAvailable": "—",
+        "percent": "%",
+        "plusSeparator": " + "
+      },
+      "table": {
+        "collapsedSummary": "{{count}} dòng · {{amount}}",
+        "collapsedSummary_one": "{{count}} dòng · {{amount}}",
+        "collapsedSummary_other": "{{count}} dòng · {{amount}}",
+        "emptyLines": "Chưa có dòng nào. Thêm mục danh mục hoặc dòng thủ công bên dưới.",
+        "fallbackName": "Bảng giá {{number}}",
+        "item": "Mặt hàng",
+        "labelAria": "Nhãn bảng giá",
+        "labelPlaceholder": "Nhãn bảng (tùy chọn, VD: Dịch vụ hàng tháng)",
+        "notTaxable": "Không chịu thuế",
+        "qty": "SL",
+        "recurrence": "Thanh toán",
+        "scrollAria": "Bảng giá — cuộn ngang trên màn hình nhỏ để xem tổng và thao tác hàng",
+        "showSubtotal": "Hiển thị hàng tổng phụ",
+        "tax": "Thuế",
+        "taxSuffix": "+ {{amount}} thuế",
+        "taxTitle": "Thuế theo từng dòng. Tổng thuế ở tiêu đề có tính pháp lý và có thể chênh lệch một xu do làm tròn.",
+        "taxable": "Chịu thuế",
+        "total": "Tổng",
+        "unitPrice": "Đơn giá",
+        "columnLabelPlaceholder": "Nhãn cột",
+        "columnAlignAria": "Căn chỉnh cột",
+        "alignLeft": "Trái",
+        "alignCenter": "Giữa",
+        "alignRight": "Phải",
+        "removeColumn": "Xóa cột",
+        "addColumn": "Thêm cột",
+        "removeRow": "Xóa hàng",
+        "addRow": "Thêm hàng",
+        "cellAria": "Hàng {{row}}, cột {{column}}",
+        "captionPlaceholder": "Chú thích (tùy chọn)",
+        "zebra": "Sọc vằn",
+        "headerStyle": "Kiểu tiêu đề",
+        "headerStylePlain": "Trơn",
+        "headerStyleAccent": "Nhấn mạnh",
+        "reshapedWarning": "Bảng này vượt quá giới hạn {{columns}} cột x {{rows}} hàng, nên đã được điều chỉnh lại cho vừa. Lưu lại sẽ thay thế bảng đã lưu bằng những gì bạn thấy ở đây."
+      },
+      "footer": {
+        "title": "Dòng chân trang (mọi trang)",
+        "helper": "Một dòng ngắn được in ở cuối mọi trang — VD: ngày hiệu lực. Để trống để dùng chân trang mặc định. Đặt các điều khoản chi tiết trong Điều khoản & Điều kiện, không đặt ở đây.",
+        "placeholder": "Để trống = dùng chân trang mặc định",
+        "inheritedPartner": "Dùng chân trang tài liệu đối tác từ cài đặt Thanh toán: “{{text}}”",
+        "inheritedBrand": "Dùng văn bản chân trang của tổ chức này từ cài đặt Cổng thông tin: “{{text}}”",
+        "inheritedNone": "Chưa đặt chân trang mặc định trong Cài đặt — chân trang trang sẽ trống.",
+        "counter": "{{count}} / {{max}}"
+      },
+      "terms": {
+        "placeholder": "Điều khoản thanh toán, ghi chú giao hàng, v.v.",
+        "title": "Điều khoản & Điều kiện (văn bản thuần)",
+        "helper": "Đối với các điều khoản pháp lý có thể tái sử dụng, hãy thêm phần Thỏa thuận / điều khoản — khách hàng sẽ ký kết cùng với báo giá."
+      },
+      "tidyAll": {
+        "complete": "Đã xem xét xong {{count}} mô tả.",
+        "noDescriptions": "Không có mô tả dòng nào cần chỉnh sửa trong phần này."
+      },
+      "undo": {
+        "lineDeleted": "Đã xóa dòng",
+        "sectionDeleted": "Đã xóa phần"
+      },
+      "title": {
+        "label": "Tiêu đề báo giá",
+        "placeholder": "ví dụ: Nâng cấp mạng văn phòng"
+      },
+      "units": {
+        "perMonth": "/th",
+        "perYear": "/năm"
+      },
+      "contract": {
+        "templateLabel": "Mẫu thỏa thuận",
+        "templatePlaceholder": "Chọn một mẫu…",
+        "noTemplates": "Chưa có mẫu thỏa thuận nào. <templatesLink>Tạo một mẫu</templatesLink> trong Hợp đồng → Mẫu thỏa thuận.",
+        "noPublishedVersion": "Mẫu này chưa có phiên bản được xuất bản. Hãy xuất bản trước khi thêm vào báo giá.",
+        "pinnedVersion": "Đã ghim vào v{{version}}",
+        "autoVariablesTitle": "Tự động điền từ báo giá",
+        "autoValueBlank": "Trống",
+        "autoHint": "Các giá trị này được lấy từ báo giá khi gửi đề xuất.",
+        "manualVariablesTitle": "Điền cho đề xuất này",
+        "labelFieldLabel": "Nhãn phần",
+        "labelPlaceholder": "Nhãn tùy chọn (ví dụ: Thỏa thuận Dịch vụ Tổng thể)",
+        "variableRequired": "Nhập giá trị",
+        "variableUnresolved": "Biến này vẫn chưa được giải quyết",
+        "untitledTemplate": "Thỏa thuận",
+        "readOnlyHint": "Xóa và thêm lại phần này để thay đổi mẫu, phiên bản hoặc các biến.",
+        "updateToVersion": "Cập nhật lên v{{version}}",
+        "saveVariables": "Lưu các biến",
+        "unresolvedWarning": "Biến chưa giải quyết (sẽ chặn việc gửi): {{names}}",
+        "placementHint": "Khách hàng nhìn thấy phần này sau tổng tiền, được thu gọn cho đến khi mở ra. Trong PDF, phần này nằm sau giá."
+      },
+      "coverPage": {
+        "title": "Trang bìa",
+        "enable": "Hiển thị trang bìa",
+        "showContents": "Thêm mục lục vào PDF",
+        "summaryOn": "Hiển thị là trang đầu tiên của đề xuất.",
+        "summaryOff": "Không có trang bìa — đề xuất bắt đầu bằng nội dung của nó.",
+        "titleLabel": "Tiêu đề bìa",
+        "titlePlaceholder": "ví dụ: Đề xuất Dịch vụ CNTT Quản lý",
+        "preparedForLabel": "Chuẩn bị cho",
+        "preparedForPlaceholder": "Ghi đè tên khách hàng",
+        "showPreparedBy": "Hiển thị “được chuẩn bị bởi” (công ty của bạn)",
+        "imageLabel": "Hình ảnh bìa",
+        "imageHelp": "PNG hoặc JPEG, tối đa 5 MB.",
+        "removeImage": "Xóa ảnh"
+      },
+      "ghost": {
+        "add": "Thêm",
+        "nameAria": "Tên dòng mới",
+        "placeholder": "Nhập tên mục…",
+        "quantityAria": "Số lượng dòng mới",
+        "unitPriceAria": "Đơn giá dòng mới"
+      },
+      "unassigned": {
+        "explainer": "Các dòng này không nằm trong phần định giá nào, nhưng vẫn xuất hiện trên báo giá của khách hàng và tính vào tổng tiền. Hãy di chuyển từng dòng vào một phần định giá để kiểm soát vị trí xuất hiện.",
+        "moveAria": "Di chuyển {{line}} vào phần định giá",
+        "movePlaceholder": "Di chuyển đến…",
+        "noTargets": "Thêm phần định giá, sau đó di chuyển các dòng này vào đó.",
+        "qtyPrice": "{{qty}} × {{price}}",
+        "title": "Các dòng chưa gán"
+      },
+      "unsavedField": {
+        "lines": "Hạng mục dòng"
+      },
+      "callout": {
+        "variantLabel": "Kiểu",
+        "variantInfo": "Thông tin",
+        "variantAccent": "Nhấn mạnh",
+        "variantWarn": "Cảnh báo",
+        "titlePlaceholder": "Tiêu đề (tùy chọn)",
+        "bodyAria": "Văn bản chú thích"
+      },
+      "warnings": {
+        "markupRemoved": "Đã lưu, nhưng một số định dạng không được hỗ trợ đã bị xóa: {{tags}}. Văn bản phong phú hỗ trợ tiêu đề, đậm, nghiêng, gạch chân, danh sách và liên kết."
+      },
+      "intro": {
+        "expiryLabel": "Có hiệu lực đến",
+        "expiryHelper": "Được in trên đề xuất. Khách hàng có thể chấp nhận cho đến hết ngày này. Để trống nếu không có hạn sử dụng.",
+        "expiryPast": "Đã qua ngày này — khách hàng không thể chấp nhận đề xuất đã hết hạn.",
+        "notesLabel": "Ghi chú giới thiệu",
+        "notesHelper": "Được in phía trên phần đầu tiên của đề xuất.",
+        "notesPlaceholder": "Ghi chú ngắn gọn cho khách hàng, ví dụ: nội dung đề xuất này bao gồm những gì."
+      }
+    },
+    "actions": {
+      "cloneDialog": {
+        "companyLabel": "Công ty",
+        "confirm": "Tạo bản sao",
+        "defaultTitle": "Bản sao của {{name}}",
+        "message": "Tạo bản nháp mới với cùng nội dung. Chọn công ty áp dụng và đặt tiêu đề.",
+        "retargetHint": "Bản nháp mới sẽ sử dụng chi tiết thanh toán và thuế suất của công ty này; việc gán chi nhánh sẽ bị xóa.",
+        "title": "Sao chép báo giá",
+        "titleLabel": "Tiêu đề"
+      },
+      "cloneError": "Không thể sao chép báo giá.",
+      "cloneQuote": "Sao chép báo giá",
+      "cloneSavingTitle": "Đợi lưu xong thay đổi trước khi sao chép.",
+      "reviseQuote": "Sửa đổi báo giá",
+      "revising": "Đang tạo bản sửa đổi…",
+      "reviseSuccess": "Đã tạo bản sửa đổi.",
+      "reviseError": "Không thể tạo bản sửa đổi.",
+      "reviseInProgress": "Bản sửa đổi đang được tiến hành — đang mở.",
+      "cloneSuccess": "Đã sao chép báo giá.",
+      "cloning": "Đang sao chép…",
+      "deleteConfirm": {
+        "message": "Thao tác này sẽ xóa vĩnh viễn báo giá nháp. Không thể hoàn tác.",
+        "title": "Xóa báo giá nháp"
+      },
+      "deleteDraft": "Xóa bản nháp",
+      "deleteError": "Không thể xóa bản nháp.",
+      "deleteSuccess": "Đã xóa bản nháp",
+      "downloadPdf": "Tải xuống PDF",
+      "emptyHint": "Thêm ít nhất một mục trước khi gửi.",
+      "moreActions": "Thêm hành động",
+      "savingHint": "Đang lưu thay đổi… Nút Gửi sẽ bật khi mọi thứ được lưu.",
+      "savingTitle": "Đang lưu thay đổi của bạn — Nút Gửi sẽ bật khi mọi thứ được lưu.",
+      "sendConfirm": {
+        "ccLabel": "Cc",
+        "ccToggle": "Cc",
+        "includePdfLabel": "Đính kèm PDF đề xuất",
+        "invalidEmail": "Địa chỉ email không hợp lệ: {{addresses}}",
+        "message": "Chúng tôi sẽ gửi email đề xuất này tới {{orgName}} và đánh dấu là Đã gửi — {{amount}} cần thanh toán khi chấp nhận. Bạn sẽ có 30 giây để hoàn tác sau khi xác nhận.",
+        "messageLabel": "Thêm tin nhắn cá nhân (tùy chọn)",
+        "messagePlaceholder": "Thêm ghi chú ngắn — hiển thị trong email phía trên liên kết chấp nhận.",
+        "paymentEnabled": "Thanh toán trực tuyến đã được bật — khách hàng có thể thanh toán bằng thẻ sau khi chấp nhận.",
+        "paymentNoteNoStripe": "Khi khách hàng chấp nhận, họ sẽ không có tùy chọn thanh toán trực tuyến. Kết nối Stripe trong <integrationsLink>Cài đặt → Tích hợp</integrationsLink> để cung cấp tùy chọn này.",
+        "paymentWarningDeposit": "Đề xuất này yêu cầu đặt cọc, nhưng khách hàng chưa thể thanh toán trực tuyến — hãy kết nối Stripe trong <integrationsLink>Cài đặt → Tích hợp</integrationsLink> để có thể thu tiền đặt cọc khi chấp nhận.",
+        "recipientRequired": "Nhập ít nhất một người nhận để gửi.",
+        "signaturePreviewLabel": "Chữ ký (đặt trong Cài đặt → Thương hiệu):",
+        "subjectLabel": "Chủ đề",
+        "subjectPartnerFallback": "công ty của bạn",
+        "subjectPlaceholder": "Đề xuất {{number}} từ {{partner}}",
+        "subjectPlaceholderNoNumber": "Đề xuất từ {{partner}}",
+        "subjectPlaceholderTemplate": "Sử dụng chủ đề từ mẫu email đề xuất của bạn",
+        "subjectPlaceholderTitled": "{{title}} — đề xuất từ {{partner}}",
+        "title": "Gửi đề xuất này?",
+        "toLabel": "Đến",
+        "toPlaceholder": "Thêm người nhận…",
+        "tooManyRecipients": "Sử dụng tối đa {{max}} địa chỉ.",
+        "zeroTotalWarning": "Báo giá này có tổng cộng {{zero}} — hãy kiểm tra giá của các hạng mục trước khi gửi.",
+        "noBillingContactHint": "Chưa lưu liên hệ thanh toán cho tổ chức này — hãy nhập email hoặc thêm liên hệ trong <orgLink>cài đặt tổ chức</orgLink>.",
+        "revisionWarning": "Việc gửi này sẽ thay thế {{number}} và vô hiệu hóa liên kết mà khách hàng đang có.",
+        "noPartNumberWarning_one": "{{count}} dòng sản phẩm không có mã phụ tùng và sẽ không được thêm vào đơn hàng phụ tùng.",
+        "noPartNumberWarning_other": "{{count}} dòng sản phẩm không có mã phụ tùng và sẽ không được thêm vào đơn hàng phụ tùng.",
+        "sendAnyway": "Vẫn gửi"
+      },
+      "sendEmailWarning": {
+        "noBillingContact": "Đề xuất được đánh dấu là Đã gửi, nhưng không có email nào được gửi đi — {{orgName}} không có email liên hệ thanh toán. Hãy thêm email trong cài đặt tổ chức rồi gửi lại.",
+        "noEmailService": "Đề xuất được đánh dấu là Đã gửi, nhưng không có email nào được gửi đi — email chưa được cấu hình trên máy chủ này.",
+        "pdfRenderFailed": "Đề xuất được đánh dấu là Đã gửi, nhưng không thể tạo PDF nên không có email nào được gửi đi. Hãy kiểm tra các file hợp đồng đính kèm rồi gửi lại.",
+        "sendFailed": "Đề xuất được đánh dấu là Đã gửi, nhưng không thể gửi email. Hãy kiểm tra địa chỉ rồi gửi lại.",
+        "shareLinkHint": "Sử dụng \"{{action}}\" trên đề xuất này để sao chép liên kết và tự gửi."
+      },
+      "sendError": "Không thể gửi đề xuất.",
+      "sendProposal": "Gửi đề xuất",
+      "sendScheduled": "Đang gửi cho {{orgName}} sau 30 giây — bạn vẫn có thể hoàn tác.",
+      "sendSuccess": "Đã gửi đề xuất — chúng tôi sẽ đánh dấu là Đã xem và Đã chấp nhận khi {{orgName}} mở và ký.",
+      "sending": "Đang gửi…",
+      "sendingIn": "Đang gửi sau {{seconds}}s…",
+      "undoError": "Không thể hủy gửi.",
+      "undoSend": "Hoàn tác gửi",
+      "undoSuccess": "Đã hủy gửi — báo giá vẫn là bản nháp.",
+      "undoTooLate": "Quá muộn để hoàn tác — đề xuất đã được gửi đi.",
+      "sendNow": "Gửi ngay",
+      "savingTimeout": "Đang lưu thay đổi của bạn — Lệnh gửi đã bị hủy. Thử lại sau khi mọi thứ đã được lưu.",
+      "sendNowCancelError": "Không thể gửi ngay lập tức — đề xuất sẽ vẫn được gửi theo lịch trình.",
+      "sendNowAlready": "Đang được gửi đi — đề xuất đang được gửi ngay bây giờ.",
+      "sendCanceledSaveFailed": "Một thay đổi không thể lưu nên Lệnh gửi đã bị hủy. Sửa trường được đánh dấu và thử lại.",
+      "sendBlockedUnsaved": "“{{field}}” có thay đổi chưa được lưu. Hãy sửa ở đó rồi Gửi.",
+      "unsavedHint": "“{{field}}” có thay đổi chưa được lưu — Nút Gửi sẽ khả dụng sau khi lưu.",
+      "unsavedTitle": "“{{field}}” có thay đổi chưa được lưu — Nút Gửi sẽ khả dụng sau khi lưu.",
+      "resend": "Gửi lại",
+      "resendError": "Không thể gửi lại đề xuất.",
+      "resendSuccess": "Đã gửi lại đề xuất cho {{orgName}} — cùng liên kết, cùng tài liệu.",
+      "resendNotDelivered": "Đã ghi nhận gửi lại, nhưng không có email nào được gửi đi. Kiểm tra địa chỉ hoặc sao chép liên kết chia sẻ và tự gửi.",
+      "copyShareLink": "Sao chép liên kết chia sẻ",
+      "copyingShareLink": "Đang sao chép…",
+      "shareLinkCopied": "Đã sao chép liên kết chia sẻ — đây là liên kết giống với email đã gửi cho khách hàng.",
+      "shareLinkCopyFailed": "Không thể tự động sao chép. Liên kết chia sẻ là: {{url}}",
+      "shareLinkError": "Không thể lấy liên kết chia sẻ.",
+      "resendConfirm": {
+        "title": "Gửi lại đề xuất",
+        "message": "Gửi cho {{orgName}} một bản sao khác của đề xuất này. Không có gì thay đổi về báo giá và liên kết chấp nhận được giữ nguyên."
+      },
+      "resendNewLinkOriginalLive": "Đã gửi lại đề xuất — nhưng với liên kết MỚI. Đề xuất này có trước tính năng theo dõi liên kết, vì vậy liên kết cũ của khách hàng không thể dùng lại; nó vẫn hoạt động song song với liên kết mới.",
+      "resendNewLinkOriginalDead": "Đã gửi lại đề xuất — nhưng với liên kết MỚI. Liên kết trước đó không thể mở được nữa, vì vậy ai đang giữ liên kết cũ phải dùng liên kết mới.",
+      "shareLinkNewLinkOriginalLive": "Đã sao chép liên kết MỚI. Đề xuất này có trước tính năng theo dõi liên kết, nên liên kết cũ không thể dùng lại; nó vẫn hoạt động song song với liên kết này.",
+      "shareLinkNewLinkOriginalDead": "Đã sao chép liên kết MỚI. Liên kết trước đó không thể mở được nữa, nên ai đang giữ liên kết cũ phải dùng liên kết này.",
+      "currencyMismatch": "Báo giá này tính bằng {{documentCurrency}} nhưng tài khoản Stripe của bạn quyết toán bằng {{accountCurrency}}. Stripe sẽ hiển thị {{documentCurrency}} cho khách hàng và quy đổi khi quyết toán — bạn chịu chênh lệch tỷ giá và phí quy đổi.",
+      "currencyUnknown": "Tiền tệ quyết toán của tài khoản Stripe chưa được lưu bộ nhớ đệm, nên không thể đối chiếu với báo giá {{documentCurrency}} này. Làm mới chi tiết tài khoản Stripe trong Cài đặt → Tích hợp để bật tính năng kiểm tra lệch tiền tệ.",
+      "acceptOnBehalf": {
+        "button": "Chấp nhận thay",
+        "emptyDraftTitle": "Thêm ít nhất một mục trước khi chấp nhận.",
+        "emptySentTitle": "Báo giá này không có mục nào. Sử dụng Sửa đổi báo giá để phát hành phiên bản có các mục.",
+        "errorQuoteEmpty": "Báo giá này không có mục nào. Đóng hộp thoại này và thêm mục, hoặc sử dụng Sửa đổi báo giá nếu báo giá đã được gửi.",
+        "title": "Ghi nhận sự chấp nhận của khách hàng",
+        "methodLabel": "Họ đã đồng ý bằng cách nào?",
+        "method": {
+          "verbal": "Trực tiếp / qua điện thoại",
+          "email": "Qua email",
+          "signed_document": "Tài liệu đã ký",
+          "purchase_order": "Đơn đặt hàng (PO)",
+          "other": "Khác"
+        },
+        "referenceLabel": "Tham chiếu",
+        "referenceHelp": "Nơi người kiểm duyệt có thể tìm thấy sự đồng ý của khách hàng — số PO, email và ngày, hoặc phiếu hỗ trợ.",
+        "signerNameLabel": "Người đồng ý",
+        "signerEmailLabel": "Email của họ (tùy chọn)",
+        "consequenceInvoice": "Hóa đơn cho số tiền {{amount}} sẽ được tạo và đánh số ngay bây giờ.",
+        "consequenceInvoiceDraft": "Hóa đơn nháp sẽ được tạo. Hóa đơn này chưa được phát hành hoặc đánh số.",
+        "consequenceContracts": "Các dòng định kỳ trở thành hợp đồng nháp để bạn kích hoạt sau.",
+        "consequenceEmail": "Hóa đơn sẽ được gửi qua email tới {{recipients}}.",
+        "consequenceEmailNotConfigured": "Chưa cấu hình dịch vụ email; hóa đơn sẽ không được gửi qua email. Hãy chia sẻ từ trang hóa đơn.",
+        "consequenceDraft": "Báo giá này chưa bao giờ được gửi. Khách hàng sẽ thấy báo giá này lần đầu qua hóa đơn.",
+        "submit": "Chấp nhận và phát hành hóa đơn",
+        "success": "Đã chấp nhận báo giá. Đã phát hành hóa đơn {{number}}.",
+        "error": "Không thể ghi nhận sự chấp nhận.",
+        "successDraftInvoice": "Đã chấp nhận báo giá. Hóa đơn được tạo ở trạng thái nháp.",
+        "errorContractVariablesUnresolved": "Hợp đồng của báo giá này vẫn cần giá trị cho: {{names}}. Hãy đóng hộp thoại này, điền các giá trị bên dưới rồi thử lại.",
+        "errorContractVariablesUnresolvedGeneric": "Hợp đồng của báo giá này có các biến chưa được giải quyết. Hãy đóng hộp thoại này, điền các giá trị bên dưới rồi thử lại.",
+        "errorDepositInvalid": "Không thể thu tiền đặt cọc của báo giá này như đã cấu hình. Hãy đóng hộp thoại này, sửa cài đặt đặt cọc bên dưới rồi thử lại.",
+        "evidenceLabel": "File chứng chứng (tùy chọn)",
+        "evidenceHelp": "PDF, PNG hoặc JPEG, tối đa 10 MB — ví dụ: PO hoặc tài liệu đã ký.",
+        "evidenceTooLarge": "File này lớn hơn 10 MB. Hãy chọn file nhỏ hơn.",
+        "evidenceAttached": "Đã đính kèm chứng cứ.",
+        "evidenceError": "Đã ghi nhận sự chấp nhận, nhưng không thể đính kèm file chứng cứ. Hãy đính kèm từ trang báo giá.",
+        "consequenceEmailNoRecipient": "Không có người nhận nào được ghi nhận trên báo giá này, vì vậy hóa đơn có thể không được gửi qua email. Hãy tự gửi cho khách hàng nếu cần.",
+        "successNoRecipient": "Đã chấp nhận báo giá. Đã phát hành hóa đơn {{number}}. Hóa đơn có thể chưa được gửi qua email — không có người nhận nào được ghi nhận trên báo giá này.",
+        "successNoEmailService": "Đã chấp nhận báo giá. Đã phát hành hóa đơn {{number}}. Hóa đơn chưa được gửi qua email — chưa cấu hình dịch vụ email. Hãy chia sẻ từ trang hóa đơn.",
+        "overlap": {
+          "title": "Tổ chức này đã có hợp đồng theo cùng lịch trình",
+          "body": "Việc chấp nhận đã tạo một hợp đồng nháp mới. Việc kích hoạt hợp đồng này cùng với hợp đồng hiện có sẽ lập hóa đơn cho khách hàng cho cả hai. Hãy xem lại cả hai trước khi kích hoạt bất kỳ hợp đồng nào.",
+          "newContract": "Bản nháp mới từ báo giá này",
+          "existingContract": "Hợp đồng hiện tại",
+          "done": "Hoàn tất"
+        }
+      },
+      "declineOnBehalf": {
+        "button": "Từ chối thay",
+        "title": "Ghi nhận việc từ chối của khách hàng",
+        "methodLabel": "Họ đã từ chối bằng cách nào?",
+        "referenceLabel": "Tham chiếu",
+        "referenceHelp": "Nơi người kiểm duyệt có thể tìm thấy sự từ chối của khách hàng — email và ngày, ghi chú cuộc gọi hoặc phiếu hỗ trợ.",
+        "reasonLabel": "Lý do của họ (tùy chọn)",
+        "consequence": "Báo giá sẽ được đánh dấu là đã từ chối và không thể chấp nhận được nữa. Hãy sửa đổi báo giá để gửi phiên bản mới cho khách hàng.",
+        "submit": "Đánh dấu đã từ chối",
+        "success": "Báo giá được đánh dấu là đã từ chối.",
+        "error": "Không thể ghi nhận việc từ chối."
+      }
+    },
+    "detail": {
+      "addContentInEditor": "Thêm nội dung trong Trình soạn thảo",
+      "created": "Đã tạo",
+      "customer": "Khách hàng",
+      "empty": "Báo giá này chưa có nội dung.",
+      "expires": "Hết hạn vào {{date}}",
+      "from": "Từ",
+      "imageUnavailable": "Ảnh không khả dụng",
+      "issued": "Đã phát hành",
+      "lifecycle": {
+        "accepted": "Đã chấp nhận",
+        "declined": "Đã từ chối",
+        "sent": "Đã gửi",
+        "viewed": "Đã xem"
+      },
+      "orderBreakdown": {
+        "copied": "Đã sao chép",
+        "copyFailed": "Không thể sao chép vào bộ nhớ tạm.",
+        "copyTsv": "Sao chép cho bảng tính",
+        "costTotal": "Tổng chi phí",
+        "exportCsv": "Tải xuống CSV",
+        "fulfillment": {
+          "allocation": {
+            "cancelled": "Đã hủy",
+            "eta": "Sẽ đến vào {{date}}",
+            "ordered": "Đã đặt hàng {{qty}}",
+            "received": "đã nhận {{qty}}",
+            "tracking": "Mã vận đơn {{number}}"
+          },
+          "cancel": "Hủy dòng",
+          "cancelError": "Không thể hủy dòng đơn hàng này.",
+          "cancelSuccess": "Đã hủy dòng đơn hàng",
+          "dialog": {
+            "cancel": "Hủy",
+            "empty": "Tất cả mục đã chọn hiện đã có trong đơn hàng.",
+            "error": "Không thể ghi nhận đơn hàng.",
+            "eta": "Dự kiến đến",
+            "notes": "Ghi chú",
+            "orderRef": "Mã tham chiếu đơn hàng",
+            "qtyAria": "Số lượng đặt hàng cho {{item}}",
+            "submit": "Ghi nhận đơn hàng",
+            "success": "Đã ghi nhận đơn hàng",
+            "title": "Đánh dấu các mục đã đặt hàng",
+            "tracking": "Mã vận đơn",
+            "vendor": "Nhà cung cấp"
+          },
+          "markOrdered": "Đánh dấu đã đặt",
+          "receive": "Đánh dấu đã nhận",
+          "receiveQtyAria": "Số lượng đã nhận",
+          "receiveError": "Không thể cập nhật dòng đơn hàng này.",
+          "receiveSuccess": "Đã đánh dấu nhận",
+          "select": "Chọn {{item}}",
+          "selectColumn": "Chọn để đặt hàng",
+          "status": {
+            "ordered": "Đã đặt hàng",
+            "partiallyReceived": "Đã nhận một phần",
+            "received": "Đã nhận"
+          }
+        },
+        "itemCount_one": "{{count}} mục",
+        "itemCount_other": "{{count}} mục",
+        "missingCost_one": "{{count}} mục chưa được ghi nhận chi phí",
+        "missingCost_other": "{{count}} mục chưa được ghi nhận chi phí",
+        "pax8Badge": {
+          "failed": "Pax8 gặp lỗi",
+          "ordered": "Đã đặt qua Pax8",
+          "reconcile": "Pax8 cần xem xét",
+          "staged": "Đã đưa vào hàng chờ Pax8"
+        },
+        "table": {
+          "extCost": "Chi phí ngoại vi",
+          "item": "Mục",
+          "markup": "Lợi nhuận gộp",
+          "partNumber": "Mã linh kiện #",
+          "qty": "SL",
+          "sku": "SKU",
+          "unitCost": "Chi phí đơn vị",
+          "vendor": "Nhà cung cấp"
+        },
+        "title": "Sẽ đặt hàng",
+        "unknownVendor": "Nhà cung cấp khác / không xác định",
+        "excluded": "Không có trong đơn hàng này (không có mã linh kiện): {{names}}",
+        "untitledLine": "Dòng chưa đặt tên"
+      },
+      "pax8Order": {
+        "message_one": "Báo giá này đã tạo đơn hàng Pax8 ({{count}} mục) đang chờ chi tiết cung cấp",
+        "message_other": "Báo giá này đã tạo đơn hàng Pax8 ({{count}} mục) đang chờ chi tiết cung cấp",
+        "open": "Mở đơn hàng Pax8"
+      },
+      "pricing": "Định giá",
+      "proposalImageAlt": "Hình ảnh đề xuất",
+      "scheduledSendFailed": "Lịch gửi đã thất bại — đề xuất này CHƯA được gửi và vẫn là bản nháp. Vui lòng xem lại và thử gửi lại.",
+      "table": {
+        "item": "Mục",
+        "noLines": "Không có dòng nào trong bảng này.",
+        "qty": "SL",
+        "recurrence": "Thanh toán",
+        "tax": "Thuế",
+        "total": "Tổng",
+        "unitPrice": "Đơn giá"
+      },
+      "tableScrollAria": "{{label}} — cuộn sang ngang để xem thêm cột",
+      "terms": "Điều khoản",
+      "totals": {
+        "annualRecurring": "Định kỳ hàng năm",
+        "dueOnAcceptance": "Đến hạn khi chấp nhận",
+        "firstPeriod": "Tổng kỳ đầu tiên (bao gồm định kỳ)",
+        "monthlyRecurring": "Định kỳ hàng tháng",
+        "oneTime": "Một lần",
+        "tax": "Thuế",
+        "title": "Tổng cộng"
+      },
+      "viewInvoice": "Xem hóa đơn",
+      "sentTo": "Đã gửi đến",
+      "declinedBanner": {
+        "title": "Đã từ chối {{date}}",
+        "reasonLabel": "Ghi chú của khách hàng:",
+        "revise": "Nhân bản & sửa đổi",
+        "revising": "Đang nhân bản…"
+      },
+      "lineage": {
+        "supersededTitle": "Báo giá này đã được thay thế bởi",
+        "inProgressTitle": "Đang soạn bản sửa đổi cho báo giá này — gửi đi sẽ thay thế báo giá này và vô hiệu hóa liên kết của khách hàng:",
+        "revisionOfTitle": "Bản sửa đổi của",
+        "untitled": "phiên bản mới hơn"
+      },
+      "acceptedOnBehalf": "Được chấp nhận thay mặt cho {{signer}} bởi {{recorder}} vào {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "người dùng đã xóa",
+      "evidence": {
+        "download": "Tải xuống bằng chứng",
+        "downloadTitle": "Tải xuống {{filename}}",
+        "attach": "Đính kèm bằng chứng",
+        "replace": "Thay thế bằng chứng",
+        "attached": "Đã đính kèm bằng chứng.",
+        "attachError": "Không thể đính kèm tệp bằng chứng.",
+        "downloadError": "Không thể tải xuống tệp bằng chứng.",
+        "tooLarge": "Tệp này lớn hơn 10 MB. Vوي lòng chọn tệp nhỏ hơn."
+      },
+      "generatedContracts": {
+        "title_one": "Báo giá này đã tạo {{count}} hợp đồng",
+        "title_other": "Báo giá này đã tạo {{count}} hợp đồng",
+        "draftHint_one": "{{count}} bản nháp chưa tính phí cho đến khi được kích hoạt. Xem lại và kích hoạt để bắt đầu tính phí.",
+        "draftHint_other": "{{count}} bản nháp chưa tính phí cho đến khi được kích hoạt. Xem lại và kích hoạt chúng để bắt đầu tính phí.",
+        "ready": "Sẵn sàng kích hoạt",
+        "unavailable": "Không thể tải các hợp đồng do báo giá này tạo ra. Tải lại để thử lại."
+      }
+    },
+    "currency": {
+      "actions": {
+        "change": "Đổi tiền tệ"
+      },
+      "dialog": {
+        "title": "Đổi tiền tệ báo giá",
+        "description": "Báo giá nháp này được tính bằng {{currency}}.",
+        "currencyLabel": "Tiền tệ mới",
+        "modeLegend": "Điều gì xảy ra với các dòng của báo giá",
+        "modeClear": "Xóa tất cả các dòng",
+        "modeClearHint": "Các dòng sẽ bị xóa. Bắt buộc khi có bất kỳ dòng thủ công hoặc gói sản phẩm nào.",
+        "modeReprice": "Cập nhật giá các dòng danh mục",
+        "modeRepriceHint": "Mọi dòng danh mục được lấy từ bảng giá của loại tiền tệ mới. Chỉ khả thi khi tất cả các dòng đều đến từ danh mục.",
+        "modeRepriceUnavailable": "Không khả dụng — ít nhất một dòng là thủ công hoặc gói sản phẩm, vì vậy bảng giá không thể cập nhật lại. Thay vào đó, hãy xóa tất cả các dòng.",
+        "confirm": "Tôi hiểu điều này thay đổi loại tiền tệ của báo giá.",
+        "submit": "Đổi tiền tệ"
+      },
+      "toast": {
+        "changed": "Đã đổi tiền tệ báo giá thành {{currency}}."
+      },
+      "errors": {
+        "change": "Không thể đổi tiền tệ báo giá."
+      }
+    },
+    "distributorLookup": {
+      "feedPriceCurrencyUnknown": "Không rõ tiền tệ giá nguồn cấp — vui lòng nhập giá {{currency}}",
+      "feedPriceIn": "Giá nguồn cấp là {{feedCurrency}} — vui lòng nhập giá {{currency}}",
+      "available": "{{count}} có sẵn",
+      "cost": "chi phí {{currency}} {{amount}}",
+      "endOfLife": "Hết vòng đời",
+      "importAndAdd": "Nhập & thêm",
+      "inStockOnly": "Chỉ hàng có sẵn",
+      "lookupFailed": "Tra cứu thất bại.",
+      "mfgPart": "Mã linh kiện NSX {{part}}",
+      "msrp": "MSRP {{amount}}",
+      "nightlyHint": "Nhập ít nhất {{count}} ký tự để tìm kiếm trong danh mục hàng đêm.",
+      "nightlyPlaceholder": "Tìm kiếm theo tên, SKU, mã linh kiện NSX hoặc nhà sản xuất",
+      "noResults": "Không có sản phẩm nào phù hợp.",
+      "outOfStock": "Hết hàng",
+      "placeholder": "SKU SYNNEX hoặc mã linh kiện NSX #",
+      "searching": "Đang tìm kiếm…",
+      "sellPrice": "Giá bán",
+      "sku": "SKU {{sku}}",
+      "source": "Nguồn",
+      "sourceEcExpress": "EC Express (SKU / mã linh kiện chính xác)",
+      "sourceNightly": "Danh mục TD SYNNEX (tệp hàng đêm)",
+      "syncedDaysAgo": "đã đồng bộ {{count}} ngày trước",
+      "syncedHoursAgo": "đã đồng bộ {{count}} giờ trước",
+      "syncedJustNow": "đã đồng bộ vừa xong",
+      "syncedMinutesAgo": "đã đồng bộ {{count}} phút trước",
+      "syncedUnknown": "không rõ thời gian đồng bộ",
+      "toBeDiscontinued": "Sắp ngừng kinh doanh",
+      "warehouses": "Kho hàng: {{list}}"
+    },
+    "document": {
+      "deviceSet": {
+        "setDevices": "thiết bị",
+        "setSeats": "số lượng",
+        "setGroup": "thiết bị trong “{{name}}”"
+      },
+      "additionalItems": "Mục bổ sung",
+      "contract": {
+        "unavailable": "Tệp thỏa thuận không khả dụng",
+        "versionFooter": "{{name}} — v{{version}}"
+      },
+      "preview": {
+        "description": "Đây là nội dung khách hàng nhìn thấy trên liên kết đề xuất của họ.",
+        "downloadPdf": "Tải xuống PDF",
+        "preparing": "Đang chuẩn bị…",
+        "loading": "Đang tải giao diện khách hàng…",
+        "loadError": "Không thể tải giao diện khách hàng của đề xuất này.",
+        "retry": "Thử lại",
+        "signatureInert": "Khách hàng ký tại đây"
+      }
+    },
+    "page": {
+      "accessDenied": "Bạn không có quyền xem báo giá.",
+      "bulk": {
+        "deleteDrafts": "Xóa bản nháp",
+        "deletedVerb": "đã xóa",
+        "failed": "Thao tác {{verb}} hàng loạt thất bại. Thử lại.",
+        "limit": "Chọn tối đa {{limit}} mục mỗi lần.",
+        "partial": "{{succeeded}} {{verb}}, bỏ qua {{skipped}}{{failedText}}",
+        "send": "Gửi",
+        "sentVerb": "đã gửi",
+        "success": "{{succeeded}} {{verb}}"
+      },
+      "bulkDelete": {
+        "message_one": "Xóa báo giá đã chọn? Chỉ các báo giá BẢN NHÁP mới bị xóa; thao tác này không thể hoàn tác.",
+        "message_other": "Xóa {{count}} báo giá đã chọn? Chỉ các báo giá BẢN NHÁP mới bị xóa; thao tác này không thể hoàn tác.",
+        "skippedNotDraft": "Không phải bản nháp (đã bỏ qua)",
+        "title": "Xóa báo giá nháp"
+      },
+      "bulkSend": {
+        "message_one": "Gửi email đề xuất đã chọn cho khách hàng? Thao tác này không thể hoàn tác.",
+        "message_other": "Gửi email {{count}} đề xuất đã chọn cho khách hàng? Thao tác này không thể hoàn tác.",
+        "recipients": "Mỗi đề xuất được gửi qua email đến liên hệ thanh toán của tổ chức và được đánh dấu là Đã gửi.",
+        "title": "Gửi báo giá",
+        "unnumbered": "Bản nháp"
+      },
+      "create": {
+        "description": "Chọn khách hàng cho đề xuất này. Bạn có thể thêm khối nội dung và giá ở bước tiếp theo.",
+        "error": "Không thể tạo báo giá nháp.",
+        "genericError": "Không thể tạo báo giá.",
+        "noSpecificSite": "Không có chi nhánh cụ thể",
+        "selectOrganization": "Chọn một tổ chức…",
+        "siteClearedOnClone": "Chi nhánh bị xóa khi bắt đầu từ một báo giá hiện có.",
+        "siteOptional": "Chi nhánh (tùy chọn)",
+        "startBlank": "Báo giá trống",
+        "startFrom": "Bắt đầu từ (tùy chọn)",
+        "submit": "Tạo bản nháp",
+        "success": "Đã tạo báo giá nháp",
+        "title": "Báo giá mới",
+        "titleOptional": "Tiêu đề (tùy chọn)",
+        "titlePlaceholder": "ví dụ: Làm mới hệ thống mạng văn phòng",
+        "working": "Đang xử lý…"
+      },
+      "deposit": {
+        "deposit": "Tiền cọc",
+        "paid": "Đã thanh toán cọc",
+        "unpaid": "Chưa thanh toán cọc"
+      },
+      "duplicate": "Nhân bản báo giá",
+      "duplicateAria": "Nhân bản báo giá {{quote}}",
+      "duplicateError": "Không thể nhân bản báo giá.",
+      "empty": {
+        "clearFilters": "Xóa bộ lọc",
+        "description": "Soạn thảo đề xuất với tiêu đề, văn bản định dạng và bảng giá, sau đó gửi đi để phê duyệt.",
+        "filtered": "Không có báo giá nào khớp với các bộ lọc này.",
+        "title": "Chưa có báo giá nào"
+      },
+      "errors": {
+        "loadOrganizations": "Không thể tải danh sách tổ chức.",
+        "loadQuotes": "Không thể tải báo giá",
+        "loadSites": "Không thể tải danh sách chi nhánh."
+      },
+      "filters": {
+        "allStatuses": "Tất cả trạng thái",
+        "searchAria": "Tìm kiếm báo giá",
+        "searchPlaceholder": "Tìm số hoặc tổ chức",
+        "statusAria": "Lọc theo trạng thái"
+      },
+      "newQuote": "Báo giá mới",
+      "stats": {
+        "awaiting": "{{count}} đang chờ",
+        "drafts": "Bản nháp",
+        "notYetSent": "chưa gửi",
+        "outForSignature": "Đang chờ ký"
+      },
+      "subtitle": "Xây dựng đề xuất với các khối phong phú và giá định kỳ, sau đó gửi cho khách hàng.",
+      "table": {
+        "created": "Đã tạo",
+        "draftQuote": "Báo giá nháp",
+        "firstPeriodSuffix": "kỳ đầu tiên",
+        "number": "Số",
+        "selectAll": "Chọn tất cả báo giá",
+        "selectQuote": "Chọn báo giá {{quote}}",
+        "total": "Tổng cộng"
+      },
+      "title": "Báo giá",
+      "tryAgain": "Thử lại"
+    },
+    "pax8ProductLookup": {
+      "feedPriceCurrencyUnknown": "Không rõ tiền tệ giá nguồn — hãy nhập giá theo {{currency}}",
+      "feedPriceIn": "Giá nguồn là {{feedCurrency}} — hãy nhập giá theo {{currency}}",
+      "cost": "chi phí {{currency}} {{amount}}",
+      "importAndAdd": "Nhập & thêm",
+      "option": "Tùy chọn {{number}}",
+      "placeholder": "Sản phẩm, nhà cung cấp hoặc SKU",
+      "searchFailed": "Tìm kiếm thất bại.",
+      "searching": "Đang tìm kiếm…",
+      "sellPrice": "Giá bán",
+      "term": "Kỳ hạn"
+    },
+    "recurrence": {
+      "one_time": "Một lần",
+      "monthly": "Hàng tháng",
+      "annual": "Hàng năm"
+    },
+    "status": {
+      "draft": "Bản nháp",
+      "sent": "Đã gửi",
+      "viewed": "Đã xem",
+      "accepted": "Đã chấp nhận",
+      "declined": "Đã từ chối",
+      "expired": "Đã hết hạn",
+      "converted": "Đã chuyển đổi",
+      "superseded": "Đã thay thế"
+    },
+    "workspace": {
+      "backLabel": "Báo giá",
+      "backToQuotes": "Quay lại báo giá",
+      "draftTitle": "Báo giá nháp",
+      "errors": {
+        "loadFailed": "Không thể tải báo giá",
+        "missingId": "Thiếu ID báo giá",
+        "notFound": "Không tìm thấy báo giá.",
+        "unavailable": "Báo giá không khả dụng."
+      },
+      "tabs": {
+        "editor": "Trình chỉnh sửa",
+        "preview": "Xem trước",
+        "detail": "Chi tiết"
+      },
+      "loading": "Đang tải báo giá…",
+      "revisionBanner": "Đây là bản sửa đổi của {{number}}. Gửi bản này sẽ thay thế bản gốc và vô hiệu hóa liên kết mà khách hàng đang có."
+    }
+  },
+  "billingUi": {
+    "margin": {
+      "cost": "Chi phí",
+      "missingCost": "Ước tính lợi nhuận chưa hoàn chỉnh — {{count}} dòng thiếu chi phí.",
+      "missingCost_one": "Ước tính lợi nhuận chưa hoàn chỉnh — {{count}} dòng thiếu chi phí.",
+      "missingCost_other": "Ước tính lợi nhuận chưa hoàn chỉnh — {{count}} dòng thiếu chi phí.",
+      "profitAnnual": "Lợi nhuận (hàng năm)",
+      "profitMonthly": "Lợi nhuận (hàng tháng)",
+      "profitOneTime": "Lợi nhuận (một lần)",
+      "title": "Biên lợi nhuận (nội bộ)"
+    },
+    "recurringBillingNote": "Chấp nhận báo giá này chỉ xuất hóa đơn cho các khoản phí một lần ngay bây giờ. Các dòng định kỳ (hàng tháng + hàng năm) sẽ được lập hóa đơn sau theo lịch trình riêng của chúng. Tổng số tiền kỳ đầu tiên kết hợp các khoản phí một lần với kỳ đầu tiên của mỗi chu kỳ định kỳ.",
+    "units": {
+      "perMonth": "/th",
+      "perYear": "/năm"
+    },
+    "unsaved": "Chưa lưu",
+    "showCostMargin": "Hiển thị chi phí & biên lợi nhuận",
+    "hideCostMargin": "Ẩn chi phí & biên lợi nhuận",
+    "orgCombobox": {
+      "searchPlaceholder": "Tìm kiếm tổ chức…",
+      "noResults": "Không có tổ chức phù hợp.",
+      "capNote": "Hiển thị {{count}} kết quả phù hợp đầu tiên — tiếp tục nhập để thu hẹp."
+    }
+  },
+  "bulk": {
+    "bulkActionBar": {
+      "selected": "Đã chọn {{count}}"
+    }
+  },
+  "invoice": {
+    "status": {
+      "draft": "Bản nháp",
+      "sent": "Đã gửi",
+      "issued": "Đã phát hành",
+      "partially_paid": "Thanh toán một phần",
+      "overdue": "Quá hạn",
+      "paid": "Đã thanh toán",
+      "void": "Đã hủy"
+    }
+  },
+  "invoiceEditor": {
+    "addLine": {
+      "add": "Thêm",
+      "addInCatalog": "Thêm một số trong Danh mục sản phẩm",
+      "bundle": "Gói",
+      "catalogItem": "Mục danh mục",
+      "clearSelection": "Xóa lựa chọn",
+      "manualLine": "Dòng thủ công",
+      "noCatalogItems": "Không có mục danh mục.",
+      "searchCatalog": "Tìm kiếm danh mục theo tên hoặc SKU",
+      "sourceAria": "Thêm nguồn dòng",
+      "catalogLoadFailed": "Không thể tải danh mục, do đó không thể hiển thị mục nào.",
+      "retry": "Thử lại"
+    },
+    "billTo": {
+      "addInSettings": "Thêm một mục trong Cài đặt tổ chức",
+      "noContact": "Chưa đặt liên hệ thanh toán.",
+      "title": "Hóa đơn gửi đến"
+    },
+    "errors": {
+      "addLine": "Không thể thêm dòng.",
+      "loadCatalog": "Không thể tải danh mục.",
+      "nameOrDescription": "Dòng cần có tên hoặc mô tả.",
+      "nonNegativeUnitPrice": "Nhập đơn giá từ 0 trở lên.",
+      "quantityGreaterThanZero": "Nhập số lượng lớn hơn 0.",
+      "removeLine": "Không thể xóa dòng.",
+      "saveNotes": "Không thể lưu ghi chú.",
+      "saveTerms": "Không thể lưu điều khoản.",
+      "updateLine": "Không thể cập nhật dòng.",
+      "noPriceForCurrency": "Không có giá {{currency}} cho mục này. Thêm giá trong danh mục hoặc nhập dòng thủ công.",
+      "saveLineDetail": "Không thể cập nhật cách in các mục thời gian"
+    },
+    "fields": {
+      "descriptionOptional": "Mô tả (tùy chọn)",
+      "lineDescription": "Mô tả dòng",
+      "lineName": "Tên dòng",
+      "name": "Tên",
+      "quantity": "Số lượng",
+      "quantityFor": "Số lượng cho {{item}}",
+      "quantityNewLine": "Số lượng dòng mới",
+      "taxable": "Chịu thuế",
+      "unitPrice": "Đơn giá",
+      "unitPriceFor": "Đơn giá cho {{item}}",
+      "unitPriceNewLine": "Đơn giá dòng mới",
+      "untitledLine": "dòng này"
+    },
+    "hiddenSuffix": " (đã ẩn)",
+    "notes": {
+      "placeholder": "Ghi chú nội bộ hoặc của khách hàng…",
+      "title": "Ghi chú"
+    },
+    "remove": "Xóa",
+    "saved": "Đã lưu",
+    "success": {
+      "lineAdded": "Đã thêm dòng",
+      "notesSaved": "Đã lưu ghi chú",
+      "termsSaved": "Đã lưu điều khoản"
+    },
+    "summary": {
+      "noTaxRate": "Các dòng được đánh dấu chịu thuế, nhưng chưa thiết lập mức thuế suất.",
+      "inheritedTaxRate": "Thuế chưa có trong bản nháp này — mức thuế kế thừa {{rate}} sẽ áp dụng khi bạn phát hành, cộng thêm {{tax}} với tổng cộng {{total}}.",
+      "setTaxRate": "Thiết lập trong Cài đặt thanh toán",
+      "subtotal": "Tổng phụ",
+      "tax": "Thuế",
+      "title": "Tóm tắt",
+      "total": "Tổng cộng"
+    },
+    "table": {
+      "customerVisible": "Khách hàng nhìn thấy",
+      "customerVisibleTitle": "Liệu dòng này có xuất hiện trên hóa đơn của khách hàng hay không",
+      "empty": "Chưa có dòng nào. Thêm mục danh mục, gói hoặc dòng thủ công bên dưới.",
+      "item": "Mục",
+      "price": "Giá",
+      "qty": "SL",
+      "tax": "Thuế",
+      "total": "Tổng"
+    },
+    "terms": {
+      "placeholder": "Điều khoản thanh toán, điều khoản bảo hành, v.v.",
+      "title": "Điều khoản & Điều kiện"
+    },
+    "unapprovedTime": "{{count}} dòng tham chiếu thời gian chưa được phê duyệt. Xem lại trước khi phát hành.",
+    "unapprovedTime_one": "{{count}} dòng tham chiếu thời gian chưa được phê duyệt. Xem lại trước khi phát hành.",
+    "unapprovedTime_other": "{{count}} dòng tham chiếu thời gian chưa được phê duyệt. Xem lại trước khi phát hành.",
+    "autosaveHint": "Thay đổi được lưu tự động. Viền màu hổ phách đánh dấu chỉnh sửa chưa lưu.",
+    "lastSaved": {
+      "saved": "Đã lưu lúc {{time}}",
+      "saving": "Đang lưu…"
+    },
+    "undo": {
+      "lineDeleted": "Đã xóa dòng",
+      "tooLate": "Quá muộn để hoàn tác — dòng đó đã bị xóa rồi.",
+      "partialFlush": "Đã áp dụng {{applied}} thao tác xóa dòng; {{failed}} thất bại và đã được khôi phục."
+    },
+    "linesScrollAria": "Dòng hóa đơn — cuộn ngang để xem thêm cột",
+    "unsavedField": {
+      "lines": "Mục dòng"
+    },
+    "lineDetail": {
+      "default": "Mặc định thanh toán",
+      "grouping": "Bố cục",
+      "groupingDay": "Nhóm theo ngày",
+      "groupingEntry": "Mỗi mục một hàng",
+      "help": "Ghi đè mặc định thanh toán cho bản nháp này.",
+      "hide": "Ẩn",
+      "show": "Hiển thị",
+      "showDate": "Ngày làm việc",
+      "showNote": "Ghi chú của kỹ thuật viên",
+      "showWorkedTime": "Thời gian đã làm vs đã lập hóa đơn",
+      "title": "Dòng mục thời gian"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} dòng sẽ chặn Phát hành: thời gian của chúng đã được lập hóa đơn trên hóa đơn khác. Xóa chúng trước khi phát hành:",
+      "billedElsewhere_one": "{{count}} dòng sẽ chặn Phát hành: thời gian của nó đã được lập hóa đơn trên hóa đơn khác. Xóa nó trước khi phát hành:",
+      "billedElsewhere_other": "{{count}} dòng sẽ chặn Phát hành: thời gian của chúng đã được lập hóa đơn trên hóa đơn khác. Xóa chúng trước khi phát hành:",
+      "button": "Làm mới từ mục thời gian",
+      "drifted": "{{count}} dòng giữ nguyên: thời gian đã lập hóa đơn của mục thời gian không còn khớp với số lượng. Sửa số lượng hoặc tạo bản nháp mới.",
+      "drifted_one": "{{count}} dòng giữ nguyên: thời gian đã lập hóa đơn của mục thời gian không còn khớp với số lượng. Sửa số lượng hoặc tạo bản nháp mới.",
+      "drifted_other": "{{count}} dòng giữ nguyên: thời gian đã lập hóa đơn của mục thời gian không còn khớp với số lượng. Sửa số lượng hoặc tạo bản nháp mới.",
+      "error": "Không thể làm mới từ mục thời gian",
+      "help": "Cập nhật ghi chú, ngày làm việc và phê duyệt từ các mục thời gian gốc. Số lượng, đơn giá và mô tả bạn đã chỉnh sửa thủ công sẽ không thay đổi.",
+      "running": "Đang làm mới…",
+      "skipped": "{{count}} dòng đã bỏ qua: mục thời gian của chúng đã được lập hóa đơn ở nơi khác, đã bị xóa hoặc không còn tính phí được trên bản nháp này.",
+      "skipped_one": "{{count}} dòng đã bỏ qua: mục thời gian của nó đã được lập hóa đơn ở nơi khác, đã bị xóa hoặc không còn tính phí được trên bản nháp này.",
+      "skipped_other": "{{count}} dòng đã bỏ qua: mục thời gian của chúng đã được lập hóa đơn ở nơi khác, đã bị xóa hoặc không còn tính phí được trên bản nháp này.",
+      "summary": "Đã làm mới: {{refreshed}} · Đã cập nhật: {{unchanged}}"
+    }
+  },
+  "invoiceActions": {
+    "composer": {
+      "toLabel": "Đến",
+      "toPlaceholder": "billing@customer.com",
+      "ccToggle": "Cc",
+      "ccLabel": "Cc",
+      "subjectLabel": "Tiêu đề",
+      "subjectPlaceholder": "Hóa đơn {{number}} từ nhà cung cấp của bạn",
+      "subjectPlaceholderNoNumber": "Hóa đơn của bạn",
+      "messageLabel": "Tin nhắn (tùy chọn)",
+      "messagePlaceholder": "Thêm ghi chú ngắn cho khách hàng…",
+      "includePdfLabel": "Đính kèm tệp PDF hóa đơn",
+      "includeDeviceAppendixLabel": "Bao gồm phụ lục thiết bị tính phí",
+      "signaturePreviewLabel": "Chữ ký của bạn sẽ được thêm vào:",
+      "invalidEmail": "Địa chỉ email không hợp lệ: {{addresses}}",
+      "tooManyRecipients": "Tối đa {{max}} địa chỉ.",
+      "recipientRequired": "Thêm ít nhất một người nhận.",
+      "noBillingContactHint": "Công ty này chưa có liên hệ thanh toán — <orgLink>thêm liên hệ</orgLink> hoặc nhập địa chỉ ở trên.",
+      "payLinkNote": "Email bao gồm một liên kết bảo mật mà khách hàng có thể dùng để xem, tải xuống và thanh toán hóa đơn này — không cần đăng nhập."
+    },
+    "copyInvoiceLink": "Sao chép liên kết hóa đơn",
+    "copyInvoiceLinkTitle": "Sao chép liên kết xem & thanh toán của khách hàng — không cần đăng nhập",
+    "copyingPaymentLink": "Đang sao chép…",
+    "deleteConfirm": {
+      "message": "Thao tác này sẽ xóa vĩnh viễn bản nháp hóa đơn. Không thể hoàn tác hành động này.",
+      "title": "Xóa bản nháp hóa đơn"
+    },
+    "deleteDraft": "Xóa bản nháp",
+    "deleteError": "Không thể xóa bản nháp.",
+    "deleteSuccess": "Đã xóa bản nháp",
+    "downloadPdf": "Tải xuống PDF",
+    "downloadPdfError": "Không thể tải xuống tệp PDF hóa đơn.",
+    "issue": "Phát hành",
+    "issueAndSend": "Phát hành & Gửi",
+    "issueBlockedUnsaved": "“{{field}}” có thay đổi chưa được lưu. Hãy sửa ở đó, sau đó tiến hành Phát hành.",
+    "issueCanceledSaveFailed": "Không thể lưu thay đổi nên đã hủy phát hành. Hãy sửa trường được đánh dấu và thử lại.",
+    "issueCanceledStillSaving": "Đang lưu thay đổi của bạn — đã hủy phát hành. Thử lại sau khi mọi thứ đã được lưu.",
+    "issueError": "Không thể phát hành hóa đơn.",
+    "issueNoEmailWarning": "Đã phát hành hóa đơn — nhưng chưa gửi email (không có liên hệ thanh toán / chưa cấu hình email)",
+    "issueSendConfirm": {
+      "customerFallback": "khách hàng",
+      "message": "Thao tác này phát hành hóa đơn và gửi email cho {{customer}} với số tiền {{amount}}. Không thể hoàn tác hành động này.",
+      "title": "Phát hành và gửi hóa đơn này?"
+    },
+    "issueSendError": "Đã phát hành hóa đơn, nhưng gửi không thành công.",
+    "issueSentSuccess": "Đã phát hành và gửi hóa đơn",
+    "issueSuccess": "Đã phát hành hóa đơn",
+    "issuing": "Đang phát hành…",
+    "noVisibleLineHint": "Thêm ít nhất một dòng hiển thị với khách hàng để phát hành.",
+    "paymentLinkCopyFailed": "Không thể tự động sao chép. Liên kết thanh toán: {{url}}",
+    "preparing": "Đang chuẩn bị…",
+    "resend": "Gửi lại",
+    "resendConfirm": {
+      "title": "Gửi lại hóa đơn này?",
+      "message": "Thao tác này gửi một bản sao khác tới {{customer}} với số tiền {{amount}}. Hóa đơn không thay đổi gì — cùng số, cùng ngày, cùng số tiền."
+    },
+    "resendSuccess": "Đã gửi lại hóa đơn",
+    "resending": "Đang gửi…",
+    "savingHint": "Đang lưu thay đổi… Nút phát hành sẽ mở khóa khi mọi thứ được lưu.",
+    "savingTitle": "Đang lưu thay đổi của bạn — Nút phát hành mở khóa khi mọi thứ được lưu.",
+    "sendConfirm": {
+      "title": "Gửi hóa đơn này?",
+      "message": "Thao tác này gửi hóa đơn qua email tới {{customer}} với số tiền {{amount}}."
+    },
+    "sourceHeldForHourBlock": "Một số thời gian trên bản nháp này được giữ cho giờ trọn gói của tổ chức này và sẽ được tính phí khi kỳ trọn gói kết thúc. Xóa các dòng đó, sau đó tiến hành Phát hành.",
+    "unsavedHint": "“{{field}}” có thay đổi chưa lưu — Nút phát hành sẽ mở khóa khi đã lưu.",
+    "unsavedTitle": "“{{field}}” có thay đổi chưa lưu — Nút phát hành sẽ mở khóa khi đã lưu."
+  },
+  "invoiceDetail": {
+    "currency": {
+      "actions": {
+        "change": "Đổi tiền tệ"
+      },
+      "dialog": {
+        "title": "Đổi tiền tệ hóa đơn",
+        "description": "Bản nháp hóa đơn này được tính bằng {{currency}}.",
+        "currencyLabel": "Tiền tệ mới",
+        "modeLegend": "Điều gì xảy ra với các dòng của hóa đơn",
+        "modeClear": "Xóa tất cả các dòng",
+        "modeClearHint": "Các dòng sẽ bị xóa. Bắt buộc khi có bất kỳ dòng nào là thủ công hoặc gói.",
+        "modeReprice": "Tính lại giá dòng danh mục",
+        "modeRepriceHint": "Mọi dòng danh mục được lấy từ bảng giá của loại tiền tệ mới. Chỉ khả thi khi tất cả các dòng đều đến từ danh mục.",
+        "confirm": "Tôi hiểu rằng điều này làm thay đổi tiền tệ của hóa đơn.",
+        "submit": "Đổi tiền tệ"
+      },
+      "toast": {
+        "changed": "Đã đổi tiền tệ hóa đơn thành {{currency}}."
+      },
+      "errors": {
+        "change": "Không thể đổi tiền tệ hóa đơn."
+      }
+    },
+    "deposit": {
+      "duePrefix": "Tiền cọc",
+      "dueSuffix": "cần trả — đã thanh toán {{paid}} trên tổng số {{total}}.",
+      "paid": "Đã thanh toán tiền cọc — số dư còn lại {{balance}}."
+    },
+    "dueDate": {
+      "aria": "Hạn thanh toán",
+      "display": "Hạn chót {{date}}",
+      "updateError": "Không thể cập nhật hạn thanh toán.",
+      "updateSuccess": "Đã cập nhật hạn thanh toán"
+    },
+    "from": "Từ",
+    "lines": {
+      "cost": "Chi phí",
+      "description": "Mô tả",
+      "hiddenMarker": " (ẩn)",
+      "margin": "Biên độ",
+      "price": "Giá",
+      "qty": "SL",
+      "tax": "Thuế",
+      "total": "Tổng",
+      "allHidden": "Tất cả các dòng chỉ dùng nội bộ. Sử dụng “Hiển thị chi phí & biên độ” để xem."
+    },
+    "devices": {
+      "title": "Thiết bị tính phí",
+      "toggle": "Thiết bị ({{count}})",
+      "notRecorded": "Chi tiết thiết bị chưa được ghi nhận cho hóa đơn này.",
+      "hostname": "Tên máy",
+      "role": "Vai trò",
+      "countedAs": "Được tính là",
+      "included": "Đã bao gồm",
+      "overage": "Vượt mức",
+      "removed": "Đã gỡ thiết bị",
+      "showing": "Hiển thị {{shown}} trên {{total}}",
+      "flaggedHeading": "Đã gắn cờ, không tính phí",
+      "empty": "Không có thiết bị nào được tính cho dòng này.",
+      "loadError": "Không thể tải danh sách thiết bị."
+    },
+    "paymentMethods": {
+      "cash": "Tiền mặt",
+      "check": "Séc",
+      "bank_transfer": "Chuyển khoản ngân hàng",
+      "card": "Thẻ",
+      "other": "Khác",
+      "ach_debit": "Ghi nợ ACH"
+    },
+    "payments": {
+      "amount": "Số tiền",
+      "amountRequired": "Nhập số tiền thanh toán để ghi nhận",
+      "connectStripe": "Kết nối Stripe để nhận thanh toán trực tuyến.",
+      "currencyMismatch": "Hóa đơn này tính bằng {{documentCurrency}} nhưng tài khoản Stripe của bạn quyết toán bằng {{accountCurrency}}. Stripe sẽ hiển thị {{documentCurrency}} cho khách hàng và quy đổi khi quyết toán — bạn chịu chênh lệch tỷ giá và phí quy đổi.",
+      "date": "Ngày thanh toán",
+      "draftHint": "Phát hành hóa đơn này để ghi nhận thanh toán.",
+      "empty": "Chưa có khoản thanh toán nào được ghi nhận.",
+      "linkCopied": "Đã sao chép liên kết thanh toán vào bộ nhớ tạm",
+      "linkError": "Không thể tạo liên kết thanh toán.",
+      "loadFailed": "Không thể tải các khoản thanh toán.",
+      "method": "Phương thức thanh toán",
+      "noLinkReturned": "Không có liên kết thanh toán nào được trả về. Thử lại.",
+      "online": "Trực tuyến",
+      "record": "Ghi nhận thanh toán",
+      "recordConfirm": {
+        "message": "Ghi nhận thanh toán {{amount}} ({{method}}) vào ngày {{date}}?",
+        "title": "Ghi nhận thanh toán"
+      },
+      "recordError": "Không thể ghi nhận thanh toán.",
+      "recordSuccess": "Đã ghi nhận thanh toán",
+      "reference": "Mã tham chiếu",
+      "referencePlaceholder": "Mã tham chiếu (tùy chọn)",
+      "reverse": "Hoàn tác",
+      "reverseAria": "Hoàn tác khoản thanh toán {{amount}}",
+      "reverseConfirm": {
+        "label": "Hoàn tác thanh toán",
+        "message": "Thao tác này sẽ hoàn tác khoản thanh toán {{amount}} qua {{method}} và xóa khoản đó khỏi số dư hóa đơn. Không thể hoàn tác thao tác này.",
+        "title": "Hoàn tác thanh toán này?"
+      },
+      "reverseError": "Không thể hoàn tác thanh toán.",
+      "reverseSuccess": "Đã hoàn tác thanh toán",
+      "sendLink": "Gửi liên kết thanh toán",
+      "setUp": "Thiết lập",
+      "shareLinkPrompt": "Chia sẻ liên kết thanh toán này với khách hàng của bạn:",
+      "stripeNudge": "Kết nối Stripe để chấp nhận thanh toán thẻ trực tuyến.",
+      "title": "Thanh toán",
+      "viaStripe": "qua Stripe",
+      "currencyUnknown": "Tiền tệ quyết toán của tài khoản Stripe của bạn chưa được lưu bộ nhớ đệm, do đó không thể đối chiếu với hóa đơn {{documentCurrency}} này. Hãy làm mới chi tiết tài khoản Stripe trong Cài đặt → Tích hợp để bật tính năng kiểm tra lệch tiền tệ.",
+      "inProvider": "Trong {{provider}}",
+      "syncingToProvider": "Đang đồng bộ…",
+      "providerSyncFailed": "Đồng bộ {{provider}} thất bại",
+      "reverseInProviderToo": "Hoàn tác việc này trong {{provider}} luôn",
+      "overpayment": "Số tiền vượt quá số dư còn lại ({{balance}}).",
+      "fillLabel": "Điền số tiền",
+      "fillDeposit": "Đặt cọc ({{amount}})",
+      "fillBalance": "Toàn bộ số dư ({{amount}})"
+    },
+    "requestPayment": {
+      "invoiceSent": "Đã gửi hóa đơn",
+      "noEmailWarning": "Không có email nào được gửi (không có liên hệ thanh toán / chưa cấu hình email)",
+      "paymentRequestSent": "Đã gửi yêu cầu thanh toán",
+      "requestPayment": "Yêu cầu thanh toán",
+      "sendError": "Không thể gửi hóa đơn.",
+      "sendInvoice": "Gửi hóa đơn"
+    },
+    "summary": {
+      "balanceDue": "Số dư còn lại",
+      "paid": "Đã thanh toán",
+      "subtotal": "Thành tiền",
+      "tax": "Thuế",
+      "total": "Tổng cộng",
+      "depositDueNow": "Tiền cọc đến hạn trả ngay"
+    },
+    "terms": "Điều khoản & Điều kiện",
+    "void": {
+      "button": "Hủy hiệu lực hóa đơn",
+      "description": "Việc hủy hiệu lực sẽ giải phóng công việc đã lập hóa đơn để có thể lập lại hóa đơn. Không thể hoàn tác thao tác này.",
+      "error": "Không thể hủy hiệu lực hóa đơn.",
+      "reason": "Lý do",
+      "reissue": "Phát hành lại thành bản nháp mới",
+      "reissuedSuccess": "Đã hủy hiệu lực hóa đơn và phát hành lại thành bản nháp",
+      "success": "Đã hủy hiệu lực hóa đơn",
+      "title": "Hủy hiệu lực hóa đơn"
+    },
+    "empty": "Hóa đơn này chưa có dòng nào.",
+    "addContentInEditor": "Thêm dòng trong Trình chỉnh sửa",
+    "linesScrollAria": "Dòng hóa đơn — cuộn ngang để xem thêm cột",
+    "resetLink": {
+      "button": "Đặt lại liên kết khách hàng",
+      "title": "Đặt lại liên kết khách hàng?",
+      "description": "Bất kỳ ai có liên kết hiện tại sẽ mất quyền truy cập — kể cả liên kết trong các email đã gửi trước đó. Lần gửi hoặc sao chép tiếp theo sẽ tạo liên kết mới.",
+      "confirm": "Đặt lại liên kết",
+      "success": "Đã đặt lại liên kết — liên kết cũ sẽ không còn hoạt động",
+      "error": "Không thể đặt lại liên kết"
+    },
+    "accountingSync": {
+      "title": "Đồng bộ {{provider}}",
+      "status": {
+        "pending": "Chưa đẩy",
+        "synced": "Đã đồng bộ",
+        "error": "Đồng bộ thất bại",
+        "synced_with_tax_variance": "Đã đồng bộ với chênh lệch thuế"
+      },
+      "taxVarianceHint": "{{provider}} tính toán tổng tiền thuế khác. So sánh cả hai bản ghi trước khi chốt kỳ.",
+      "docNumber": "Chứng từ {{provider}} {{docNumber}}",
+      "lastSynced": "Đồng bộ lần cuối {{when}}",
+      "syncing": "Đang đồng bộ…",
+      "push": "Đẩy lên {{provider}}",
+      "pushed": "Đã đẩy hóa đơn lên {{provider}}.",
+      "pushFailed": "Không thể đẩy hóa đơn lên {{provider}}.",
+      "voidedHint": "Hóa đơn này đã bị hủy hiệu lực — không có gì để đẩy lên {{provider}}.",
+      "remoteDeletedHint": "Hóa đơn này đã bị xóa trong {{provider}}. Đẩy lại sẽ tạo bản sao trùng lặp — hãy xử lý trong {{provider}} trước."
+    }
+  },
+  "invoiceDocument": {
+    "preview": {
+      "description": "Đây là giao diện khách hàng nhìn thấy trên hóa đơn của họ.",
+      "downloadError": "Không thể tải xuống PDF hóa đơn.",
+      "downloadPdf": "Tải xuống PDF",
+      "loadError": "Không thể tải chế độ xem của khách hàng cho hóa đơn này.",
+      "loading": "Đang tải chế độ xem của khách hàng…",
+      "preparing": "Đang chuẩn bị…",
+      "retry": "Thử lại"
+    },
+    "ticketHeader": "Phiếu hỗ trợ #{{number}}"
+  },
+  "invoiceWorkspace": {
+    "backLabel": "Hóa đơn",
+    "backToInvoices": "Quay lại danh sách hóa đơn",
+    "draftTitle": "Hóa đơn nháp",
+    "errors": {
+      "loadFailed": "Không thể tải hóa đơn",
+      "missingId": "Thiếu mã hóa đơn",
+      "notFound": "Không tìm thấy hóa đơn.",
+      "unavailable": "Hóa đơn không khả dụng."
+    },
+    "tabs": {
+      "editor": "Trình chỉnh sửa",
+      "preview": "Xem trước",
+      "detail": "Chi tiết"
+    }
+  },
+  "invoicesPage": {
+    "accessDenied": "Bạn không có quyền xem hóa đơn.",
+    "bulk": {
+      "deleteDrafts": "Xóa bản nháp",
+      "deletedVerb": "đã xóa",
+      "failed": "Hàng loạt {{verb}} thất bại. Thử lại.",
+      "issue": "Phát hành",
+      "issuedVerb": "đã phát hành",
+      "limit": "Chọn tối đa {{limit}} mục mỗi lần.",
+      "partial": "{{succeeded}} {{verb}}, bỏ qua {{skipped}}{{failedText}}",
+      "success": "{{succeeded}} {{verb}}",
+      "void": "Hủy hiệu lực",
+      "voidedVerb": "đã hủy hiệu lực",
+      "pushToProvider": "Đẩy lên {{provider}}",
+      "providerQueued": "Đã đưa {{enqueued}} vào hàng đợi cho {{provider}}",
+      "providerQueuedPartial": "Đã đưa {{enqueued}} vào hàng đợi cho {{provider}}, bỏ qua {{skipped}}",
+      "providerQueuedFailed": "Đã đưa {{enqueued}} vào hàng đợi cho {{provider}}, bỏ qua {{skipped}}, lỗi đưa vào hàng đợi {{failed}}",
+      "providerFailed": "Đưa vào hàng đợi đẩy {{provider}} thất bại. Thử lại."
+    },
+    "bulkDelete": {
+      "message": "Xóa (các) hóa đơn đã chọn {{count}}? Chỉ các hóa đơn NHÁP mới bị xóa; không thể hoàn tác thao tác này.",
+      "title": "Xóa hóa đơn nháp"
+    },
+    "bulkVoid": {
+      "description": "Việc hủy hiệu lực sẽ giải phóng công việc đã lập hóa đơn để có thể lập lại hóa đơn. Không thể hoàn tác thao tác này.",
+      "reason": "Lý do",
+      "submit": "Hủy hiệu lực hóa đơn",
+      "title": "Hủy hiệu lực hóa đơn"
+    },
+    "deposit": {
+      "paid": "Đã thanh toán tiền cọc",
+      "unpaid": "Chưa thanh toán tiền cọc"
+    },
+    "dialog": {
+      "allBlockedByCurrency": "Tất cả công việc chưa lập hóa đơn trong phạm vi này được tính bằng tiền tệ khác, vì vậy không thể tổng hợp. Thay vào đó, hãy tổng hợp bản nháp bằng loại tiền tệ đó:",
+      "allSites": "Tất cả chi nhánh",
+      "assemble": "Tổng hợp",
+      "assembleError": "Không thể tổng hợp hóa đơn cho khoảng thời gian đó.",
+      "assembleFromWork": "Tổng hợp từ công việc",
+      "assembleIn": "Tổng hợp trong {{code}} ({{count}} mục, {{amount}})",
+      "assembleSuccess": "Đã tổng hợp bản nháp hóa đơn",
+      "blankInvoice": "Hóa đơn trống",
+      "blockedByCurrency": "{{count}} mục chưa thanh toán tính bằng {{code}} đã bị bỏ qua — hãy tổng hợp bản nháp riêng bằng {{code}} để tính tiền.",
+      "createDraft": "Tạo bản nháp",
+      "createError": "Không thể tạo bản nháp hóa đơn.",
+      "createGenericError": "Không thể tạo hóa đơn.",
+      "createSuccess": "Đã tạo bản nháp hóa đơn",
+      "currency": "Tiền tệ",
+      "currencyOrgDefault": "Mặc định của tổ chức",
+      "description": "Tổng hợp công việc chưa thanh toán thành bản nháp, hoặc tạo hóa đơn trống.",
+      "from": "Từ",
+      "selectOrganization": "Chọn tổ chức…",
+      "siteOptional": "Chi nhánh (tùy chọn)",
+      "sourceAria": "Nguồn hóa đơn",
+      "title": "Hóa đơn mới",
+      "to": "Đến",
+      "working": "Đang xử lý…",
+      "heldForHourBlock_one": "{{count}} mục thời gian ({{hours}} giờ) đang giữ lại cho giờ gói của tổ chức này và sẽ được tính tiền khi kỳ gói đóng lại.",
+      "heldForHourBlock_other": "{{count}} mục thời gian ({{hours}} giờ) đang giữ lại cho giờ gói của tổ chức này và sẽ được tính tiền khi kỳ gói đóng lại."
+    },
+    "empty": {
+      "description": "Tổng hợp thời gian và linh kiện chưa thanh toán thành bản nháp, hoặc tạo hóa đơn trống.",
+      "filtered": "Không có hóa đơn nào khớp với bộ lọc.",
+      "title": "Chưa có hóa đơn nào"
+    },
+    "errors": {
+      "loadInvoices": "Không tải được hóa đơn",
+      "loadOrganizations": "Không tải được tổ chức.",
+      "loadSites": "Không tải được chi nhánh."
+    },
+    "filters": {
+      "allStatuses": "Tất cả trạng thái",
+      "issuedFrom": "Đã phát hành từ",
+      "issuedTo": "Đã phát hành đến",
+      "searchAria": "Tìm kiếm hóa đơn",
+      "searchPlaceholder": "Tìm số hoặc tổ chức",
+      "statusAria": "Lọc theo trạng thái"
+    },
+    "newInvoice": "Hóa đơn mới",
+    "stats": {
+      "drafts": "Bản nháp",
+      "needsFollowUp": "cần theo dõi",
+      "notYetIssued": "chưa phát hành",
+      "open": "{{count}} đang mở",
+      "outstanding": "Chưa thanh toán",
+      "overdue": "Quá hạn"
+    },
+    "subtitle": "Tổng hợp, phát hành và theo dõi hóa đơn khách hàng.",
+    "table": {
+      "balance": "Số dư",
+      "draftInvoice": "Bản nháp hóa đơn",
+      "due": "Hạn thanh toán",
+      "issued": "Đã phát hành",
+      "number": "Số",
+      "selectAll": "Chọn tất cả hóa đơn",
+      "selectInvoice": "Chọn hóa đơn {{invoice}}",
+      "total": "Tổng cộng"
+    },
+    "title": "Hóa đơn",
+    "tryAgain": "Thử lại",
+    "exportBillables": "Xuất mục tính tiền",
+    "exportBillablesDialogTitle": "Xuất mục tính tiền"
+  },
+  "orgBillingSettings": {
+    "address": {
+      "city": "Thành phố",
+      "country": "Quốc gia",
+      "line1": "Địa chỉ dòng 1",
+      "line2": "Địa chỉ dòng 2",
+      "postal": "Mã bưu chính",
+      "region": "Tỉnh / Bang",
+      "title": "Địa chỉ thanh toán"
+    },
+    "contact": {
+      "description": "Báo giá và hóa đơn được gửi qua email cho người liên hệ thanh toán của tổ chức theo mặc định — người liên hệ cấp tổ chức có vai trò Thanh toán. Bạn vẫn có thể thay đổi người nhận mỗi khi gửi.",
+      "manage": "Quản lý liên hệ",
+      "noEmail": "{{name}} có vai trò Thanh toán nhưng không có địa chỉ email, vì vậy không thể gửi báo giá và hóa đơn qua email cho đến khi thêm email.",
+      "none": "Không có liên hệ nào giữ vai trò Thanh toán. Cho đến khi có, việc gửi đề xuất sẽ đánh dấu là Đã gửi nhưng không gửi email gì.",
+      "recipientLabel": "Người nhận mặc định:",
+      "title": "Liên hệ thanh toán"
+    },
+    "currency": {
+      "title": "Tiền tệ",
+      "description": "Báo giá, hóa đơn, hợp đồng, mục thời gian và linh kiện mới cho tổ chức này sẽ được gắn loại tiền tệ này. Không có mục nào đã tồn tại bị thay đổi.",
+      "label": "Tiền tệ thanh toán",
+      "partnerDefault": "Không kế thừa: mỗi tổ chức giữ tiền tệ thanh toán riêng. Tiền tệ mặc định của đối tác ({{currency}}) chỉ áp dụng cho các tổ chức được tạo từ bây giờ.",
+      "loading": "Đang kiểm tra xem việc đổi sang {{currency}} sẽ ảnh hưởng đến những gì…",
+      "error": "Không tải được tóm tắt thay đổi tiền tệ.",
+      "panelTitle": "Đổi tiền tệ thanh toán thành {{currency}}?",
+      "none": "Không có gì trong tổ chức này được gắn loại tiền tệ khác.",
+      "groupTitle": "Được gắn bằng {{currency}}",
+      "counts": {
+        "draftInvoices": "Bản nháp hóa đơn",
+        "draftQuotes": "Bản nháp báo giá",
+        "sentQuotes": "Báo giá đã gửi",
+        "viewedQuotes": "Báo giá đã xem",
+        "draftContracts": "Bản nháp hợp đồng",
+        "activeContracts": "Hợp đồng đang hoạt động",
+        "pausedContracts": "Hợp đồng tạm dừng",
+        "timeEntries": "Mục thời gian chưa thanh toán",
+        "parts": "Linh kiện chưa thanh toán"
+      },
+      "timeDetail": "{{ready}} sẵn sàng tính tiền, {{running}} đang chạy, {{nonBillable}} không tính tiền, {{missingRate}} chưa có đơn giá",
+      "partsDetail": "{{ready}} sẵn sàng tính tiền, {{nonBillable}} không tính tiền",
+      "amounts": "Nhân công {{labor}} · Linh kiện {{parts}}",
+      "warningsTitle": "Cấu hình sẽ ngừng áp dụng",
+      "warningRate": "Đơn giá theo giờ mặc định của tổ chức được đặt bằng {{currency}} và sẽ không còn áp dụng cho các mục thời gian mới.",
+      "warningCategories": "{{count}} đơn giá theo danh mục phiếu hỗ trợ bằng loại tiền khác sẽ bị bỏ qua.",
+      "warningOverrides": "{{count}} mức giá tùy chỉnh trong danh mục của tổ chức bằng loại tiền khác sẽ bị bỏ qua.",
+      "recovery": "Để tính tiền các mục {{currency}} ở trên, hãy tổng hợp bản nháp bằng {{currency}}.",
+      "rateLess": "{{count}} mục thời gian chưa thanh toán có số giờ nhưng chưa có đơn giá theo giờ. Hãy đặt đơn giá cho chúng — việc đổi tiền tệ không ảnh hưởng đến chúng.",
+      "retention": "Chỉ các tài liệu, mục thời gian và linh kiện trong tương lai mới thay đổi. Không có số tiền nào bị chuyển đổi và các bản nháp, hợp đồng, mục chưa thanh toán hiện tại giữ nguyên tiền tệ đã gắn.",
+      "advisory": "Các số lượng này chỉ là bản xem trước, không phải cam kết — bất kỳ thứ gì được tạo sau bản xem trước này sẽ không được bao gồm.",
+      "stale": "Tiền tệ thanh toán đã đổi thành {{currency}} trong lúc bạn đang xem xét. Hãy kiểm tra lại tóm tắt đã làm mới và xác nhận lần nữa.",
+      "confirm": "Đổi tiền tệ",
+      "changing": "Đang đổi…",
+      "cancel": "Hủy",
+      "changeError": "Không thể đổi tiền tệ thanh toán của tổ chức.",
+      "changeSuccess": "Đã cập nhật tiền tệ thanh toán của tổ chức"
+    },
+    "loadError": "Không tải được cài đặt thanh toán.",
+    "loading": "Đang tải cài đặt thanh toán…",
+    "saveButton": "Lưu cài đặt thanh toán",
+    "saveError": "Không thể lưu cài đặt thanh toán của tổ chức.",
+    "saveSuccess": "Đã lưu cài đặt thanh toán của tổ chức",
+    "tax": {
+      "partnerDefault": "Mặc định của đối tác",
+      "taxExempt": "Miễn thuế",
+      "taxId": "Mã số thuế",
+      "taxRate": "Thuế suất (%)",
+      "title": "Thuế"
+    },
+    "terms": {
+      "description": "Số ngày từ khi phát hành đến hạn thanh toán hóa đơn của tổ chức này. Để trống để dùng mặc định của đối tác. Thay đổi áp dụng cho hóa đơn phát hành từ bây giờ; hóa đơn đã phát hành giữ nguyên hạn thanh toán.",
+      "invalid": "Nhập một số nguyên từ 0 đến 365.",
+      "partnerDefault": "Mặc định của đối tác",
+      "paymentTermsDays": "Điều khoản thanh toán (ngày)",
+      "title": "Điều khoản thanh toán"
+    }
+  },
+  "partnerBillingSettings": {
+    "agreements": {
+      "title": "Thỏa thuận",
+      "description": "Mặc định cho các thỏa thuận bạn gửi để ký. Người gửi vẫn có thể chọn thời gian hết hạn khác cho từng yêu cầu.",
+      "expiryDays": "Thời hạn liên kết mặc định (ngày)",
+      "expiryDaysHelp": "Liên kết ký của yêu cầu thỏa thuận mới sẽ hết hạn sau số ngày này kể từ khi tạo, trừ khi người gửi chọn ngày khác.",
+      "expiryDaysInvalid": "Nhập một số nguyên từ {{min}} đến {{max}}.",
+      "remindersEnabled": "Gửi lời nhắc tự động",
+      "remindersHelp": "Gửi lại cùng một liên kết ký cho người nhận cho đến khi thỏa thuận được ký, từ chối, hủy bỏ hoặc hết hạn.",
+      "intervalDays": "Nhắc nhở sau mỗi (ngày)",
+      "intervalDaysInvalid": "Nhập một số nguyên từ {{min}} đến {{max}}.",
+      "maxReminders": "Dừng sau (lần nhắc)",
+      "maxRemindersHelp": "Đếm mọi lời nhắc trên yêu cầu, thủ công hoặc tự động.",
+      "maxRemindersInvalid": "Nhập một số nguyên từ {{min}} đến {{max}}.",
+      "readOnlyNoSend": "Thay đổi mặc định thỏa thuận yêu cầu quyền gửi thỏa thuận. Bạn chỉ có quyền xem."
+    },
+    "company": {
+      "addressInherited": "Giống như chi tiết công ty",
+      "addressLine1": "Địa chỉ dòng 1",
+      "addressLine2": "Địa chỉ dòng 2",
+      "addressTitle": "Địa chỉ",
+      "city": "Thành phố",
+      "country": "Quốc gia",
+      "defaultTerms": "Điều khoản & điều kiện mặc định",
+      "defaultTermsPlaceholder": "Điều khoản thanh toán, từ chối trách nhiệm, ngôn ngữ bảo hành, v.v.",
+      "description": "Hiển thị là bên bán trên báo giá và hóa đơn.",
+      "inheritedFromCompanyDetails": "Chi tiết công ty",
+      "name": "Tên công ty",
+      "phone": "Điện thoại",
+      "postal": "Mã bưu chính",
+      "region": "Tỉnh / khu vực",
+      "title": "Liên hệ công ty",
+      "useCompanyAddress": "Sử dụng địa chỉ công ty",
+      "website": "Trang web"
+    },
+    "defaults": {
+      "aiStyle": "Kiểu nội dung AI",
+      "aiStyleHelp": "Định hình cách tính năng “Tự động điền từ web” và “Tinh chỉnh bằng AI” viết tên sản phẩm và mô tả trên báo giá, hóa đơn và mục danh mục. Để trống để dùng định dạng mặc định.",
+      "aiStylePlaceholder": "Mặc định: tên mục là tên ngắn, chung chung thân thiện với khách hàng (\"Điểm truy cập không dây\"); mô tả bắt đầu bằng tên đầy đủ của sản phẩm, sau đó là các thông số kỹ thuật dạng gạch đầu dòng đủ chi tiết để đối chiếu đơn hàng. Mô tả phong cách của riêng bạn ở đây để ghi đè.",
+      "autoTaxHardware": "Tự động tính thuế mặt hàng phần cứng",
+      "autoTaxHardwareHelp": "Phần cứng mới nhập mặc định là chịu thuế.",
+      "autoEmailInvoice": "Gửi email hóa đơn tự động khi báo giá được chấp nhận",
+      "autoEmailInvoiceHelp": "Khi khách hàng chấp nhận đề xuất, hóa đơn được phát hành sẽ được gửi qua email ngay lập tức với liên kết xem & thanh toán bảo mật — không cần đăng nhập.",
+      "notifyOnBehalfAcceptance": "Gửi email cho khách hàng khi bạn ghi nhận sự chấp nhận thay họ",
+      "notifyOnBehalfAcceptanceHelp": "Khi ai đó trong nhóm của bạn chấp nhận báo giá thay cho khách hàng, khách hàng sẽ nhận được một thông báo ngắn cho biết ai đã ghi nhận và vào lúc nào, kèm theo số hóa đơn nếu có. Họ có thể trả lời nếu có sai sót. Tắt theo mặc định.",
+      "currencyCode": "Tiền tệ mặc định cho tổ chức mới",
+      "currencyHelp": "Tổ chức mới bắt đầu với loại tiền tệ này. Tổ chức hiện tại giữ nguyên loại tiền tệ của họ — thay đổi trên tab Thanh toán của tổ chức đó.",
+      "defaultMarkup": "Tỷ suất lợi nhuận mặc định (%)",
+      "defaultTaxRate": "Thuế suất mặc định (%)",
+      "description": "Mặc định cho báo giá và hóa đơn trên các khách hàng của bạn. Một tổ chức có thể ghi đè thuế suất và điều khoản thanh toán của riêng mình. Tiền tệ của tổ chức đó bắt đầu từ tiền tệ mặc định ở đây và được thay đổi trên tab Thanh toán của tổ chức đó.",
+      "deviceAppendix": "Bao gồm phụ lục thiết bị tính cước trên PDF hóa đơn",
+      "deviceAppendixHelp": "Thêm một trang liệt kê mọi thiết bị được tính trên từng dòng hóa đơn. Tắt theo mặc định; lựa chọn này được chốt khi hóa đơn được phát hành.",
+      "documentPageSize": "Kích thước trang",
+      "documentPageSizeA4": "A4",
+      "documentPageSizeLetter": "Letter",
+      "documentTheme": "Phông chữ tài liệu",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
+      "invoiceFooter": "Chân trang tài liệu",
+      "invoiceFooterHelp": "In ở cuối mọi trang báo giá và hóa đơn. Văn bản chân trang của riêng tổ chức (cài đặt Cổng thông tin) sẽ thay thế phần này cho tổ chức đó và dòng chân trang của báo giá sẽ thay thế cả hai.",
+      "invoiceFooterPlaceholder": "Hướng dẫn thanh toán, ghi chú cảm ơn, v.v.",
+      "invoiceNumberPrefix": "Tiền tố số hóa đơn",
+      "markupHelp": "Tỷ suất lợi nhuận mặc định trên giá gốc nhà phân phối, được dùng để điền trước giá bán khi nhập mục danh mục. Biên lợi nhuận gộp kết quả được hiển thị khi bạn nhập.",
+      "paymentTermsDays": "Điều khoản thanh toán (ngày)",
+      "prefixInvalid": "Nhập tiền tố từ 1 đến 12 ký tự.",
+      "taxRateInvalid": "Nhập thuế suất từ 0 đến 100.",
+      "termsDaysInvalid": "Nhập một số nguyên ngày từ 0 đến 365.",
+      "title": "Cài đặt thanh toán",
+      "lineDetailTitle": "Dòng mục nhập thời gian trên hóa đơn",
+      "lineDetailHelp": "Chọn những gì khách hàng nhìn thấy cho các mục nhập thời gian. Hóa đơn nháp có thể ghi đè điều này; lựa chọn được chốt khi hóa đơn được phát hành.",
+      "lineShowDate": "Hiển thị ngày làm việc",
+      "lineShowNote": "Hiển thị ghi chú của kỹ thuật viên",
+      "lineShowWorkedTime": "Hiển thị thời gian thực tế so với thời gian tính cước",
+      "lineGrouping": "Bố cục",
+      "lineGroupingEntry": "Một hàng cho mỗi mục nhập",
+      "lineGroupingDay": "Nhóm theo ngày"
+    },
+    "loadError": "Không thể tải cài đặt thanh toán.",
+    "loading": "Đang tải cài đặt thanh toán…",
+    "saveButton": "Lưu cài đặt thanh toán",
+    "saveError": "Không thể lưu cài đặt thanh toán.",
+    "saveSuccess": "Đã lưu cài đặt thanh toán",
+    "readOnlyNotice": "Bạn chỉ có quyền xem cài đặt thanh toán. Yêu cầu quản trị viên thay đổi.",
+    "readOnlyNoPartnerWideNotice": "Cài đặt thanh toán áp dụng cho tất cả tổ chức, vì vậy việc thay đổi yêu cầu quyền truy cập tổ chức đối tác đầy đủ. Bạn chỉ có quyền xem."
+  },
+  "shared": {
+    "documentWorkspace": {
+      "backAria": "Quay lại {{label}}"
+    },
+    "sortableTh": {
+      "ascending": "Tăng dần",
+      "descending": "Giảm dần",
+      "sortBy": "Sắp xếp theo {{label}}",
+      "sortByWithDirection": "Sắp xếp theo {{label}}, {{direction}}"
+    },
+    "statusPill": {
+      "prefix": "Trạng thái:"
+    }
+  },
+  "partnerBillingSettingsTabs": {
+    "defaults": "Mặc định",
+    "documents": "Tài liệu",
+    "agreements": "Thỏa thuận",
+    "connections": "Kết nối",
+    "rates": "Biểu phí",
+    "payments": "Thanh toán"
+  },
+  "billingConnectionsTab": {
+    "accounting": {
+      "title": "Kế toán",
+      "description": "Stripe, QuickBooks và Xero kết nối trong mục Tích hợp — quản lý chúng ở đó.",
+      "cta": "Quản lý kết nối kế toán →"
+    },
+    "catalog": {
+      "title": "Danh mục & nhà phân phối",
+      "description": "Danh mục sản phẩm và kết nối nhà phân phối (Pax8, TD SYNNEX) nằm ở hai nơi — chuyển đổi giữa chúng tại đây.",
+      "catalogCta": "Mở Danh mục sản phẩm →",
+      "distributorsCta": "Mở Nhà phân phối →"
+    }
+  },
+  "orgBillingProfile": {
+    "label": "Hồ sơ thanh toán",
+    "inherit": "{{name}} (mặc định đối tác)",
+    "noProfile": "Không có hồ sơ thanh toán",
+    "unavailable": "Hồ sơ được gán không khả dụng",
+    "resolved": "Biểu phí từ {{name}}",
+    "allOtherWork": "Tất cả công việc khác",
+    "billable": "Tính phí ở mức {{rate}}/h",
+    "included": "Đã bao gồm",
+    "nonBillable": "Không tính phí",
+    "noRate": "Tính phí — chưa cấu hình mức phí",
+    "minimum": "{{outcome}} · tối thiểu {{minutes}} phút",
+    "rounding": "Làm tròn đến {{minutes}} phút",
+    "archivedWorkType": "Loại công việc đã lưu trữ",
+    "mismatch": "Hồ sơ thanh toán được gán không hoạt động hoặc dùng loại tiền tệ khác. Giá trị mặc định của đối tác khớp sẽ được áp dụng thay thế.",
+    "currencyWarning": "Hồ sơ thanh toán được gán sử dụng {{currency}}. Sau thay đổi này, giá trị mặc định của đối tác khớp sẽ được áp dụng.",
+    "loadError": "Không thể tải hồ sơ thanh toán.",
+    "saveError": "Không thể lưu hồ sơ thanh toán.",
+    "partialSave": "Hồ sơ thanh toán đã được lưu, nhưng các cài đặt thanh toán khác thì chưa. Thử lại Lưu để hoàn tất.",
+    "aiUsage": "Sử dụng AI: {{summary}}"
+  },
+  "rates": {
+    "title": "Biểu phí",
+    "description": "Đặt mức phí nhân công theo hồ sơ thanh toán và loại công việc. Thay đổi áp dụng cho các mục nhập thời gian mới.",
+    "create": "Thêm hồ sơ thanh toán",
+    "loadError": "Không thể tải hồ sơ thanh toán. Vui lòng thử lại.",
+    "saveError": "Không thể lưu hồ sơ thanh toán.",
+    "saved": "Đã lưu hồ sơ thanh toán.",
+    "empty": "Thêm cấu hình thanh toán để thiết lập đơn giá nhân công.",
+    "profile": "Cấu hình thanh toán",
+    "allOtherWork": "Tất cả công việc khác",
+    "actions": "Thao tác",
+    "default": "Mặc định",
+    "clone": "Nhân bản cấu hình thanh toán",
+    "setDefault": "Đặt làm mặc định",
+    "archive": "Lưu trữ",
+    "usageUnavailable": "Không có dữ liệu sử dụng của tổ chức.",
+    "readOnlyNotice": "Bạn có quyền xem đơn giá thanh toán. Hãy yêu cầu quản trị viên thay đổi.",
+    "readOnlyNoPartnerWideNotice": "Đơn giá thanh toán áp dụng cho mọi tổ chức, nên việc thay đổi yêu cầu quyền truy cập toàn bộ tổ chức đối tác. Bạn chỉ có quyền xem.",
+    "edit": "Sửa cấu hình thanh toán",
+    "name": "Tên",
+    "currency": "Tiền tệ",
+    "rounding": "Làm tròn (phút)",
+    "notes": "Ghi chú",
+    "coverage": "Kết quả thanh toán",
+    "hourlyRate": "Đơn giá giờ",
+    "minimum": "Tối thiểu (phút)",
+    "billable": "Có thể tính phí",
+    "included": "Đã bao gồm",
+    "nonBillable": "Không tính phí",
+    "noRate": "Có tính phí · chưa đặt đơn giá",
+    "billableAt": "Tính phí {{rate}}/h",
+    "minimumSummary": "Tối thiểu {{minutes}} phút",
+    "roundingSummary": "Làm tròn đến {{minutes}} phút",
+    "inherits": "Sử dụng Tất cả công việc khác",
+    "currencyHelp": "Cấu hình mặc định hoặc cấu hình có đơn giá không thể đổi tiền tệ. Để trống nghĩa là không làm tròn.",
+    "ai": {
+      "column": "Mức sử dụng AI",
+      "sectionTitle": "Mức sử dụng AI",
+      "sectionHelp": "Cách tính phí sử dụng Breeze AI của các tổ chức theo cấu hình thanh toán này. Tính chi phí gốc của Breeze cộng thêm phần trăm lợi nhuận, hoặc đặt giá theo từng model.",
+      "coverage": "Thanh toán sử dụng AI",
+      "coverageBillable": "Có thể tính phí",
+      "coverageIncluded": "Đã bao gồm",
+      "coverageNotBilled": "Không tính phí",
+      "markup": "Lợi nhuận trên chi phí (%)",
+      "markupHelp": "Cộng thêm vào chi phí USD của Breeze cho mỗi yêu cầu. 25 là tính chi phí gốc cộng 25%. Để trống nếu chỉ tính phí các model có trong bảng giá.",
+      "markupInvalid": "Nhập phần trăm từ 0 đến 1000 với tối đa hai chữ số thập phân.",
+      "priceListTitle": "Bảng giá",
+      "priceListHelp": "Đơn giá tính bằng {{currency}} trên triệu token. Model có trong bảng giá sẽ dùng giá riêng thay vì phần trăm lợi nhuận.",
+      "priceListEmpty": "Chưa có giá model nào.",
+      "addRate": "Thêm giá model",
+      "removeRate": "Xóa",
+      "modelId": "Model",
+      "modelPlaceholder": "Chọn hoặc nhập ID model",
+      "inputPrice": "Đầu vào",
+      "outputPrice": "Đầu ra",
+      "cacheReadPrice": "Đọc bộ nhớ đệm",
+      "cacheWritePrice": "Ghi bộ nhớ đệm",
+      "rowInvalid": "Nhập ID model và cả bốn mức giá, ví dụ 3.00 hoặc 0.30.",
+      "rowDuplicate": "Model này đã có trong bảng giá.",
+      "choicesUnavailable": "Không có gợi ý model. Vui lòng tự nhập ID model.",
+      "usdOnlyWarning": "Phần trăm lợi nhuận chỉ áp dụng cho thẻ USD; hãy thêm bảng giá cho {{currency}} nếu không mức sử dụng sẽ được ghi nhận là chưa có giá.",
+      "summaryBillableMarkup": "Tính phí · chi phí +{{percent}}%",
+      "summaryBillablePriceList_one": "Tính phí · bảng giá ({{count}} model)",
+      "summaryBillablePriceList_other": "Tính phí · bảng giá ({{count}} model)",
+      "summaryBillablePriceListMarkup_one": "Tính phí · bảng giá ({{count}} model), các model khác chi phí +{{percent}}%",
+      "summaryBillablePriceListMarkup_other": "Tính phí · bảng giá ({{count}} model), các model khác chi phí +{{percent}}%",
+      "summaryBillableUnpriced": "Tính phí · chưa thiết lập giá",
+      "summaryIncluded": "Đã bao gồm",
+      "summaryNotBilled": "Không tính phí"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Xác nhận thanh toán tự động",
+    "chargeConfirmMessage": "Thử thanh toán tối đa {{amount}}, bao gồm phí xử lý, cho hóa đơn {{invoice}} bằng {{method}}?",
+    "noticeQueued": "Đã xếp hàng thông báo thanh toán tự động",
+    "requestDeliveryFailed": "Không thể gửi email yêu cầu. Vui lòng gửi lại yêu cầu.",
+    "skipNoContact": "Không có email liên hệ thanh toán. Vui lòng thêm email hoặc nhập người nhận.",
+    "skipStripeNotReady": "Stripe chưa sẵn sàng cho thanh toán tự động. Kiểm tra kết nối và quyền hạn.",
+    "skipAlreadyActive": "Thanh toán tự động đã được bật hoặc đang tạm dừng.",
+    "title": "Thanh toán tự động",
+    "loading": "Đang tải thanh toán tự động…",
+    "error": "Không thể hoàn tất thao tác này. Vui lòng thử lại.",
+    "saved": "Đã cập nhật thanh toán tự động",
+    "save": "Lưu",
+    "invalid": "Nhập số nguyên từ 0–60 ngày và hạn mức dương kèm theo mã tiền tệ 3 chữ cái.",
+    "offset-days": "Số ngày sau khi phát hành",
+    "offset-rule": "So với hạn thanh toán",
+    "cap-enabled": "Hạn mức thanh toán tự động",
+    "cap-amount": "Số tiền tối đa",
+    "cap-currency": "Tiền tệ",
+    "ach-mode": "Phương thức thanh toán",
+    "inherit": "{{value}} — kế thừa từ {{source}}",
+    "source": {
+      "org": "Tổ chức",
+      "partner": "Mặc định đối tác",
+      "default": "Mặc định Breeze"
+    },
+    "option": {
+      "earlier": "Thời điểm nào sớm hơn",
+      "later": "Thời điểm nào muộn hơn",
+      "false": "Không giới hạn",
+      "true": "Đã bật giới hạn",
+      "ach_preferred": "Ưu tiên tài khoản ngân hàng; chấp nhận thẻ",
+      "ach_only": "Chỉ tài khoản ngân hàng"
+    },
+    "achRisk": "Thanh toán ngân hàng áp dụng cho tài khoản Hoa Kỳ đủ điều kiện bằng USD. Doanh nghiệp của bạn chịu trách nhiệm về các khoản hoàn tiền ACH và phí hoàn tiền của Stripe; hoàn tiền tài khoản cá nhân có thể mất tới 60 ngày.",
+    "stripeNotReady": "Thanh toán tự động không khả dụng. Kiểm tra quyền Stripe: {{permissions}}.",
+    "stripeDisconnected": "Kết nối Stripe trước",
+    "card": "Thẻ",
+    "bank": "Tài khoản ngân hàng",
+    "done": "Đã hoàn tất yêu cầu.",
+    "status": {
+      "not_requested": "Chưa yêu cầu",
+      "requested": "Đã yêu cầu",
+      "active": "Đang hoạt động",
+      "paused": "Đã tạm dừng",
+      "cancelled": "Tắt",
+      "needs_attention": "Cần chú ý"
+    },
+    "pending": "Đang chờ xác minh ngân hàng. Chưa thể thực hiện thanh toán tự động.",
+    "effective": "Áp dụng cho hóa đơn phát hành sau {{date}}",
+    "recipient": "Ghi đè người nhận yêu cầu (tùy chọn)",
+    "request": "Gửi yêu cầu",
+    "resend": "Gửi lại yêu cầu",
+    "pause": "Tạm dừng",
+    "resume": "Tiếp tục",
+    "turnOff": "Tắt",
+    "cancel": "Hủy",
+    "processingWarning": "Các khoản thanh toán tự động trong tương lai sẽ dừng lại. Giao dịch ngân hàng đang xử lý không thể thu hồi.",
+    "unasked_one": "{{count}} khách hàng chưa được hỏi",
+    "unasked_other": "{{count}} khách hàng chưa được hỏi",
+    "sendNow": "Gửi ngay",
+    "dismiss": "Bỏ qua",
+    "select": "Chọn",
+    "client": "Khách hàng",
+    "statusLabel": "Trạng thái",
+    "method": "Phương thức thanh toán",
+    "selectClient": "Chọn {{name}}",
+    "empty": "Không tìm thấy khách hàng nào.",
+    "requestedCount_one": "Đã gửi yêu cầu đến {{count}} khách hàng.",
+    "requestedCount_other": "Đã gửi yêu cầu đến {{count}} khách hàng.",
+    "chargeDate": "Thu tiền vào hoặc khoảng ngày {{date}}",
+    "excludeInvoice": "Loại trừ hóa đơn này khỏi thanh toán tự động",
+    "excludeRefusedProcessing": "Thanh toán của hóa đơn này đang được xử lý và không thể dừng. Bạn có thể loại trừ hóa đơn sau khi thanh toán hoàn tất hoặc thất bại.",
+    "excludeContract": "Loại trừ các hóa đơn chứa hợp đồng này",
+    "failed": "Không thể cập nhật thanh toán tự động. Vui lòng thử lại.",
+    "states": {
+      "awaiting_notice": "Đang chờ thông báo",
+      "scheduled": "Đã lên lịch",
+      "collecting": "Đang thu tiền",
+      "retry_scheduled": "Đã lên lịch thử lại",
+      "action_required": "Cần xác nhận",
+      "succeeded": "Đã nhận thanh toán",
+      "failed": "Thanh toán thất bại",
+      "skipped_by_client": "Khách hàng đã bỏ qua",
+      "excluded_by_msp": "Nhà cung cấp đã loại trừ",
+      "cancelled": "Đã hủy",
+      "not_needed": "Không cần thanh toán",
+      "reserved": "Đã giữ chỗ thanh toán",
+      "created": "Đã tạo thanh toán",
+      "confirming": "Đang xác nhận thanh toán",
+      "processing": "Đang xử lý thanh toán",
+      "requires_action": "Cần xác nhận",
+      "canceled": "Đã hủy",
+      "unapplied": "Thanh toán cần đối soát"
+    },
+    "reasons": {
+      "not_enrolled": "Chưa đăng ký",
+      "enrolled_after_issue": "Đăng ký sau khi phát hành hóa đơn",
+      "method_not_usable": "Phương thức thanh toán không khả dụng",
+      "over_cap": "Vượt quá giới hạn thanh toán tự động",
+      "above_authorized_cap": "Vượt quá giới hạn mà khách hàng đã ủy quyền",
+      "issued_before_authorization": "Phát hành trước khi cập nhật ủy quyền của khách hàng: thu thủ công",
+      "cap_currency_mismatch": "Tiền tệ giới hạn không khớp",
+      "ach_currency_unsupported": "Tiền tệ thanh toán ngân hàng không được hỗ trợ",
+      "excluded_contract": "Hợp đồng bị loại trừ",
+      "excluded_invoice": "Hóa đơn bị loại trừ",
+      "charging_disabled": "Đã tắt tính năng tự động thu tiền",
+      "stripe_unavailable": "Stripe không khả dụng",
+      "bank_unverified": "Chưa thu tiền: ngân hàng của khách hàng không được xác minh kịp thời. Thu thủ công",
+      "charging_on_hold": "Chưa thu tiền: thanh toán tự động vẫn tắt. Thu thủ công",
+      "service_unavailable": "Chưa thu tiền: Stripe vẫn không thể kết nối. Thu thủ công",
+      "control_pending:skip": "Yêu cầu bỏ qua; đang dừng khoản thanh toán đang chờ xử lý",
+      "control_pending:exclude": "Yêu cầu loại trừ; đang dừng khoản thanh toán đang chờ xử lý",
+      "control_pending:stop": "Yêu cầu dừng; đang dừng khoản thanh toán đang chờ xử lý",
+      "control_pending:renotice": "Đang cập nhật thông báo; đang dừng khoản thanh toán đang chờ xử lý",
+      "skip": "Khách hàng đã bỏ qua",
+      "exclude": "Nhà cung cấp đã loại trừ",
+      "stop": "Đã dừng thanh toán tự động",
+      "client_request": "Khách hàng yêu cầu",
+      "no_billing_contact": "Không có liên hệ thanh toán",
+      "delivery_failed": "Gửi thông báo thất bại",
+      "consent_required": "Thiếu ủy quyền thanh toán. Yêu cầu cập nhật ủy quyền."
+    },
+    "chargeFailed": "Không thể bắt đầu thanh toán. Vui lòng thử lại.",
+    "chargeResultUnknown": "Chúng tôi không thể xác nhận điều gì đã xảy ra với khoản thanh toán này. Đang làm mới hóa đơn để hiển thị trạng thái hiện tại.",
+    "chargeStarted": "Đã bắt đầu thử thanh toán",
+    "chargeNow": "Thu tiền ngay",
+    "noCharge": "Chưa có khoản thu nào",
+    "noticeStuck": "Thông báo thanh toán cần được chú ý",
+    "unapplied": "{{count}} khoản thanh toán cần đối soát. Xem xét các khoản tiền chưa giải quyết trước khi thu tiền lại.",
+    "lastCharge": "Khoản thu gần nhất",
+    "attention": "Chú ý",
+    "attemptStates": {
+      "reserved": "Đã giữ chỗ thanh toán",
+      "created": "Đã tạo thanh toán",
+      "confirming": "Đang xác nhận thanh toán",
+      "processing": "Đang xử lý",
+      "succeeded": "Đã nhận thanh toán",
+      "failed": "Thất bại",
+      "requires_action": "Cần xác nhận",
+      "canceled": "Đã hủy",
+      "unapplied": "Thanh toán cần đối soát",
+      "returned": "Đã trả lại",
+      "refunded": "Đã hoàn tiền",
+      "disputed": "Đã tranh chấp"
+    },
+    "fees": {
+      "title": "Phí xử lý",
+      "cardBps": "Phí thẻ tín dụng (điểm cơ bản, 0–300)",
+      "ach": "Phí thanh toán ngân hàng (USD, 0.00–25.00)",
+      "inactive": "Phí thẻ không hoạt động cho đến khi quản trị viên đối tác của bạn xác nhận cả hai tuyên bố bên dưới.",
+      "notified": "Tôi đã thông báo cho đơn vị thu nhận (Stripe) và các mạng lưới thẻ ít nhất 30 ngày trước",
+      "cost": "Khoản phí này không vượt quá chi phí chấp nhận thẻ của tôi",
+      "rules": "Chỉ thẻ tín dụng. Không có phí thẻ ở CA, CT, ME hoặc MA; Colorado giới hạn ở mức 2%. Phí chỉ áp dụng cho các khoản thanh toán tự động hợp lệ tại Mỹ bằng USD. Liên kết thanh toán một lần không mất phí.",
+      "legal": "Breeze không phải là tư vấn pháp lý. Bạn chịu trách nhiệm về tính đủ điều kiện phụ phí, thông báo và xử lý thuế.",
+      "lowerAuthorization": "Khách hàng có điều khoản ủy quyền thấp hơn: {{count}}. Ủy quyền hiện tại của họ vẫn có hiệu lực cho đến khi họ chấp nhận điều khoản cập nhật.",
+      "authorizedCard": "Đã ủy quyền: {{accepted}} điểm cơ bản; đã cấu hình: {{configured}}",
+      "authorizedAch": "Đã ủy quyền: USD {{accepted}}; đã cấu hình: USD {{configured}}",
+      "authorizedCap": "Giới hạn đã ủy quyền: {{accepted}}; đã cấu hình: {{configured}}",
+      "noCap": "không giới hạn",
+      "requestAuthorization": "Yêu cầu cập nhật ủy quyền",
+      "requestFailed": "Không thể yêu cầu cập nhật ủy quyền. Kiểm tra liên hệ thanh toán và trạng thái sẵn sàng của Stripe.",
+      "requested": "Đã yêu cầu cập nhật ủy quyền. Ủy quyền hiện tại vẫn giữ nguyên hiệu lực.",
+      "attestationOnFile": "Hồ sơ xác nhận: {{name}} đã xác nhận cả hai tuyên bố vào ngày {{date}}.",
+      "attestationOnFileUnknown": "Hồ sơ xác nhận: cả hai tuyên bố đã được xác nhận vào ngày {{date}}.",
+      "reattestHelp": "Để xác nhận lại, hãy chọn cả hai tuyên bố và lưu. Thao tác đó sẽ ghi lại một xác nhận mới dưới tên bạn với ngày hiện tại, thay thế bản ghi trong hồ sơ. Thao tác này không thay đổi phí đã ủy quyền của bất kỳ khách hàng nào.",
+      "authorizedCardNone": "Không có ủy quyền trong hồ sơ; đã cấu hình: {{configured}} điểm cơ bản",
+      "authorizedAchNone": "Không có ủy quyền trong hồ sơ; đã cấu hình: USD {{configured}}",
+      "lowerAuthorizationOrg": "Khách hàng này chưa ủy quyền các điều khoản đã cấu hình. Mọi ủy quyền hiện tại vẫn có hiệu lực cho đến khi họ chấp nhận điều khoản cập nhật.",
+      "blankPartner": "Để trống sẽ sử dụng mặc định của Breeze (không có phí). Để miễn phí cho một khách hàng, hãy đặt phí của họ thành 0 trên trang Thanh toán của khách hàng đó.",
+      "blankOrg": "Để trống sẽ sử dụng mặc định của đối tác. Nhập 0 để miễn phí cho khách hàng này.",
+      "inactiveOrg": "Phí thẻ không hoạt động cho đến khi quản trị viên đối tác xác nhận cả hai tuyên bố phí trên tab Thanh toán trong cài đặt Thanh toán của đối tác.",
+      "missingAuthorization": "Không có ủy quyền trong hồ sơ: {{count}}. Thanh toán tự động không thể thu tiền từ những khách hàng này cho đến khi họ ủy quyền phương thức thanh toán đã lưu.",
+      "missingAuthorizationOrg": "Khách hàng này không có ủy quyền nào trong hồ sơ cho phương thức thanh toán đã lưu của họ. Thanh toán tự động không thể thu tiền cho đến khi khách hàng ủy quyền.",
+      "requestMissingAuthorization": "Yêu cầu ủy quyền"
+    },
+    "enrollmentTitle": "Đăng ký thanh toán tự động",
+    "requestSentTo": "Đã gửi yêu cầu đến {{email}}.",
+    "result": {
+      "paused": "Đã tạm dừng thanh toán tự động.",
+      "resumed": "Đã tiếp tục thanh toán tự động.",
+      "turnedOff": "Đã tắt thanh toán tự động."
+    },
+    "needsAttention": {
+      "method_unusable": "Không thể thu phí phương thức thanh toán đã lưu.",
+      "stripe_account_changed": "Tài khoản Stripe được kết nối đã thay đổi sau khi khách hàng này đăng ký.",
+      "key_missing_permissions": "Khóa Stripe thiếu các quyền cần thiết cho thanh toán tự động.",
+      "verification_failed": "Xác minh tài khoản ngân hàng thất bại."
+    },
+    "chargeOutcome": {
+      "succeeded": "Đã nhận thanh toán.",
+      "processing": "Đã gửi thanh toán. Giao dịch đang được xử lý và hóa đơn sẽ cập nhật khi thanh toán hoàn tất.",
+      "requiresAction": "Ngân hàng của khách hàng yêu cầu họ xác nhận khoản thanh toán này. Nếu có liên hệ thanh toán trong hồ sơ, họ sẽ nhận được email chứa liên kết để xác nhận.",
+      "declined": "Thanh toán không thành công.",
+      "cardDeclined": "Thẻ đã bị từ chối.",
+      "expiredCard": "Thẻ đã hết hạn. Yêu cầu khách hàng cập nhật phương thức thanh toán của họ.",
+      "insufficientFunds": "Thanh toán bị từ chối do không đủ số dư.",
+      "canceled": "Thanh toán đã bị hủy trước khi hoàn tất.",
+      "unapplied": "Thanh toán đã được ghi nhận nhưng cần đối soát. Xem xét lại trước khi thu tiền."
+    },
+    "chargeRefused": {
+      "notice_lead": "Thời gian thông báo của khách hàng chưa kết thúc. Hóa đơn có thể được thanh toán sau khi kết thúc.",
+      "no_eligible_notice": "Hóa đơn này không có thông báo thanh toán tự động, do đó không thể tự động thanh toán.",
+      "renotice_required": "Phải gửi lại thông báo thanh toán trước khi có thể thanh toán hóa đơn này.",
+      "collection_in_progress": "Khoản thanh toán cho hóa đơn này đang được xử lý.",
+      "checkout_session_unrevoked": "Khách hàng có thể đang thanh toán hóa đơn này trực tuyến ngay bây giờ. Hãy thử lại sau vài phút.",
+      "retry_not_due": "Chưa đến hạn thử lại tiếp theo.",
+      "not_payable": "Hóa đơn này không mở để thanh toán.",
+      "nothing_to_pay": "Không còn khoản nào cần thanh toán trên hóa đơn này.",
+      "enrollment_inactive": "Thanh toán tự động không được bật cho khách hàng này.",
+      "schedule_inactive": "Hóa đơn này không còn được lên lịch thanh toán tự động.",
+      "generic": "Không thể bắt đầu thanh toán tự động. Làm mới hóa đơn để xem trạng thái hiện tại.",
+      "excluded_contract": "Hợp đồng của hóa đơn này không nằm trong diện thanh toán tự động, vì vậy hóa đơn chưa được tính tiền. Nếu khách hàng đã được thông báo về khoản thanh toán này, họ đã nhận được email cho biết việc đó sẽ không diễn ra."
+    },
+    "stepUp": {
+      "heading": "Xác nhận danh tính của bạn",
+      "intro": {
+        "autopay_charge_now": "Thanh toán hóa đơn này ngay bây giờ cần phải xác thực yếu tố thứ hai mới.",
+        "partner_payment_settings_update": "Thay đổi cài đặt thanh toán cần phải xác thực yếu tố thứ hai mới cho các giá trị chính xác này.",
+        "org_payment_settings_update": "Thay đổi cài đặt thanh toán của tổ chức này cần phải xác thực yếu tố thứ hai mới cho các giá trị chính xác này.",
+        "autopay_request_recipient": "Gửi yêu cầu ủy quyền đến một địa chỉ khác với liên hệ thanh toán cần phải xác thực yếu tố thứ hai mới."
+      },
+      "code": "Mã xác thực",
+      "passkey": "Bạn sẽ xác nhận bằng passkey của mình.",
+      "noFactor": "Hãy thêm ứng dụng xác thực hoặc passkey vào tài khoản của bạn trước.",
+      "noFactorSmsOnly": "Mã tin nhắn văn bản không thể xác nhận hành động này. Hãy thêm ứng dụng xác thực hoặc passkey vào tài khoản của bạn trước.",
+      "enrollLink": "Thiết lập yếu tố thứ hai",
+      "confirm": "Xác nhận",
+      "failed": "Xác minh thất bại. Hãy thử lại.",
+      "unavailable": "Không thể bắt đầu xác minh"
+    },
+    "notEnabled": {
+      "title": "Thanh toán tự động chưa được bật cho tài khoản của bạn",
+      "hint": "Thanh toán tự động chưa được bật. Hãy yêu cầu quản trị viên Breeze bật tính năng này, sau đó quay lại để yêu cầu đăng ký từ khách hàng của bạn."
+    }
+  },
+  "reminders": {
+    "title": "Nhắc nhở thanh toán",
+    "description": "Gửi nhắc nhở đến người liên hệ thanh toán của tổ chức đối với các hóa đơn chưa thanh toán. Nhắc nhở hoạt động ngay cả khi không có thanh toán tự động.",
+    "enabled": "Gửi nhắc nhở thanh toán",
+    "on": "Đã bật",
+    "off": "Đã tắt",
+    "inherit": "Sử dụng {{source}}: {{value}}",
+    "before": "Số ngày trước ngày đáo hạn",
+    "repeat": "Lặp lại trước hạn mỗi (ngày)",
+    "overdue": "Nhắc quá hạn mỗi (ngày)",
+    "noRepeat": "Không lặp lại",
+    "orgRepeatHelp": "Để trống sẽ kế thừa cài đặt của đối tác. Bạn không thể chỉ tắt các lần lặp lại sắp tới ở đây khi đối tác bật lặp lại chúng; hãy tắt nhắc nhở cho tổ chức này để dừng tất cả nhắc nhở.",
+    "partnerRepeatHelp": "Để trống khoảng thời gian lặp lại cho một lời nhắc sắp tới. Để trống ở các trường khác sẽ sử dụng giá trị mặc định được hiển thị.",
+    "cadenceHelp": "Không có nhắc nhở nào được gửi vào ngày đáo hạn. Lời nhắc quá hạn đầu tiên được gửi sau một khoảng thời gian quá hạn. Thay đổi ngày hoặc khoảng thời gian không gửi lại các nhắc nhở đã được phân bổ.",
+    "invalid": "Nhập số ngày nguyên từ 1 đến 31, hoặc để trống để kế thừa.",
+    "sources": {
+      "org": "tổ chức",
+      "partner": "mặc định của đối tác",
+      "default": "mặc định của Breeze"
+    },
+    "save": "Lưu cài đặt thanh toán",
+    "saving": "Đang lưu…",
+    "saved": "Đã lưu cài đặt nhắc nhở",
+    "saveFailed": "Không thể lưu cài đặt nhắc nhở",
+    "loadFailed": "Không thể tải cài đặt nhắc nhở",
+    "retry": "Thử lại",
+    "loading": "Đang tải cài đặt thanh toán…"
+  }
+}

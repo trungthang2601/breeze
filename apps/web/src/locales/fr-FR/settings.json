@@ -243,7 +243,9 @@
     "itITLabel": "Italiano (Italia)",
     "itITDescription": "Italien (Italie)",
     "trTRLabel": "Türkçe (Türkiye)",
-    "trTRDescription": "Turc (Turquie)"
+    "trTRDescription": "Turc (Turquie)",
+    "viLabel": "Tiếng Việt",
+    "viDescription": "Vietnamien"
   },
   "partner": {
     "regional": {

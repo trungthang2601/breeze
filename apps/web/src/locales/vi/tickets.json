@@ -1,0 +1,847 @@
+{
+  "timesheet": {
+    "workTypeColumn": "Loại công việc"
+  },
+  "workType": {
+    "label": "Loại công việc",
+    "none": "Không có loại công việc",
+    "archivedSuffix": "{{name}} (đã lưu trữ)",
+    "loadError": "Không có loại công việc"
+  },
+  "slaChip": {
+    "pausedLeft": "Đã tạm dừng · còn lại {{relative}}",
+    "left": "Còn lại {{relative}}",
+    "breached": "Đã vi phạm"
+  },
+  "slaTimers": {
+    "title": "SLA",
+    "firstResponse": "Phản hồi đầu tiên",
+    "resolution": "Giải quyết",
+    "state": {
+      "met": "Đạt",
+      "notMet": "Không đạt",
+      "metLate": "Đạt muộn",
+      "breached": "Đã vi phạm",
+      "pausedLeft": "Đã tạm dừng · còn lại {{relative}}",
+      "left": "Còn lại {{relative}}"
+    },
+    "clockPaused": "Đồng hồ tạm dừng trong khi phiếu hỗ trợ đang {{status}}.",
+    "status": {
+      "onHold": "tạm giữ",
+      "pending": "đang chờ"
+    }
+  },
+  "cannedResponsePicker": {
+    "button": "Phản hồi mẫu"
+  },
+  "deviceTicketsTab": {
+    "loading": "Đang tải phiếu hỗ trợ...",
+    "loadFailed": "Không tải được phiếu hỗ trợ.",
+    "empty": "Không có phiếu hỗ trợ cho thiết bị này.",
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm giữ",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "priority": {
+      "urgent": "Khẩn cấp",
+      "high": "Cao",
+      "normal": "Bình thường",
+      "low": "Thấp"
+    }
+  },
+  "ticketQueueList": {
+    "empty": "Không có phiếu hỗ trợ phù hợp.",
+    "clearFilters": "Xóa bộ lọc",
+    "ariaLabel": "Hàng đợi phiếu",
+    "selectTicket": "Chọn {{ticket}}",
+    "timeAgo": {
+      "minutes": "{{count}} phút trước",
+      "minutes_one": "{{count}} phút trước",
+      "minutes_other": "{{count}} phút trước",
+      "hours": "{{count}} giờ trước",
+      "hours_one": "{{count}} giờ trước",
+      "hours_other": "{{count}} giờ trước",
+      "days": "{{count}} ngày trước",
+      "days_one": "{{count}} ngày trước",
+      "days_other": "{{count}} ngày trước"
+    },
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm giữ",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "priority": {
+      "urgent": "Khẩn cấp",
+      "high": "Cao",
+      "normal": "Bình thường",
+      "low": "Thấp"
+    },
+    "checklistProgress": "{{done}}/{{total}} bước",
+    "checklistTitle": "Danh sách kiểm tra: đã hoàn thành {{done}} trên {{total}} bước",
+    "merged": "Đã hợp nhất"
+  },
+  "ticketArchivedList": {
+    "emptyTitle": "Không có phiếu hỗ trợ đã lưu trữ.",
+    "emptyDescription": "Các phiếu hỗ trợ bị xóa nằm ở đây. Khôi phục để đưa về hàng đợi hoạt động.",
+    "ariaLabel": "Phiếu hỗ trợ đã lưu trữ",
+    "deleted": "đã xóa {{relative}}",
+    "restore": "Khôi phục",
+    "restoring": "Đang khôi phục…",
+    "timeAgo": {
+      "minutes": "{{count}} phút trước",
+      "minutes_one": "{{count}} phút trước",
+      "minutes_other": "{{count}} phút trước",
+      "hours": "{{count}} giờ trước",
+      "hours_one": "{{count}} giờ trước",
+      "hours_other": "{{count}} giờ trước",
+      "days": "{{count}} ngày trước",
+      "days_one": "{{count}} ngày trước",
+      "days_other": "{{count}} ngày trước"
+    },
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm giữ",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "priority": {
+      "urgent": "Khẩn cấp",
+      "high": "Cao",
+      "normal": "Bình thường",
+      "low": "Thấp"
+    }
+  },
+  "ticketComposer": {
+    "reply": "Trả lời",
+    "internalNote": "Ghi chú nội bộ",
+    "internalBanner": "Nội bộ: người yêu cầu không nhìn thấy",
+    "replyPlaceholder": "Trả lời {{requester}}…",
+    "requesterFallback": "người yêu cầu",
+    "internalPlaceholder": "Thêm ghi chú nội bộ…",
+    "sending": "Đang gửi",
+    "sendReply": "Gửi trả lời",
+    "addInternalNote": "Thêm ghi chú nội bộ",
+    "attachments": {
+      "attach": "Đính kèm",
+      "uploading": "Đang tải lên…",
+      "retry": "Thử lại",
+      "remove": "Xóa tệp",
+      "tooMany": "Bạn có thể đính kèm tối đa {{max}} tệp vào một bình luận.",
+      "tooLarge": "{{name}} lớn hơn 10 MB.",
+      "sentWithoutAttachment_one": "Đã đăng ghi chú nhưng không thể thêm tệp đính kèm. Hãy thử lại hoặc xóa đi.",
+      "sentWithoutAttachment_other": "Đã đăng ghi chú nhưng không thể thêm {{count}} tệp đính kèm. Hãy thử lại hoặc xóa đi."
+    }
+  },
+  "ticketFeed": {
+    "empty": "Chưa có hoạt động nào.",
+    "commentDeleted": "{{author}} — đã xóa",
+    "commentFallback": "Một bình luận",
+    "requester": "Người yêu cầu",
+    "technician": "Kỹ thuật viên",
+    "internal": "Nội bộ",
+    "edited": "đã sửa",
+    "system": {
+      "systemAuthor": "Hệ thống",
+      "technicianAuthor": "Kỹ thuật viên",
+      "statusChanged": "{{author}} đã đổi trạng thái: {{from}} thành {{to}}",
+      "assigned": "{{author}} đã phân công phiếu này",
+      "unassigned": "{{author}} đã hủy phân công phiếu này",
+      "loggedTime": "{{author}} đã ghi nhận thời gian",
+      "systemEvent": "Sự kiện hệ thống",
+      "collapsed": "{{count}} thay đổi. Hiển thị",
+      "collapsed_one": "{{count}} thay đổi. Hiển thị",
+      "collapsed_other": "{{count}} thay đổi. Hiển thị"
+    },
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm dừng",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "deleteDialog": {
+      "title": "Xóa bình luận",
+      "message": "Bạn có chắc chắn muốn xóa bình luận này không? Thao tác này không thể hoàn tác."
+    },
+    "attachments": {
+      "broken": "Không thể tải {{name}}",
+      "open": "Mở tệp đính kèm",
+      "remove": "Gỡ tệp đính kèm"
+    },
+    "mergedFrom": "từ {{number}}",
+    "mergedFromUnknown": "từ một phiếu hỗ trợ đã gộp"
+  },
+  "ticketPartsCard": {
+    "title": "Linh kiện",
+    "empty": "Không có linh kiện.",
+    "nonBillableSuffix": " · không tính phí",
+    "marginTitle": "Biên độ",
+    "deletePrompt": "Xóa?",
+    "addPart": "Thêm linh kiện",
+    "fromCatalogPrefix": "Từ danh mục:",
+    "unlink": "Hủy liên kết",
+    "catalogPlaceholder": "Thêm từ danh mục (tùy chọn)",
+    "quantity": "Số lượng",
+    "unitPrice": "Đơn giá",
+    "costPlaceholder": "Chi phí (tùy chọn)",
+    "cost": "Chi phí",
+    "billable": "Có tính phí",
+    "update": "Cập nhật",
+    "toast": {
+      "updateFailed": "Không thể cập nhật linh kiện",
+      "updated": "Đã cập nhật linh kiện",
+      "addFailed": "Không thể thêm linh kiện",
+      "added": "Đã thêm linh kiện",
+      "updateFailedSentence": "Không thể cập nhật linh kiện.",
+      "addFailedSentence": "Không thể thêm linh kiện.",
+      "deleteFailed": "Không thể xóa linh kiện",
+      "deleted": "Đã xóa linh kiện",
+      "deleteFailedSentence": "Không thể xóa linh kiện."
+    }
+  },
+  "ticketTimeBilling": {
+    "title": "Thời gian & Thanh toán",
+    "totalTime": "Tổng thời gian",
+    "billable": "Có tính phí",
+    "timeAmount": "Số tiền theo thời gian",
+    "noAmount": "—",
+    "partsCount": "Linh kiện ({{count}})",
+    "partsCount_one": "Linh kiện ({{count}})",
+    "partsCount_other": "Linh kiện ({{count}})",
+    "starting": "Đang bắt đầu…",
+    "startTimer": "Bắt đầu bộ đếm giờ",
+    "logTime": "Ghi nhận thời gian",
+    "minutes": "Phút",
+    "rate": "Đơn giá theo giờ",
+    "rateWithCurrency": "Đơn giá theo giờ ({{currency}})",
+    "rateInvalid": "Nhập mức giá từ 0 trở lên.",
+    "noRateWarning": "Không có đơn giá theo giờ — thời gian tính phí không có đơn giá sẽ không thể xuất hóa đơn.",
+    "descriptionPlaceholder": "Mô tả (tùy chọn)",
+    "techFallback": "Kỹ thuật viên",
+    "running": "đang chạy",
+    "toast": {
+      "startTimerFailed": "Không thể bắt đầu bộ đếm giờ.",
+      "logFailed": "Không thể ghi nhận thời gian",
+      "logged": "Đã ghi nhận thời gian",
+      "logFailedSentence": "Không thể ghi nhận thời gian.",
+      "deleted": "Đã xóa mục thời gian",
+      "deleteFailed": "Không thể xóa mục thời gian."
+    },
+    "billedVsWorked": "{{worked}} h đã làm · {{billed}} h tính phí",
+    "includedMinutes": "{{hours}} h đã bao gồm trong hợp đồng",
+    "laborBreakdown": "{{hours}} h × {{rate}} = {{amount}}",
+    "laborRule": "Mỗi mục tính phí theo số phút làm tròn thành giờ (2 chữ số thập phân) × đơn giá.",
+    "missingRateCount_one": "1 mục không có đơn giá theo giờ — không được tính vào tổng tiền trên",
+    "missingRateCount_other": "{{count}} mục không có đơn giá theo giờ — không được tính vào tổng tiền trên",
+    "deleteEntry": "Xóa mục thời gian {{duration}} của {{tech}}",
+    "deleteConfirmTitle": "Xóa mục thời gian?",
+    "deleteConfirmMessage": "Thao tác này sẽ xóa vĩnh viễn mục {{duration}} của {{tech}}. Không thể hoàn tác.",
+    "deleteRefusal": {
+      "notOwnEntry": "Bạn chỉ có thể xóa mục thời gian của chính mình.",
+      "approvedImmutable": "Các mục đã phê duyệt chỉ có thể bị xóa bởi quản trị viên.",
+      "entryBilled": "Mục này đã được lập hóa đơn và không thể xóa. Hãy hủy hóa đơn trước.",
+      "deleteLost": "Mục này đã thay đổi trong khi đang bị xóa. Tải lại và thử lại.",
+      "notFound": "Mục này không còn tồn tại."
+    },
+    "deleteEntryWithDescription": "Xóa mục thời gian {{duration}} của {{tech}}: {{description}}",
+    "noteInvoiceCue": "Khách hàng nhìn thấy ghi chú này trên hóa đơn của họ trừ khi cài đặt thanh toán ẩn ghi chú."
+  },
+  "inboundReviewQueue": {
+    "title": "Hàng chờ xem xét",
+    "description": "Email đến bị cách ly (người gửi không xác định) và thất bại. Chuyển thành phiếu hỗ trợ hoặc bỏ qua.",
+    "loading": "Đang tải.",
+    "loadFailed": "Không thể tải hàng chờ xem xét.",
+    "adminsOnly": "Hàng chờ xem xét chỉ dành cho quản trị viên.",
+    "empty": "Không có gì để xem xét.",
+    "unknownSender": "(người gửi không xác định)",
+    "noSubject": "(không có chủ đề)",
+    "selectOrganization": "Chọn tổ chức…",
+    "createTicket": "Tạo phiếu hỗ trợ",
+    "convertToTicket": "Chuyển thành phiếu hỗ trợ",
+    "dismiss": "Bỏ qua",
+    "prev": "Trang trước",
+    "pageOf": "Trang {{page}} / {{totalPages}}",
+    "pickOrgFirst": "Hãy chọn một tổ chức trước.",
+    "convertFailed": "Chuyển thành phiếu hỗ trợ thất bại. Thử lại.",
+    "ticketCreated": "Phiếu hỗ trợ được tạo từ email",
+    "dismissFailed": "Bỏ qua thất bại. Thử lại.",
+    "dismissed": "Đã bỏ qua email đến",
+    "parseStatus": {
+      "quarantined": "đã cách ly",
+      "failed": "thất bại"
+    },
+    "friendly": {
+      "orgNotAccessible": "Tổ chức đó không có sẵn trong đối tác của bạn.",
+      "rowNotFound": "Email đến đó không còn khả dụng.",
+      "rowAlreadyResolved": "Email đến đó đã được xử lý. Đang làm mới danh sách.",
+      "noSender": "Email này không có địa chỉ người gửi hợp lệ, do đó không thể chuyển thành phiếu hỗ trợ. Hãy bỏ qua hoặc xử lý qua kênh khác."
+    }
+  },
+  "createTicketPage": {
+    "title": "Tạo phiếu hỗ trợ",
+    "orgsLoadFailed": "Không thể tải tổ chức.",
+    "selectOrganization": "Chọn tổ chức",
+    "subject": "Chủ đề",
+    "requesterOptional": "Người yêu cầu (tùy chọn)",
+    "defaultYou": "Mặc định (bạn)",
+    "someoneElse": "Người khác…",
+    "requesterName": "Tên người yêu cầu",
+    "emailOptional": "Email (tùy chọn)",
+    "requesterEmail": "Email người yêu cầu",
+    "deviceOptional": "Thiết bị (tùy chọn)",
+    "category": "Danh mục",
+    "priority": "Độ ưu tiên",
+    "creating": "Đang tạo",
+    "createTicket": "Tạo phiếu hỗ trợ",
+    "creationFailed": "Tạo phiếu hỗ trợ thất bại. Thử lại.",
+    "createdToast": "Đã tạo phiếu hỗ trợ {{number}}",
+    "startFromForm": "Bắt đầu từ biểu mẫu (tùy chọn)",
+    "blankTicketOption": "Phiếu hỗ trợ trống",
+    "priorityOptions": {
+      "low": "Thấp",
+      "normal": "Bình thường",
+      "high": "Cao",
+      "urgent": "Khẩn cấp"
+    },
+    "type": "Loại"
+  },
+  "ticketFormFields": {
+    "selectPlaceholder": "Chọn…"
+  },
+  "ticketsPage": {
+    "title": "Phiếu hỗ trợ",
+    "createTicket": "Tạo phiếu",
+    "reviewQueue": "Hàng đợi duyệt",
+    "archived": "Đã lưu trữ",
+    "searchPlaceholder": "Tìm kiếm phiếu",
+    "filterByPriority": "Lọc theo độ ưu tiên",
+    "allPriorities": "Tất cả độ ưu tiên",
+    "filterByCategory": "Lọc theo danh mục",
+    "allCategories": "Tất cả danh mục",
+    "assigneeLockedTitle": "Tab đã lọc theo người phụ trách",
+    "filterByAssignee": "Lọc theo người phụ trách",
+    "allAssignees": "Tất cả người phụ trách",
+    "sortTickets": "Sắp xếp phiếu",
+    "loadFailed": "Không tải được phiếu.",
+    "selectAll": "Chọn tất cả",
+    "selectedCount": "Đã chọn {{count}}",
+    "selectedCount_one": "Đã chọn {{count}}",
+    "selectedCount_other": "Đã chọn {{count}}",
+    "clearSelection": "Xóa chọn",
+    "noSelection": "Chọn một phiếu. Dùng j/k để di chuyển, Enter để mở rộng.",
+    "ticketNotInView": "Phiếu {{number}} không có trong chế độ xem này.",
+    "movedToClosed": {
+      "message": "{{status}} — hiện ở mục {{tab}}",
+      "view": "Xem trong {{tab}}"
+    },
+    "ticketingSettings": "Cài đặt phiếu hỗ trợ",
+    "assignFailed": "Phân công thất bại. Thử lại.",
+    "assignedToYou": "Được giao cho bạn",
+    "restoreFailed": "Khôi phục thất bại. Thử lại.",
+    "ticketRestored": "Đã khôi phục phiếu",
+    "tabs": {
+      "mine": "Phiếu của tôi",
+      "unassigned": "Chưa giao",
+      "open": "Tất cả đang mở",
+      "breaching": "Sắp quá hạn",
+      "closed": "Đã đóng"
+    },
+    "sort": {
+      "triage": "Thứ tự xử lý",
+      "newest": "Mới nhất trước",
+      "oldest": "Cũ nhất trước",
+      "due": "Hạn chót"
+    },
+    "priority": {
+      "urgent": "Khẩn cấp",
+      "high": "Cao",
+      "normal": "Bình thường",
+      "low": "Thấp"
+    },
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm giữ",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "empty": {
+      "title": "Chưa có phiếu nào",
+      "description": "Phiếu được gửi từ cổng thông tin khách hàng, quy tắc cảnh báo và kỹ thuật viên. Hãy tạo phiếu đầu tiên hoặc thiết lập quy tắc cảnh báo để tự động mở phiếu."
+    },
+    "bulk": {
+      "assignToAria": "Giao hàng loạt cho",
+      "assignTo": "Giao cho…",
+      "unassign": "Bỏ giao",
+      "setStatusAria": "Đặt trạng thái hàng loạt",
+      "setStatus": "Đặt trạng thái…",
+      "updateFailed": "Cập nhật hàng loạt thất bại. Thử lại.",
+      "deleteFailed": "Xóa hàng loạt thất bại. Thử lại.",
+      "updatedPast": "đã cập nhật",
+      "deletedPast": "đã xóa",
+      "reasonCount": "{{count}} {{reason}}",
+      "reasonCount_one": "{{count}} {{reason}}",
+      "reasonCount_other": "{{count}} {{reason}}",
+      "partialToast": "{{updated}} {{verb}}, bỏ qua {{skipped}}{{failedSuffix}}{{reasonsSuffix}}",
+      "successToast": "{{updated}} {{verb}}",
+      "failedSuffix": ", thất bại {{failed}}",
+      "reasonsSuffix": " — {{reasons}}",
+      "reason": {
+        "outOfScope": "nằm ngoài phạm vi của bạn",
+        "invalidTransition": "thay đổi trạng thái không hợp lệ",
+        "assigneeNotFound": "không tìm thấy người phụ trách",
+        "assigneeWrongPartner": "người phụ trách thuộc đối tác khác",
+        "concurrentModification": "đã bị sửa đổi bởi người khác",
+        "ticketPartnerUnresolvable": "không thể xác định đối tác của phiếu",
+        "other": "lỗi khác"
+      }
+    },
+    "bulkDeleteDialog": {
+      "title": "Xóa {{count}} phiếu?",
+      "title_one": "Xóa {{count}} phiếu?",
+      "title_other": "Xóa {{count}} phiếu?",
+      "message": "Thao tác này ẩn phiếu khỏi mọi hàng đợi; quản trị viên có thể khôi phục từ mục Đã lưu trữ.",
+      "confirm": "Xóa phiếu"
+    },
+    "filterByType": "Lọc theo loại",
+    "allTypes": "Tất cả loại",
+    "showMerged": "Hiển thị đã gộp"
+  },
+  "ticketWorkbench": {
+    "notFound": "Không tìm thấy phiếu. Có thể phiếu đã bị xóa hoặc bạn không có quyền truy cập.",
+    "loadFailed": "Không tải được phiếu.",
+    "backToQueue": "Quay lại hàng đợi",
+    "ticketSubject": "Tiêu đề phiếu",
+    "subjectEditButton": "Sửa tiêu đề",
+    "openFullPage": "Mở trang đầy đủ",
+    "priorityLabel": "Độ ưu tiên",
+    "categoryLabel": "Danh mục",
+    "noCategory": "Không có danh mục",
+    "currentCategory": "Danh mục hiện tại",
+    "assignee": "Người phụ trách",
+    "unassigned": "Chưa giao",
+    "mspStaff": "Nhân viên MSP",
+    "assigneeValue": "Người phụ trách: {{assignee}} ✕",
+    "source": "Nguồn",
+    "dueDate": "Hạn chót",
+    "waitingOn": "Đang đợi",
+    "resolution": "Cách giải quyết",
+    "linkedAlerts": "Cảnh báo liên kết",
+    "status": {
+      "new": "Mới",
+      "open": "Mở",
+      "pending": "Đang chờ",
+      "on_hold": "Tạm giữ",
+      "resolved": "Đã giải quyết",
+      "closed": "Đã đóng"
+    },
+    "priority": {
+      "urgent": "Khẩn cấp",
+      "high": "Cao",
+      "normal": "Bình thường",
+      "low": "Thấp"
+    },
+    "tags": {
+      "label": "Thẻ",
+      "removeTag": "Xóa thẻ {{tag}}",
+      "addTag": "Thêm thẻ…",
+      "addTagAria": "Thêm thẻ"
+    },
+    "invoice": {
+      "create": "Tạo hóa đơn",
+      "creating": "Đang tạo…",
+      "createFailed": "Không thể tạo hóa đơn từ phiếu này.",
+      "created": "Đã tạo bản nháp hóa đơn",
+      "allBlockedByCurrency": "Tất cả công việc tính phí trên phiếu này được định giá bằng loại tiền tệ khác với loại tiền xuất hóa đơn của tổ chức. Thay vào đó, hãy tạo bản nháp bằng loại tiền tệ đó:",
+      "assembleIn": "Tạo bằng {{code}} ({{count}} mục, {{amount}})",
+      "partialLeftOut": "Hóa đơn nháp đã được tạo, nhưng một số công việc tính phí trên phiếu hỗ trợ này bị bỏ sót và vẫn chưa được lập hóa đơn.",
+      "openDraft": "Mở bản nháp",
+      "allMissingRate": "Không thể lập hóa đơn: mọi mục thời gian tính phí trên phiếu hỗ trợ này đều thiếu đơn giá theo giờ.",
+      "missingRateHeading": "Các mục thời gian không có đơn giá theo giờ (chưa lập hóa đơn — hãy đặt đơn giá và tạo lại hóa đơn):",
+      "missingRateEntry": "{{description}} — {{hours}} giờ",
+      "setRate": "Đặt đơn giá trên bảng chấm công",
+      "heldForHourBlock_one": "{{count}} mục thời gian ({{hours}} giờ) được giữ lại cho giờ gói của tổ chức này và sẽ được lập hóa đơn khi kỳ gói kết thúc.",
+      "heldForHourBlock_other": "{{count}} mục thời gian ({{hours}} giờ) được giữ lại cho giờ gói của tổ chức này và sẽ được lập hóa đơn khi kỳ gói kết thúc."
+    },
+    "move": {
+      "open": "Chuyển đến tổ chức khác…",
+      "label": "Chuyển đến tổ chức",
+      "selectOrganization": "Chọn tổ chức…",
+      "confirm": "Chuyển",
+      "failed": "Chuyển thất bại. Thử lại.",
+      "blockedCurrency": "Phiếu hỗ trợ này có {{timeCount}} mục thời gian chưa lập hóa đơn và {{partCount}} linh kiện chưa lập hóa đơn tính bằng {{sourceCurrency}}, nhưng {{targetOrg}} lập hóa đơn bằng {{targetCurrency}}. Hãy lập hóa đơn trước, hoặc vẫn chuyển — số tiền sẽ giữ nguyên bằng {{sourceCurrency}} và chỉ có thể lập hóa đơn trên bản nháp bằng {{sourceCurrency}}.",
+      "acceptCurrency": "Tôi hiểu rằng các số tiền này giữ nguyên bằng {{sourceCurrency}} và không được quy đổi.",
+      "moveAnyway": "Vẫn chuyển"
+    },
+    "merge": {
+      "open": "Gộp vào…",
+      "title": "Gộp {{number}} vào phiếu hỗ trợ khác",
+      "description": "Các bình luận, thời gian, linh kiện và liên kết của {{number}} sẽ chuyển sang phiếu hỗ trợ bạn chọn. {{number}} sau đó sẽ được đóng và trỏ đến phiếu đó.",
+      "pickerLabel": "Phiếu hỗ trợ đích",
+      "searchPlaceholder": "Tìm theo số hoặc tiêu đề",
+      "pickerHint": "Chỉ liệt kê các phiếu hỗ trợ đang mở trong tổ chức này, từ cũ nhất.",
+      "loading": "Đang tải phiếu hỗ trợ…",
+      "candidatesFailed": "Không thể tải phiếu hỗ trợ. Đóng hộp thoại và thử lại.",
+      "noCandidates": "Không có phiếu hỗ trợ mở nào khác trong tổ chức này.",
+      "previewLoading": "Đang kiểm tra việc gộp…",
+      "previewFailed": "Không thể kiểm tra việc gộp này. Chọn lại phiếu hỗ trợ để thử lại.",
+      "side": {
+        "source": "Phiếu hỗ trợ này",
+        "survivor": "Mục tiêu",
+        "both": "Cả hai phiếu hỗ trợ"
+      },
+      "refusal": {
+        "MERGE_SAME_TICKET": "Không thể gộp phiếu hỗ trợ vào chính nó.",
+        "MERGE_CROSS_ORG": "Cả hai phiếu hỗ trợ phải thuộc cùng một tổ chức.",
+        "MERGE_SOURCE_INELIGIBLE": "Không thể gộp phiếu hỗ trợ này (đã bị xóa hoặc đã được gộp).",
+        "MERGE_SURVIVOR_INELIGIBLE": "Phiếu đích không thể nhận gộp (đã đóng, bị xóa hoặc đã được gộp).",
+        "MERGE_DELIVERABLE_PINNED": "Không thể gộp phiếu hỗ trợ gắn liền với sản phẩm bàn giao dịch vụ.",
+        "MERGE_IMPORT_WINDOW": "Không thể gộp phiếu hỗ trợ đang trong cửa sổ nhập liệu mở.",
+        "MERGE_APPROVAL_STATE": "Không thể gộp phiếu hỗ trợ có yêu cầu phê duyệt hoặc ngân sách.",
+        "MERGE_WORK_KIND_MISMATCH": "Không thể gộp chung công việc hỗ trợ và công việc dự án.",
+        "MERGE_PENDING_INTENTS": "Phiếu hỗ trợ này có các tác vụ AI đang chờ. Đợi chúng hoàn tất hoặc hủy chúng.",
+        "ORG_MERGING": "Tổ chức này đang được gộp. Thử lại sau.",
+        "MERGE_SCOPE_DENIED": "Bạn không có quyền truy cập vào thiết bị hoặc chi nhánh trên một trong các phiếu hỗ trợ này."
+      },
+      "suggested": "{{number}} cũ hơn; thường đây là phiếu được giữ lại.",
+      "movesTo": "Chuyển đến {{number}}",
+      "nothingMoves": "Không có gì khác được chuyển.",
+      "counts": {
+        "ticket_comments": "Bình luận: {{count}}",
+        "time_entries": "Mục thời gian: {{count}}",
+        "ticket_parts": "Linh kiện: {{count}}",
+        "ticket_alert_links": "Liên kết cảnh báo: {{count}}",
+        "ticket_attachments": "Tệp đính kèm: {{count}}",
+        "ticket_email_links": "Liên kết email: {{count}}",
+        "ticket_checklist_items": "Mục danh sách kiểm tra: {{count}}",
+        "ticket_external_refs": "Tham chiếu ngoài: {{count}}",
+        "ticket_links": "Liên kết phiếu hỗ trợ: {{count}}",
+        "device_vulnerabilities": "Lỗ hổng bảo mật: {{count}}",
+        "organization_key_dates": "Nhắc nhở ngày quan trọng: {{count}}",
+        "service_deliverable_occurrences": "Lần giao bàn giao: {{count}}",
+        "ai_operator_task_targets": "Mục tiêu tác vụ AI: {{count}}",
+        "ticket_drafts": "Bản nháp đã hủy: {{count}}"
+      },
+      "droppedHeading": "Liên kết bị loại bỏ",
+      "dropped": {
+        "between_pair": "liên kết giữa hai phiếu hỗ trợ",
+        "pair_unique": "trùng với liên kết mà phiếu đích đã có",
+        "self": "sẽ trỏ đến chính nó",
+        "canonical_duplicate": "trùng lặp sau khi sắp xếp lại",
+        "cycle": "sẽ tạo ra một vòng lặp",
+        "limit": "vượt quá giới hạn liên kết trên mỗi phiếu hỗ trợ"
+      },
+      "retained": "Giữ nguyên trên {{number}}: {{name}}",
+      "anIntegration": "một tích hợp",
+      "device": {
+        "keeps": "Phiếu hỗ trợ được gộp giữ lại {{device}}.",
+        "takes": "Phiếu hỗ trợ được gộp nhận {{device}}.",
+        "unknown": "thiết bị khác"
+      },
+      "requesterAccess": "Người yêu cầu của {{source}} sẽ thấy luồng công khai của {{survivor}} trong cổng thông tin và có thể trả lời ở đó.",
+      "notify": "Gửi email cho người yêu cầu của {{number}} rằng yêu cầu của họ đã được gộp",
+      "noRequester": "{{number}} không có người yêu cầu để gửi email.",
+      "warning": "Thao tác này không thể hoàn tác. {{source}} chuyển thành chỉ đọc và trỏ đến {{survivor}}.",
+      "confirm": "Gộp",
+      "merging": "Đang gộp…",
+      "failed": "Gộp thất bại. Thử lại.",
+      "merged": "Đã gộp vào {{number}}",
+      "mfaRequired": "Việc gộp phiếu hỗ trợ yêu cầu xác thực đa yếu tố. Đăng nhập lại bằng MFA và thử lại.",
+      "alreadyMerged": "Một trong các phiếu hỗ trợ này đã được gộp. Chọn đích khác.",
+      "retry": "Các phiếu hỗ trợ này đã thay đổi trong quá trình gộp. Thử lại."
+    },
+    "mergedBanner": {
+      "mergedInto": "Phiếu hỗ trợ này đã được gộp vào {{number}} vào ngày {{date}}.",
+      "pending": "Phiếu hỗ trợ này đã được gộp vào phiếu khác vào ngày {{date}}.",
+      "deleted": "Phiếu hỗ trợ này đã được gộp vào ngày {{date}} vào một phiếu đã bị xóa hoặc bạn không thể nhìn thấy.",
+      "open": "Mở {{number}}",
+      "readOnly": "Phiếu hỗ trợ đã gộp là chế độ chỉ đọc. Trả lời trên phiếu hỗ trợ đã được gộp vào.",
+      "railReadOnly": "Thời gian, thanh toán và linh kiện ở chế độ chỉ đọc trên phiếu hỗ trợ đã gộp. Ghi nhận thời gian và linh kiện trên phiếu hỗ trợ đã được gộp vào."
+    },
+    "triage": {
+      "title": "Phân loại được đề xuất",
+      "checking": "Đang kiểm tra tín hiệu phiếu hỗ trợ…",
+      "priority": "Mức độ ưu tiên: {{priority}}",
+      "category": "Danh mục: {{category}}",
+      "confidence": "{{percent}}% độ tin cậy",
+      "notRight": "Chưa chính xác",
+      "applying": "Đang áp dụng…",
+      "suggestedCategory": "Danh mục đề xuất",
+      "applyFailed": "Không thể áp dụng đề xuất phân loại phiếu hỗ trợ.",
+      "applied": "Đã áp dụng đề xuất phân loại phiếu hỗ trợ",
+      "feedbackFailed": "Không thể lưu phản hồi phân loại phiếu hỗ trợ.",
+      "feedbackSaved": "Đã lưu phản hồi phân loại phiếu hỗ trợ"
+    },
+    "aiDraft": {
+      "kindReply": "Bản nháp phản hồi do AI soạn",
+      "kindResolutionNote": "Ghi chú cách giải quyết do AI soạn",
+      "sendAsMe": "Gửi với tư cách là tôi",
+      "sending": "Đang gửi…",
+      "discard": "Hủy bỏ",
+      "sendFailed": "Không thể gửi bản nháp AI.",
+      "sent": "Đã gửi bản nháp",
+      "discardFailed": "Không thể hủy bản nháp AI.",
+      "discarded": "Đã hủy bản nháp"
+    },
+    "aiProposal": {
+      "postAsNote": "Đăng làm ghi chú riêng tư",
+      "posted": "Đã đăng làm ghi chú riêng tư",
+      "postFailed": "Không thể đăng ghi chú"
+    },
+    "resolve": {
+      "noteLabel": "Ghi chú cách giải quyết (hiển thị với người yêu cầu)",
+      "submit": "Giải quyết phiếu hỗ trợ"
+    },
+    "pending": {
+      "reasonLabel": "Bạn đang chờ điều gì? (tùy chọn)",
+      "setPending": "Đặt thành đang chờ",
+      "putOnHold": "Tạm giữ"
+    },
+    "description": {
+      "empty": "Không có mô tả.",
+      "add": "Thêm mô tả"
+    },
+    "requester": {
+      "label": "Người yêu cầu",
+      "someoneElse": "Người khác…",
+      "nameAria": "Tên người yêu cầu",
+      "emailPlaceholder": "Email (tùy chọn)",
+      "emailAria": "Email người yêu cầu"
+    },
+    "device": {
+      "none": "Không có thiết bị",
+      "unlink": "Hủy liên kết",
+      "link": "Liên kết thiết bị",
+      "change": "Đổi thiết bị",
+      "cancel": "Hủy",
+      "assigneeWarning": "Việc thay đổi thiết bị sẽ kiểm tra lại người phụ trách. Kỹ thuật viên không thể truy cập thiết bị mới sẽ bị hủy phân công."
+    },
+    "toast": {
+      "statusUpdated": "Đã cập nhật trạng thái",
+      "statusUpdateFailed": "Cập nhật trạng thái thất bại. Thử lại.",
+      "ticketResolved": "Đã giải quyết phiếu",
+      "resolveFailed": "Giải quyết thất bại. Thử lại.",
+      "replyFailed": "Trả lời thất bại. Thử lại.",
+      "updateFailed": "Cập nhật thất bại. Thử lại.",
+      "commentEditFailed": "Sửa bình luận thất bại. Thử lại.",
+      "commentDeleteFailed": "Xóa bình luận thất bại. Thử lại.",
+      "priorityUpdateFailed": "Cập nhật mức ưu tiên thất bại. Thử lại.",
+      "categoryUpdateFailed": "Cập nhật danh mục thất bại. Thử lại.",
+      "assigned": "Đã phân công",
+      "unassigned": "Chưa phân công",
+      "assignFailed": "Phân công thất bại. Thử lại.",
+      "attachmentFailed": "Không thể tải lên tệp đính kèm.",
+      "typeUpdateFailed": "Không thể cập nhật loại phiếu."
+    },
+    "delete": {
+      "failed": "Xóa thất bại. Thử lại.",
+      "deleted": "Đã xóa phiếu"
+    },
+    "deleteDialog": {
+      "title": "Xóa phiếu này?",
+      "message": "Thao tác này ẩn phiếu khỏi tất cả hàng đợi. Quản trị viên có thể khôi phục từ hàng đợi Lưu trữ.",
+      "confirm": "Xóa phiếu"
+    },
+    "typeLabel": "Loại phiếu"
+  },
+  "billingOutcome": {
+    "included": "Đã bao gồm",
+    "nonBillable": "Không tính phí",
+    "hourly": "{{rate}}/h",
+    "minimum": "Tối thiểu {{minutes}} phút",
+    "missingRate": "Tính phí · chưa cấu hình đơn giá",
+    "recalculated": "Chi phí sẽ được tính lại cho loại công việc này khi lưu.",
+    "unavailable": "Không có kết quả tính phí"
+  },
+  "ticketApproval": {
+    "errors": {
+      "requestNotPending": "Yêu cầu phê duyệt này không còn chờ xử lý.",
+      "requestChanged": "Yêu cầu đã thay đổi khi bạn đang xem. Phiên bản mới nhất đã được tải lại; hãy xem lại và thử lại.",
+      "requestExpired": "Yêu cầu phê duyệt này đã hết hạn. Yêu cầu lại để gửi yêu cầu mới.",
+      "requestAlreadyPending": "Yêu cầu phê duyệt với lý do này đã đang chờ xử lý trên phiếu này.",
+      "requestNotReaskable": "Chỉ các yêu cầu bị từ chối, hết hạn hoặc đã hủy vẫn còn thời gian giữ lại mới có thể yêu cầu lại.",
+      "nothingHeld": "Không có thời gian nào được giữ lại trên phiếu này để yêu cầu phê duyệt.",
+      "approvalsDisabled": "Tính năng phê duyệt của khách hàng chưa được bật cho khách hàng này.",
+      "entryNotResolvable": "Thời gian này chỉ có thể xóa sổ sau khi yêu cầu phê duyệt bị từ chối, hết hạn hoặc đã hủy.",
+      "approvalRequestPending": "Phiếu này có yêu cầu phê duyệt đang chờ khách hàng, nên không thể di chuyển. Hãy hủy hoặc giải quyết yêu cầu trước.",
+      "sourceAwaitingApproval": "Một số thời gian trên hóa đơn này đang chờ khách hàng phê duyệt. Hãy lấy phê duyệt hoặc xóa sổ trước khi phát hành.",
+      "approvalRequired": "Cần có sự phê duyệt của khách hàng trước khi có thể theo dõi thời gian tính phí trên phiếu này. Yêu cầu phê duyệt từ bảng Phê duyệt của phiếu."
+    },
+    "budget": {
+      "title": "Ngân sách và phê duyệt",
+      "hours": "Ngân sách (giờ)",
+      "amount": "Số tiền ngân sách",
+      "save": "Lưu ngân sách",
+      "saved": "Đã lưu ngân sách",
+      "saveFailed": "Lưu ngân sách thất bại",
+      "invalidHours": "Nhập số giờ lớn hơn 0 hoặc để trống nếu không giới hạn.",
+      "invalidAmount": "Nhập số tiền lớn hơn 0 với tối đa 2 chữ số thập phân hoặc để trống.",
+      "ceiling": "Mức trần {{ceiling}}",
+      "ceilingWithExtensions": "Mức trần {{ceiling}} (ngân sách {{budget}} + đã duyệt {{extra}})",
+      "noBudget": "Chưa đặt ngân sách",
+      "usedLegend": "Đã dùng {{value}}",
+      "heldLegend": "Đang chờ phê duyệt {{value}}",
+      "unpriced_one": "{{count}} mục giữ lại chưa có giá.",
+      "unpriced_other": "{{count}} mục giữ lại chưa có giá.",
+      "barLabel": "Sử dụng ngân sách",
+      "requestApproval": "Yêu cầu phê duyệt"
+    },
+    "request": {
+      "trigger": "Lý do",
+      "triggerBudget": "Vượt ngân sách",
+      "triggerAfterHours": "Làm việc ngoài giờ",
+      "extensionMinutes": "Phút bổ sung",
+      "extensionAmount": "Số tiền bổ sung",
+      "windowStart": "Áp dụng từ",
+      "windowEnd": "Áp dụng đến",
+      "message": "Tin nhắn cho khách hàng (tùy chọn)",
+      "submit": "Gửi yêu cầu",
+      "sent": "Đã gửi yêu cầu phê duyệt",
+      "failed": "Gửi yêu cầu phê duyệt thất bại",
+      "invalidExtension": "Nhập số phút bổ sung hoặc số tiền bổ sung lớn hơn 0.",
+      "invalidWindow": "Chọn thời gian bắt đầu và kết thúc, với thời gian kết thúc sau thời gian bắt đầu và cách nhau tối đa 14 ngày."
+    },
+    "panel": {
+      "title": "Phê duyệt của khách hàng",
+      "status": {
+        "pending": "Đang chờ",
+        "approved": "Đã duyệt",
+        "denied": "Từ chối",
+        "expired": "Hết hạn",
+        "cancelled": "Đã hủy"
+      },
+      "revision": "Phiên bản {{n}}",
+      "ask": "Đang yêu cầu {{ask}}",
+      "window": "Áp dụng từ {{from}} đến {{to}}",
+      "expires": "Hết hạn vào {{when}}",
+      "heldEntries_one": "{{count}} mục giữ lại",
+      "heldEntries_other": "{{count}} mục giữ lại",
+      "approvers": "Người phê duyệt",
+      "notified": "Đã thông báo",
+      "noneListed": "Không có",
+      "noApprover": "Không có người phê duyệt trong hồ sơ: thêm liên hệ thanh toán hoặc ghi nhận quyết định thay mặt.",
+      "decidedByCustomer": "Được quyết định bởi {{who}}",
+      "customerFallback": "khách hàng",
+      "decidedOnBehalf": "Được ghi nhận bởi {{user}} thay mặt cho {{signer}} · {{method}} · {{reference}}",
+      "method": {
+        "verbal": "Trực tiếp",
+        "email": "Email",
+        "signedDocument": "Tài liệu đã ký",
+        "other": "Khác"
+      },
+      "cancel": "Hủy yêu cầu",
+      "cancelConfirmTitle": "Hủy yêu cầu phê duyệt này?",
+      "cancelConfirmMessage": "Khách hàng sẽ không thể phản hồi nữa. Thời gian đã giữ lại sẽ tiếp tục được giữ cho đến khi bạn yêu cầu lại hoặc xóa sổ.",
+      "cancelled": "Đã hủy yêu cầu phê duyệt",
+      "cancelFailed": "Hủy yêu cầu thất bại",
+      "reask": "Yêu cầu lại",
+      "reaskSubmit": "Gửi lại",
+      "reasked": "Đã gửi lại yêu cầu phê duyệt",
+      "reaskFailed": "Yêu cầu lại thất bại",
+      "record": "Ghi nhận quyết định"
+    },
+    "record": {
+      "title": "Ghi nhận quyết định của khách hàng",
+      "intro": "Sử dụng tính năng này khi khách hàng đưa ra quyết định bên ngoài Breeze. Thao tác này được ghi nhật ký dưới tên bạn.",
+      "target": "Phiên bản {{revision}} · {{ask}}",
+      "decision": "Quyết định",
+      "approve": "Đã duyệt",
+      "deny": "Từ chối",
+      "method": "Được đưa ra bằng cách nào?",
+      "reference": "Tham chiếu",
+      "referencePlaceholder": "ví dụ: cuộc gọi điện thoại ngày 12 tháng 10, tiêu đề email, số tài liệu",
+      "signerName": "Tên khách hàng",
+      "signerEmail": "Email khách hàng (tùy chọn)",
+      "note": "Ghi chú (tùy chọn)",
+      "submit": "Ghi nhận quyết định",
+      "recorded": "Đã ghi nhận quyết định",
+      "failed": "Không thể ghi nhận quyết định"
+    },
+    "held": {
+      "chip": "Đang chờ khách hàng phê duyệt",
+      "writeOff": "Xóa sổ thời gian",
+      "writeOffTitle": "Xóa sổ thời gian đang giữ?",
+      "writeOffMessage": "Thời gian này đang bị giữ vì khách hàng chưa phê duyệt. Xóa sổ nghĩa là tính phí bằng 0, do đó sẽ không được lập hóa đơn.",
+      "writtenOff": "Đã xóa sổ thời gian",
+      "writeOffFailed": "Không thể xóa sổ thời gian"
+    },
+    "timer": {
+      "startNonBillable": "Bắt đầu là không tính phí"
+    },
+    "loadError": "Không thể tải phê duyệt của khách hàng",
+    "retry": "Thử lại"
+  },
+  "ticketType": {
+    "incident": "Sự cố",
+    "service_request": "Yêu cầu dịch vụ",
+    "problem": "Vấn đề",
+    "change": "Thay đổi"
+  },
+  "ticketLinks": {
+    "title": "Phiếu hỗ trợ liên quan",
+    "loading": "Đang tải phiếu hỗ trợ liên quan…",
+    "loadFailed": "Không thể tải phiếu hỗ trợ liên quan.",
+    "empty": "Không có phiếu hỗ trợ liên quan.",
+    "deleted": "Đã xóa",
+    "add": "Liên kết phiếu hỗ trợ",
+    "addTitle": "Liên kết phiếu hỗ trợ",
+    "linkType": "Phiếu hỗ trợ này…",
+    "addType": {
+      "related": "liên quan đến",
+      "caused_by": "được gây ra bởi",
+      "resolves": "giải quyết",
+      "duplicate_of": "là bản sao của"
+    },
+    "searchLabel": "Tìm phiếu hỗ trợ trong tổ chức này",
+    "searchPlaceholder": "Tìm theo số hoặc tiêu đề",
+    "searching": "Đang tìm kiếm…",
+    "searchFailed": "Tìm kiếm thất bại. Thử lại.",
+    "noResults": "Không có phiếu hỗ trợ phù hợp.",
+    "changePick": "Chọn phiếu hỗ trợ khác",
+    "addSubmit": "Thêm liên kết",
+    "adding": "Đang thêm…",
+    "added": "Đã liên kết phiếu hỗ trợ.",
+    "addFailed": "Không thể thêm liên kết.",
+    "removed": "Đã gỡ liên kết.",
+    "removeFailed": "Không thể gỡ liên kết.",
+    "remove": "Gỡ liên kết với {{ticket}}",
+    "removeTitle": "Gỡ liên kết?",
+    "removeMessage": "Gỡ liên kết với {{ticket}}? Bản thân các phiếu hỗ trợ sẽ không thay đổi.",
+    "removeConfirm": "Gỡ liên kết",
+    "linkedIncidents": "{{count}} sự cố đã liên kết",
+    "linkedIncidents_one": "{{count}} sự cố đã liên kết",
+    "linkedIncidents_other": "{{count}} sự cố đã liên kết",
+    "group": {
+      "caused_by": "Gây ra bởi",
+      "causes": "Gây ra",
+      "resolves": "Giải quyết",
+      "resolved_by": "Được giải quyết bởi",
+      "duplicate_of": "Bản sao của",
+      "duplicates": "Các bản sao",
+      "related": "Liên quan"
+    },
+    "errors": {
+      "ALREADY_LINKED": "Các phiếu hỗ trợ này đã được liên kết.",
+      "LINK_CYCLE": "Liên kết đó sẽ tạo ra một chuỗi nguyên nhân vòng tròn.",
+      "LINK_LIMIT": "Một phiếu hỗ trợ có thể có tối đa 50 liên kết, bao gồm cả liên kết đến các phiếu bạn không thể xem. Hãy gỡ liên kết trước khi thêm liên kết mới.",
+      "SOURCE_ALREADY_DUPLICATE": "Phiếu hỗ trợ này đã được đánh dấu là bản sao của phiếu khác (có thể bạn không nhìn thấy).",
+      "SOURCE_HAS_DUPLICATES": "Các phiếu hỗ trợ khác (có thể bạn không nhìn thấy) đã được đánh dấu là bản sao của phiếu này, vì vậy bản thân nó không thể được đánh dấu là bản sao.",
+      "DUPLICATE_TARGET_IS_DUPLICATE": "Phiếu hỗ trợ đó vốn là bản sao. Thay vào đó, hãy liên kết với phiếu gốc.",
+      "CROSS_ORG": "Chỉ có thể liên kết các phiếu hỗ trợ trong cùng một tổ chức.",
+      "SELF_LINK": "Không thể liên kết phiếu hỗ trợ với chính nó.",
+      "NOT_FOUND": "Không tìm thấy phiếu hỗ trợ đó hoặc không còn khả dụng.",
+      "LINK_GONE": "Liên kết đó đã được gỡ trước đó."
+    }
+  }
+}

@@ -1,0 +1,290 @@
+{
+  "section": {
+    "title": "Hạng mục bàn giao dịch vụ",
+    "pausedDraft": "Tạm dừng cho đến khi hợp đồng được kích hoạt. Bản nháp không tạo phiếu hỗ trợ nào; khi kích hoạt, các hạng mục chưa bắt đầu sẽ chuyển sang ngày bắt đầu hợp đồng (hoặc ngày hôm nay nếu đã qua).",
+    "empty": "Chưa có hạng mục bàn giao. Thêm các báo cáo định kỳ và đánh giá mà khách hàng này cần nhận."
+  },
+  "table": {
+    "name": "Hạng mục bàn giao",
+    "cadence": "Tần suất",
+    "nextDue": "Hạn tiếp theo",
+    "lastDelivered": "Đã bàn giao lần cuối",
+    "status": "Trạng thái",
+    "portal": "Cổng thông tin"
+  },
+  "cadence": {
+    "monthly": "Hàng tháng",
+    "quarterly": "Hàng quý",
+    "semiannual": "6 tháng một lần",
+    "annual": "Hàng năm",
+    "one_time": "Một lần"
+  },
+  "status": {
+    "on_track": "Đúng tiến độ",
+    "due_soon": "Sắp đến hạn",
+    "late": "Trễ hạn",
+    "missed": "Đã bỏ lỡ",
+    "inactive": "Không hoạt động"
+  },
+  "occurrence": {
+    "status": {
+      "scheduled": "Đã lên lịch",
+      "open": "Đang mở",
+      "awaiting_evidence": "Đang chờ minh chứng",
+      "delivered": "Đã bàn giao",
+      "missed": "Đã bỏ lỡ",
+      "waived": "Đã miễn"
+    }
+  },
+  "actions": {
+    "add": "Thêm hạng mục bàn giao",
+    "edit": "Sửa",
+    "deactivate": "Vô hiệu hóa",
+    "deliver": "Đánh dấu đã bàn giao",
+    "waive": "Miễn",
+    "reopen": "Mở lại",
+    "reschedule": "Đổi lịch",
+    "addEvidence": "Thêm minh chứng",
+    "removeEvidence": "Xóa minh chứng",
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "retry": "Thử lại"
+  },
+  "form": {
+    "name": "Tên",
+    "description": "Mô tả",
+    "contract": "Hợp đồng",
+    "noContract": "Không gắn với hợp đồng",
+    "contractsUnavailable": "Không thể tải hợp đồng của tổ chức này. Tải lại trang trước khi lưu.",
+    "cadence": "Tần suất",
+    "anchorDueDate": "Ngày đến hạn đầu tiên",
+    "effectiveFrom": "Có hiệu lực từ",
+    "effectiveUntil": "Có hiệu lực đến",
+    "leadDays": "Thời gian chuẩn bị (ngày)",
+    "graceDays": "Thời gian ân hạn (ngày)",
+    "artifactRequired": "Yêu cầu minh chứng trước khi đánh dấu đã bàn giao",
+    "completionMode": {
+      "label": "Hoàn thành",
+      "explicit": "Được đánh dấu bàn giao bởi kỹ thuật viên",
+      "on_ticket_resolve": "Bàn giao khi phiếu hỗ trợ liên kết được giải quyết"
+    },
+    "autoEvidenceReport": "Đính kèm bản chạy báo cáo làm minh chứng",
+    "autoEvidenceNone": "Không có",
+    "autoEvidenceHelp": "Minh chứng được tạo vào ngày đến hạn và hiển thị cho khách hàng khi sự kiện được bàn giao.",
+    "autoEvidenceEmpty": "Chưa có loại báo cáo minh chứng được quản lý nào.",
+    "owner": "Chủ sở hữu",
+    "ticketCategory": "Danh mục phiếu hỗ trợ",
+    "portalVisible": "Hiển thị trên cổng thông tin khách hàng",
+    "sortOrder": "Thứ tự sắp xếp",
+    "instructions": "Hướng dẫn nội bộ",
+    "instructionsHint": "Nội bộ — không bao giờ hiển thị cho khách hàng.",
+    "checklistTemplate": "Mẫu danh sách công việc",
+    "checklistTemplateNone": "Không có",
+    "checklistTemplateAllOrgs": "Tất cả tổ chức",
+    "checklistTemplateManage": "Quản lý mẫu danh sách công việc"
+  },
+  "drawer": {
+    "title": "Các lần diễn ra",
+    "empty_one": "Chưa có lần diễn ra nào. Lần đầu tiên được lên kế hoạch trước ngày đến hạn {{count}} ngày.",
+    "empty_other": "Chưa có lần diễn ra nào. Lần đầu tiên được lên kế hoạch trước ngày đến hạn {{count}} ngày.",
+    "emptyWithDate_one": "Chưa có lần diễn ra nào. Lần đầu tiên được lên kế hoạch trước ngày đến hạn {{count}} ngày ({{date}}).",
+    "emptyWithDate_other": "Chưa có lần diễn ra nào. Lần đầu tiên được lên kế hoạch trước ngày đến hạn {{count}} ngày ({{date}}).",
+    "evidence": "Minh chứng",
+    "noEvidence": "Chưa đính kèm minh chứng",
+    "late": "Trễ hạn",
+    "awaitingEvidenceHint": "Phiếu hỗ trợ đã giải quyết — đính kèm minh chứng để hoàn thành",
+    "rescheduledFrom": "Đã đổi lịch từ {{date}}",
+    "deliveryNote": "Ghi chú bàn giao",
+    "waivedReason": "Lý do miễn",
+    "newDueDate": "Ngày đến hạn mới",
+    "uploadEvidence": "Tải lên tệp làm minh chứng",
+    "uploadEvidenceHint": "PDF, JPEG, PNG hoặc WebP, tối đa 10 MB. Tệp được lưu vào thư viện tài liệu của tổ chức này.",
+    "evidenceDocument": "Tài liệu",
+    "upload": "Tải lên",
+    "checklistProgress": "{{done}} / {{total}}",
+    "showChecklist": "Hiển thị danh sách công việc",
+    "hideChecklist": "Ẩn danh sách công việc",
+    "linkDocument": "Liên kết tài liệu hiện có",
+    "linkDocumentSelect": "Chọn tài liệu để liên kết làm minh chứng",
+    "linkDocumentLoading": "Đang tải tài liệu…",
+    "linkDocumentPlaceholder": "Chọn tài liệu…",
+    "linkDocumentEmpty": "Chưa có tài liệu nào trong thư viện của tổ chức này.",
+    "linkAgreement": "Liên kết thỏa thuận đã ký",
+    "linkAgreementSelect": "Chọn thỏa thuận đã ký để liên kết làm minh chứng",
+    "linkAgreementLoading": "Đang tải thỏa thuận đã ký…",
+    "linkAgreementPlaceholder": "Chọn thỏa thuận đã ký…",
+    "linkAgreementEmpty": "Chưa có thỏa thuận đã ký nào cho tổ chức này.",
+    "link": "Liên kết"
+  },
+  "evidence": {
+    "reportRun": "Bản chạy báo cáo",
+    "document": "Tài liệu",
+    "signedAgreement": "Thỏa thuận đã ký",
+    "reportRunId": "ID bản chạy báo cáo"
+  },
+  "upcoming": {
+    "title": "90 ngày tới",
+    "empty": "Không có gì đến hạn trong 90 ngày tới."
+  },
+  "group": {
+    "noContract": "Không có hợp đồng"
+  },
+  "errors": {
+    "evidenceRequired": "Đính kèm minh chứng trước khi đánh dấu lần diễn ra này đã bàn giao.",
+    "duplicateName": "Hạng mục bàn giao với tên này đã tồn tại cho tổ chức này.",
+    "loadFailed": "Không thể tải các hạng mục bàn giao.",
+    "saveFailed": "Không thể lưu hạng mục bàn giao.",
+    "actionFailed": "Không thể cập nhật lần diễn ra.",
+    "uploadFailed": "Không thể tải lên tệp minh chứng.",
+    "tooLarge": "Tệp đó lớn hơn 10 MB.",
+    "unsupportedType": "Chỉ có thể đính kèm tệp PDF, JPEG, PNG và WebP.",
+    "storageUnavailable": "Lưu trữ tài liệu hiện không khả dụng. Vui lòng thử lại sau.",
+    "linkFailed": "Không thể liên kết tài liệu.",
+    "libraryLoadFailed": "Không thể tải thư viện tài liệu.",
+    "agreementsLoadFailed": "Không thể tải các thỏa thuận đã ký.",
+    "agreementsForbidden": "Bạn không có quyền xem các thỏa thuận đã ký."
+  },
+  "confirm": {
+    "deactivate": "Vô hiệu hóa {{name}}? Các lần diễn ra đang mở sẽ bị đóng và không có lần mới nào được lên lịch.",
+    "deleteKeyDate": "Xóa mốc thời gian quan trọng {{label}}?"
+  },
+  "keyDates": {
+    "title": "Mốc thời gian quan trọng",
+    "empty": "Chưa có mốc thời gian quan trọng nào được ghi nhận.",
+    "add": "Thêm ngày quan trọng",
+    "label": "Nhãn",
+    "kind": {
+      "label": "Loại",
+      "insurance_renewal": "Gia hạn bảo hiểm",
+      "vendor_contract_end": "Hết hạn hợp đồng nhà cung cấp",
+      "compliance_deadline": "Hạn chót tuân thủ",
+      "audit": "Kiểm toán",
+      "other": "Khác"
+    },
+    "date": "Ngày",
+    "recursAnnually": "Lặp lại hàng năm",
+    "remindDaysBefore": "Nhắc nhở (số ngày trước)",
+    "portalVisible": "Hiển thị trong cổng thông tin khách hàng",
+    "contractEnd": "Hết hạn hợp đồng",
+    "notes": "Ghi chú",
+    "owner": "Người phụ trách",
+    "edit": "Sửa ngày quan trọng",
+    "delete": "Xóa",
+    "errors": {
+      "loadFailed": "Không thể tải các ngày quan trọng.",
+      "saveFailed": "Không thể lưu ngày quan trọng."
+    },
+    "toast": {
+      "saved": "Đã lưu ngày quan trọng",
+      "deleted": "Đã xóa ngày quan trọng"
+    }
+  },
+  "toast": {
+    "saved": "Đã lưu sản phẩm bàn giao",
+    "delivered": "Đã đánh dấu hoàn thành",
+    "waived": "Đã miễn lượt",
+    "reopened": "Đã mở lại lượt",
+    "rescheduled": "Đã đổi lịch lượt",
+    "evidenceAdded": "Đã thêm bằng chứng",
+    "evidenceRemoved": "Đã xóa bằng chứng",
+    "deactivated": "Đã vô hiệu hóa sản phẩm bàn giao",
+    "evidenceUploaded": "Đã tải lên bằng chứng",
+    "evidenceLinked": "Đã liên kết tài liệu làm bằng chứng"
+  },
+  "templates": {
+    "pageTitle": "Mẫu sản phẩm bàn giao",
+    "pageDescription": "Định nghĩa gói dịch vụ một lần và áp dụng cho bất kỳ khách hàng nào. Các bộ mẫu toàn đối tác khả dụng cho mọi tổ chức bạn quản lý.",
+    "empty": "Chưa có bộ mẫu nào. Hãy tạo một bộ để định nghĩa gói dịch vụ có thể tái sử dụng cho khách hàng.",
+    "allOrganizations": "Tất cả tổ chức",
+    "actions": {
+      "newSet": "Bộ mẫu mới",
+      "addItem": "Thêm sản phẩm bàn giao",
+      "apply": "Áp dụng bộ mẫu",
+      "edit": "Sửa",
+      "delete": "Xóa",
+      "save": "Lưu",
+      "cancel": "Hủy"
+    },
+    "form": {
+      "name": "Tên bộ",
+      "description": "Mô tả",
+      "itemName": "Tên sản phẩm bàn giao",
+      "cadence": "Tần suất",
+      "leadDays": "Mở trước hạn (số ngày)",
+      "graceDays": "Đánh dấu trễ hạn sau hạn (số ngày)",
+      "artifactRequired": "Yêu cầu tài liệu",
+      "completionMode": "Hoàn thành",
+      "autoEvidenceReportType": "Loại báo cáo bằng chứng"
+    },
+    "ownerScope": {
+      "legend": "Bộ này dành cho ai?",
+      "allOrganizations": "Tất cả tổ chức (toàn đối tác)",
+      "thisOrganizationOnly": "Chỉ tổ chức này"
+    },
+    "apply": {
+      "title": "Áp dụng bộ mẫu",
+      "set": "Bộ mẫu",
+      "contract": "Hợp đồng (tùy chọn)",
+      "noContract": "Không có hợp đồng",
+      "effectiveFrom": "Có hiệu lực từ",
+      "owner": "Người phụ trách (tùy chọn)",
+      "submit": "Áp dụng",
+      "created_one": "Đã tạo {{count}} sản phẩm bàn giao",
+      "created_other": "Đã tạo {{count}} sản phẩm bàn giao",
+      "skipped": "Đã bỏ qua (đã tồn tại): {{names}}",
+      "items": "Sản phẩm bàn giao trong bộ này",
+      "noItems": "Bộ này chưa có sản phẩm bàn giao nào."
+    },
+    "portal": {
+      "shown": "Hiển thị trong cổng thông tin",
+      "hidden": "Ẩn khỏi cổng thông tin"
+    },
+    "errors": {
+      "collision": "Các sản phẩm bàn giao này đã tồn tại trên đích: {{names}}",
+      "duplicateSetName": "Bộ mẫu với tên này đã tồn tại.",
+      "duplicateItemName": "Một mục với tên này đã tồn tại trong bộ.",
+      "partnerWideDenied": "Quản lý mẫu toàn đối tác yêu cầu quyền truy cập đầy đủ vào tổ chức đối tác.",
+      "loadFailed": "Không thể tải các bộ mẫu.",
+      "saveFailed": "Không thể lưu bộ mẫu.",
+      "deleteFailed": "Không thể xóa bộ mẫu.",
+      "itemSaveFailed": "Không thể lưu sản phẩm bàn giao.",
+      "itemDeleteFailed": "Không thể xóa sản phẩm bàn giao.",
+      "applyFailed": "Không thể áp dụng bộ mẫu."
+    },
+    "toast": {
+      "setSaved": "Đã lưu bộ mẫu",
+      "setDeleted": "Đã xóa bộ mẫu",
+      "itemSaved": "Đã lưu sản phẩm bàn giao",
+      "itemDeleted": "Đã xóa sản phẩm bàn giao",
+      "applied": "Đã áp dụng bộ mẫu"
+    }
+  },
+  "move": {
+    "action": "Chuyển đến hợp đồng…",
+    "toTitle": "Chuyển sản phẩm bàn giao sang hợp đồng",
+    "selected": "Đã chọn: {{count}}",
+    "selectRow": "Chọn {{name}}",
+    "target": "Hợp đồng đích",
+    "confirm": "Chuyển",
+    "moved": "Đã chuyển sản phẩm bàn giao",
+    "hereAction": "Chuyển sản phẩm bàn giao đến đây từ…",
+    "hereTitle": "Chuyển sản phẩm bàn giao đến đây",
+    "hereHelp": "Chọn sản phẩm bàn giao từ các hợp đồng khác của tổ chức này để chuyển sang hợp đồng này.",
+    "hereEmpty": "Không có sản phẩm bàn giao nào khác trong tổ chức này.",
+    "collision": "Không có gì được chuyển. Các tên này đã tồn tại trên hợp đồng đích: {{names}}"
+  },
+  "bulk": {
+    "select": "Chọn {{name}}",
+    "selectAll": "Chọn tất cả sản phẩm bàn giao",
+    "count_one": "Đã chọn {{count}}",
+    "count_other": "Đã chọn {{count}}",
+    "reschedule": "Đổi lịch các mục đã chọn",
+    "clear": "Xóa",
+    "newDate": "Ngày đến hạn mới",
+    "done_one": "Đã đổi lịch {{count}} lượt",
+    "done_other": "Đã đổi lịch {{count}} lượt",
+    "partial": "Đã đổi lịch {{moved}}, không thể chuyển {{refused}}",
+    "none": "Không có sản phẩm bàn giao nào được chọn có lượt đang mở để đổi lịch.",
+    "failed": "Không thể đổi lịch các lượt đã chọn."
+  }
+}

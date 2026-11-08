@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import OrgSwitcher from './OrgSwitcher';
 import NotificationCenter from './NotificationCenter';
+import LanguageToggle from './LanguageToggle';
 import TimerWidget from '../time/TimerWidget';
 import CommandPalette from './CommandPalette';
 import SupportModal from '../support/SupportModal';
@@ -457,6 +458,7 @@ export default function Header() {
 
         {/* Notifications */}
         {mounted && isAuthenticated && <TimerWidget />}
+        {mounted && isAuthenticated && <LanguageToggle />}
         {mounted && isAuthenticated && <NotificationCenter />}
 
         {/* Theme Picker */}

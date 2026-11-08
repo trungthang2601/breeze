@@ -1,0 +1,677 @@
+{
+  "patchApprovalModal": {
+    "title": "Xem lại bản vá",
+    "close": "Đóng",
+    "cancel": "Hủy",
+    "deferUntil": "Hoãn đến",
+    "actions": {
+      "approve": {
+        "label": "Phê duyệt",
+        "description": "Cho phép bản vá này được triển khai tự động hoặc trong cửa sổ bảo trì tiếp theo."
+      },
+      "decline": {
+        "label": "Từ chối",
+        "description": "Chặn bản vá này triển khai cho đến khi được xem xét lại."
+      },
+      "defer": {
+        "label": "Hoãn",
+        "description": "Trì hoãn quyết định và xem xét lại sau."
+      }
+    },
+    "notes": {
+      "label": "Ghi chú",
+      "placeholder": "Thêm ngữ cảnh hoặc lý do cho quyết định..."
+    },
+    "errors": {
+      "partnerLevel": "Việc phê duyệt bản vá được quản lý ở cấp đối tác",
+      "chooseDeferUntil": "Chọn thời điểm hoãn bản vá đến",
+      "updateFailed": "Không thể cập nhật phê duyệt bản vá"
+    },
+    "toast": {
+      "approved": "Đã phê duyệt bản vá",
+      "declined": "Đã từ chối bản vá",
+      "declinedAllRings": "Đã từ chối bản vá cho tất cả vòng cập nhật",
+      "deferred": "Đã hoãn bản vá"
+    },
+    "allRings": {
+      "label": "Xóa tất cả phê duyệt vòng",
+      "description": "Đồng thời thu hồi phê duyệt bản vá này ở mọi vòng cập nhật khác cho đối tác này, không chỉ phạm vi hiện tại."
+    },
+    "confirm": {
+      "title": "Xác nhận phê duyệt bản vá",
+      "selectedRing": "(không có tên)",
+      "messageRingOne": "Phê duyệt bản vá trên {{count}} thiết bị ở tất cả tổ chức trong vòng {{ring}}?",
+      "messageRingMany": "Phê duyệt bản vá trên {{count}} thiết bị ở tất cả tổ chức trong vòng {{ring}}?",
+      "messagePartnerWide": "Phê duyệt bản vá cho tất cả tổ chức trực thuộc đối tác của bạn?"
+    },
+    "checkingAccess": "Đang kiểm tra quyền truy cập của bạn..."
+  },
+  "patchComplianceView": {
+    "unknownDevice": "Không xác định",
+    "emptyValue": "—",
+    "searchPlaceholder": "Tìm kiếm thiết bị...",
+    "showing": "Hiển thị {{shown}} trên {{total}}",
+    "empty": "Không tìm thấy thiết bị nào.",
+    "emptyFiltered": "Không có thiết bị nào khớp với bộ lọc của bạn.",
+    "errors": {
+      "fetchData": "Không thể tải dữ liệu bản vá",
+      "loadPendingPatches": "Không thể tải các bản vá đang chờ cho thiết bị {{deviceId}}"
+    },
+    "actions": {
+      "tryAgain": "Thử lại",
+      "export": "Xuất",
+      "refreshCompliance": "Làm mới dữ liệu tuân thủ",
+      "clear": "Xóa",
+      "scan": "Quét",
+      "install": "Cài đặt",
+      "installCount": "Cài đặt ({{count}})",
+      "view": "Xem"
+    },
+    "export": {
+      "selectOrganization": "Chọn một tổ chức để xuất báo cáo tuân thủ",
+      "generateFailed": "Không thể tạo báo cáo",
+      "queued": "Báo cáo tuân thủ {{reportId}} đã được đưa vào hàng đợi. Đang chuẩn bị tải xuống...",
+      "ready": "Báo cáo tuân thủ {{reportId}} đã sẵn sàng. Bắt đầu tải xuống...",
+      "failed": "Báo cáo tuân thủ {{reportId}} thất bại",
+      "expired": "Báo cáo tuân thủ {{reportId}} đã hết hạn. Hãy tạo báo cáo mới để tải xuống.",
+      "checkFailed": "Không thể kiểm tra trạng thái báo cáo",
+      "downloadFailed": "Không thể tải xuống báo cáo tuân thủ {{reportId}}",
+      "noReportId": "Báo cáo đã được đưa vào hàng đợi nhưng không có ID báo cáo nào được trả về"
+    },
+    "summary": {
+      "compliantPercent": "Tuân thủ {{percent}}%",
+      "devices": "{{compliant}} / {{total}} thiết bị",
+      "pendingDevices": "{{count}} có bản vá đang chờ",
+      "approved": "{{count}} đã phê duyệt",
+      "pendingApproval": "{{count}} chờ phê duyệt",
+      "failedInstalls_one": "{{count}} cài đặt thất bại",
+      "failedInstalls_other": "{{count}} cài đặt thất bại",
+      "critical": "{{count}} nghiêm trọng",
+      "reboot": "{{count}} khởi động lại",
+      "imagesNotChecked_one": "{{count}} ảnh container chưa được kiểm tra",
+      "imagesNotChecked_other": "{{count}} ảnh container chưa được kiểm tra"
+    },
+    "filters": {
+      "allDevices": "Tất cả thiết bị ({{count}})",
+      "statusFilterLabel": "Bộ lọc trạng thái tuân thủ",
+      "pendingPatches": "Bản vá đang chờ ({{count}})",
+      "critical": "Nghiêm trọng ({{count}})",
+      "failed": "Cài đặt thất bại ({{count}})",
+      "pendingReboot": "Chờ khởi động lại ({{count}})",
+      "thirdPartyPending": "Bản vá bên thứ ba đang chờ ({{count}})",
+      "compliant": "Tuân thủ ({{count}})"
+    },
+    "selection": {
+      "selected": "Đã chọn {{count}}",
+      "selectAll": "Chọn tất cả",
+      "deselectAll": "Bỏ chọn tất cả",
+      "selectDevice": "Chọn {{name}}",
+      "deselectDevice": "Bỏ chọn {{name}}"
+    },
+    "table": {
+      "device": "Thiết bị",
+      "status": "Trạng thái",
+      "approved": "Đã phê duyệt",
+      "approvedTitle": "Các bản vá nổi bật đã được phê duyệt cài đặt",
+      "pendingApproval": "Chờ phê duyệt",
+      "pendingApprovalTitle": "Các bản vá nổi bật vẫn đang chờ phê duyệt",
+      "failed": "Thất bại",
+      "failedTitle": "Các bản vá nổi bật có lần cài đặt gần nhất thất bại",
+      "osPatches": "Bản vá HĐH",
+      "osPatchesTitle": "Bản cập nhật nổi bật từ Windows Update, Apple hoặc trình quản lý gói Linux",
+      "thirdParty": "Bên thứ ba",
+      "thirdPartyTitle": "Bản cập nhật nổi bật từ bên thứ ba hoặc nguồn tùy chỉnh",
+      "critical": "Nghiêm trọng",
+      "criticalTitle": "Các bản vá nổi bật được xếp hạng mức độ nghiêm trọng cao",
+      "lastActivity": "Hoạt động gần nhất",
+      "lastActivityTitle": "Hoạt động cài đặt hoặc quét bản vá gần đây nhất",
+      "reboot": "Khởi động lại",
+      "rebootTitle": "HĐH báo cáo đang chờ khởi động lại — bất kỳ nguyên nhân nào (bản cập nhật Windows, CBS, đổi tên tệp đang chờ); được báo cáo bởi agent. Đối với thiết bị ngoại tuyến, điều này phản ánh trạng thái lúc kết nối gần nhất.",
+      "actions": "Thao tác"
+    },
+    "status": {
+      "ok": "OK",
+      "outstanding": "{{count}} chưa xử lý"
+    },
+    "reboot": {
+      "offlineTitle": "Thiết bị ngoại tuyến — điều này phản ánh trạng thái HĐH lúc kết nối gần nhất và có thể đã cũ.",
+      "yes": "Có",
+      "yesAsOf": "Có · tính đến {{time}}"
+    },
+    "relative": {
+      "justNow": "vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "activity": {
+      "noActivity": "Không có hoạt động nào được ghi nhận",
+      "installed": "Đã cài đặt {{time}}",
+      "scanned": "Đã quét {{time}}",
+      "lastScanned": "Quét lần cuối {{time}}",
+      "lastInstalled": "Cài đặt lần cuối {{time}}",
+      "noScan": "Không có lần quét nào được ghi nhận",
+      "noInstall": "Không có lần cài đặt nào được ghi nhận"
+    },
+    "confirm": {
+      "title": "Xác nhận thao tác trên hệ thống",
+      "selectedOrganization": "tổ chức được chọn",
+      "scanAction": "Quét bản vá",
+      "installAction": "Cài đặt bản vá",
+      "messageOne": "{{action}} trên {{count}} thiết bị tại {{org}}?",
+      "messageMany": "{{action}} trên {{count}} thiết bị tại {{org}}?",
+      "messageMultiOrg": "{{action}} trên {{count}} thiết bị trên {{orgCount}} tổ chức ({{orgNames}})?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} của {{total}}",
+      "previous": "Trang trước",
+      "next": "Trang sau"
+    }
+  },
+  "patchInstallHistory": {
+    "title": "Lịch sử thao tác bản vá",
+    "loading": "Đang tải lịch sử bản vá...",
+    "empty": "Không tìm thấy thao tác bản vá nào.",
+    "emptyValue": "--",
+    "unknownPatch": "Bản vá không xác định",
+    "operationCountOne": "{{count}} thao tác",
+    "operationCountMany": "{{count}} thao tác",
+    "errors": {
+      "fetchHistory": "Không thể lấy lịch sử bản vá"
+    },
+    "actions": {
+      "retry": "Thử lại",
+      "refresh": "Làm mới",
+      "refreshing": "Đang làm mới...",
+      "clearFilters": "Xóa bộ lọc"
+    },
+    "filters": {
+      "allTypes": "Tất cả loại",
+      "allStatus": "Tất cả trạng thái"
+    },
+    "operationTypes": {
+      "install": "Cài đặt",
+      "scan": "Quét",
+      "rollback": "Hoàn tác",
+      "download": "Tải xuống"
+    },
+    "status": {
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "pending": "Đang chờ",
+      "running": "Đang chạy",
+      "timeout": "Hết thời gian",
+      "unknown": "Không xác định"
+    },
+    "table": {
+      "operation": "Thao tác",
+      "status": "Trạng thái",
+      "patches": "Bản vá",
+      "duration": "Thời lượng",
+      "date": "Ngày"
+    },
+    "pagination": {
+      "showing": "Hiển thị từ {{start}} đến {{end}} trong tổng số {{total}}",
+      "pageStatus": "Trang {{current}} / {{total}}"
+    },
+    "duration": {
+      "lessThanSecond": "<1s",
+      "seconds": "{{count}}s",
+      "minutesSeconds": "{{minutes}}m {{seconds}}s"
+    },
+    "relative": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}}m trước",
+      "hoursAgo": "{{count}}h trước",
+      "daysAgo": "{{count}}d trước"
+    },
+    "detail": {
+      "installed": "Đã cài đặt",
+      "failed": "Thất bại",
+      "pending": "Đang chờ",
+      "scanned": "Đã quét",
+      "rebootRequired": "Cần khởi động lại",
+      "yes": "Có",
+      "started": "Đã bắt đầu",
+      "completed": "Đã hoàn thành",
+      "error": "Lỗi",
+      "patchResults": "Kết quả bản vá",
+      "reboot": "Khởi động lại",
+      "empty": "Không có kết quả chi tiết về bản vá.",
+      "table": {
+        "patch": "Bản vá",
+        "kb": "KB",
+        "status": "Trạng thái",
+        "error": "Lỗi"
+      }
+    }
+  },
+  "patchList": {
+    "title": "Bản vá",
+    "summary": "{{shown}} / {{total}} bản vá",
+    "searchPlaceholder": "Tìm kiếm bản vá...",
+    "loading": "Đang tải bản vá...",
+    "empty": "Không tìm thấy bản vá. Hãy thử điều chỉnh tìm kiếm hoặc bộ lọc.",
+    "vendorBy": "bởi {{vendor}}",
+    "moreCves": "+{{count}} mục khác",
+    "sortBy": "Sắp xếp theo {{label}}",
+    "errors": {
+      "approvePatches": "Không thể phê duyệt bản vá",
+      "declinePatches": "Không thể từ chối bản vá",
+      "staleList": "{{message}} Đang hiển thị danh sách đã tải trước đó, có thể đã cũ."
+    },
+    "severity": {
+      "critical": "Nghiêm trọng",
+      "important": "Quan trọng",
+      "moderate": "Trung bình",
+      "low": "Thấp",
+      "unrated": "Chưa xếp hạng",
+      "unratedNote": "Sẽ không tự động phê duyệt",
+      "derivedNote": "Xếp hạng suy ra",
+      "derivedTooltip": "Nhà cung cấp không công bố mức độ cho bản cập nhật này. Mức độ nghiêm trọng này được suy ra từ phân loại và tiêu đề của bản vá."
+    },
+    "approval": {
+      "pending": "Đang chờ",
+      "approved": "Đã phê duyệt",
+      "declined": "Đã từ chối",
+      "deferred": "Đã hoãn"
+    },
+    "filters": {
+      "allSeverities": "Tất cả mức độ",
+      "allStatus": "Tất cả trạng thái",
+      "moreFilters": "Bộ lọc khác",
+      "lessFilters": "Ít bộ lọc hơn",
+      "allSources": "Tất cả nguồn",
+      "allOs": "Tất cả HĐH",
+      "severityLabel": "Mức độ",
+      "statusLabel": "Trạng thái phê duyệt",
+      "sourceLabel": "Nguồn",
+      "osLabel": "Hệ điều hành"
+    },
+    "actions": {
+      "deploy": "Triển khai",
+      "review": "Xem xét",
+      "unapprove": "Bỏ phê duyệt",
+      "details": "Chi tiết",
+      "approveCount": "Phê duyệt {{count}}",
+      "declineCount": "Từ chối {{count}}",
+      "deployCount": "Triển khai {{count}}",
+      "clearSelection": "Bỏ chọn",
+      "tryAgain": "Thử lại"
+    },
+    "selection": {
+      "selected": "Đã chọn {{count}}",
+      "selectAll": "Chọn tất cả",
+      "deselectAll": "Bỏ chọn tất cả",
+      "selectAllPatches": "Chọn tất cả bản vá",
+      "deselectAllPatches": "Bỏ chọn tất cả bản vá",
+      "selectPatch": "Chọn {{title}}",
+      "deselectPatch": "Bỏ chọn {{title}}",
+      "selectAllMatching": "Chọn tất cả {{count}} mục phù hợp"
+    },
+    "table": {
+      "patch": "Bản vá",
+      "severity": "Mức độ",
+      "source": "Nguồn",
+      "os": "HĐH",
+      "release": "Phát hành",
+      "approval": "Phê duyệt",
+      "devices": "Thiết bị",
+      "actions": "Thao tác"
+    },
+    "releaseUnknown": "Không xác định",
+    "pagination": {
+      "rowsPerPage": "Số dòng mỗi trang",
+      "pageStatus": "Trang {{current}} / {{total}}"
+    },
+    "installFailure": {
+      "badgeDevices_one": "Cài đặt thất bại trên {{count}} thiết bị",
+      "badgeDevices_other": "Cài đặt thất bại trên {{count}} thiết bị",
+      "noReason": "Agent không báo cáo lý do",
+      "failedAt": "Lần thử cài đặt cuối thất bại: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} thiết bị",
+      "badge_other": "{{count}} thiết bị",
+      "none": "Không có thiết bị nào trong phạm vi còn cần bản vá này",
+      "open": "Hiển thị các thiết bị vẫn cần {{title}}",
+      "heading": "Các thiết bị vẫn cần {{title}}",
+      "loading": "Đang tải thiết bị…",
+      "error": "Không thể tải danh sách thiết bị.",
+      "showing": "Đang hiển thị {{shown}} / {{total}}",
+      "loadMore": "Tải thêm",
+      "lastChecked": "Kiểm tra lần cuối: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Phiên bản gói {{version}}",
+      "id": "ID danh mục {{id}}",
+      "title": "Một mục danh mục khác có cùng tiêu đề. Mỗi mục được phê duyệt riêng."
+    }
+  },
+  "patchesPage": {
+    "title": "Quản lý bản vá",
+    "description": "Quản lý vòng cập nhật, phê duyệt, tuân thủ và triển khai bản vá.",
+    "ringScopeHint": "Vòng cập nhật được quản lý ở cấp đối tác",
+    "loadingRings": "Đang tải vòng cập nhật...",
+    "tabs": {
+      "compliance": "Tuân thủ",
+      "patches": "Bản vá",
+      "jobs": "Tác vụ",
+      "updateRings": "Vòng cập nhật"
+    },
+    "actions": {
+      "runScan": "Chạy quét",
+      "scanning": "Đang quét...",
+      "newRing": "Vòng mới",
+      "tryAgain": "Thử lại",
+      "scan": "Quét",
+      "close": "Đóng",
+      "saving": "Đang lưu...",
+      "creating": "Đang tạo...",
+      "saveChanges": "Lưu thay đổi",
+      "createRing": "Tạo vòng"
+    },
+    "errors": {
+      "fetchRings": "Không thể tải vòng cập nhật",
+      "fetchPatches": "Không thể tải bản vá",
+      "fetchJobs": "Không thể tải tác vụ vá",
+      "partnerLevel": "Phê duyệt bản vá được quản lý ở cấp đối tác",
+      "approvePatches": "Không thể phê duyệt bản vá",
+      "approveCountOne": "Không thể phê duyệt {{count}} bản vá",
+      "approveCountMany": "Không thể phê duyệt {{count}} bản vá",
+      "declineCount": "Không thể từ chối {{count}} bản vá",
+      "loadDevicesForScan": "Không thể tải thiết bị để quét",
+      "noDevicesForScan": "Không có thiết bị nào khả dụng để quét",
+      "updateRing": "Không thể cập nhật vòng",
+      "createRing": "Không thể tạo vòng cập nhật",
+      "deleteRing": "Không thể xóa vòng",
+      "approveUnknown": "Trạng thái phê duyệt không xác định — không thể đọc phản hồi từ máy chủ. Làm mới để xác nhận bản vá nào đã được phê duyệt.",
+      "approveAbortedWithFailures": "{{message}} ({{count}} bản vá cũng đã bị máy chủ từ chối trước đó.)",
+      "checkRingLinks": "Không thể kiểm tra chính sách nào đang sử dụng vòng này — không có gì bị xóa"
+    },
+    "toast": {
+      "ringSaved": "Đã lưu vòng cập nhật",
+      "ringCreated": "Đã tạo vòng cập nhật",
+      "ringDeleted": "Đã xóa vòng cập nhật",
+      "chooseDevicesForInstall": "Chọn các thiết bị để cài đặt bản vá này từ tab Tuân thủ."
+    },
+    "scan": {
+      "confirmTitle": "Xác nhận quét bản vá",
+      "selectedOrganization": "tổ chức đã chọn",
+      "confirmMessageOne": "Quét bản vá trên {{count}} thiết bị tại {{org}}?",
+      "confirmMessageMany": "Quét bản vá trên {{count}} thiết bị tại {{org}}?",
+      "confirmMessageMultiOrg": "Quét bản vá trên {{count}} thiết bị trên {{orgCount}} tổ chức ({{orgNames}})?",
+      "failedFallback": "Quét bản vá thất bại",
+      "deviceOne": "thiết bị",
+      "deviceMany": "thiết bị",
+      "failedToQueue": "{{count}} không thể đưa vào hàng đợi",
+      "skipped": "{{count}} đã bỏ qua (không có quyền / không tìm thấy)",
+      "failedZero": "Quét bản vá thất bại: 0 / {{requested}} {{noun}} được đưa vào hàng đợi.",
+      "failedZeroWithShortfall": "Quét bản vá thất bại: 0 / {{requested}} {{noun}} được đưa vào hàng đợi ({{shortfall}}).",
+      "queuedPartial": "Đã đưa quét bản vá vào hàng đợi cho {{queued}} / {{requested}} {{noun}} — {{shortfall}}.",
+      "dispatchedSuffix": ", {{count}} đã điều phối ngay lập tức",
+      "queuedSuccess": "Đã đưa quét bản vá vào hàng đợi cho {{queued}} {{noun}}{{dispatchSuffix}}."
+    },
+    "ringModal": {
+      "editTitle": "Sửa vòng cập nhật",
+      "createTitle": "Tạo vòng cập nhật"
+    },
+    "truncatedNotice": "Đang hiển thị {{shown}} / {{total}} bản vá. Các bộ lọc ở đây chỉ thu hẹp những gì đã tải, do đó phần còn lại không thể truy cập từ chế độ xem này — hãy sử dụng API bản vá để xử lý toàn bộ danh mục.",
+    "emptyRingSeverityNotice": "Chưa có thiết bị nào trong vòng này. Mức độ nghiêm trọng do thiết bị báo cáo sẽ xuất hiện sau khi thiết bị được gán, vì vậy hầu hết các bản vá hiển thị là Chưa đánh giá cho đến lúc đó.",
+    "shiftedNotice": "Đang hiển thị {{shown}} / {{total}} bản vá — danh mục đã thay đổi trong khi đang tải. Tải lại để xem phần còn lại.",
+    "ringDelete": {
+      "messageNone": "Không có chính sách nào sử dụng vòng này. Các quy tắc phê duyệt và cài đặt lịch trình của vòng sẽ bị xóa và không thể khôi phục.",
+      "title": "Xóa {{name}}?",
+      "messageOne": "1 chính sách sẽ dừng việc vá lỗi theo lịch trình cho đến khi bạn chọn vòng khác.",
+      "messageMany": "{{count}} chính sách sẽ dừng việc vá lỗi theo lịch trình cho đến khi bạn chọn vòng khác.",
+      "confirm": "Xóa vòng"
+    }
+  },
+  "patchJobsList": {
+    "empty": "Chưa có tác vụ vá nào. Các tác vụ do chính sách, vòng cập nhật hoặc Breeze AI tạo ra sẽ xuất hiện ở đây.",
+    "loading": "Đang tải tác vụ vá...",
+    "columns": {
+      "name": "Tác vụ",
+      "status": "Trạng thái",
+      "devices": "Thiết bị",
+      "createdBy": "Được tạo bởi",
+      "scheduled": "Đã lên lịch",
+      "started": "Đã bắt đầu",
+      "completed": "Đã hoàn thành"
+    },
+    "status": {
+      "scheduled": "Đã lên lịch",
+      "running": "Đang chạy",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy"
+    },
+    "devicesSummary": "{{completed}}/{{total}} đã hoàn thành",
+    "devicesSummaryWithFailed": "{{completed}}/{{total}} đã hoàn thành, {{failed}} thất bại",
+    "createdBySystem": "Hệ thống",
+    "notScheduled": "—",
+    "actions": {
+      "tryAgain": "Thử lại",
+      "previousPage": "Trước",
+      "nextPage": "Sau"
+    },
+    "pagination": "Trang {{page}} / {{totalPages}}",
+    "filters": {
+      "allStatuses": "Tất cả trạng thái"
+    }
+  },
+  "patchJobDetail": {
+    "title": "Tác vụ vá",
+    "loading": "Đang tải chi tiết tác vụ...",
+    "notFound": "Không tìm thấy tác vụ vá này.",
+    "summary": {
+      "status": "Trạng thái",
+      "source": "Nguồn",
+      "scheduled": "Đã lên lịch",
+      "started": "Đã bắt đầu",
+      "completed": "Đã hoàn thành",
+      "createdBy": "Được tạo bởi"
+    },
+    "resultsTitle": "Kết quả thiết bị ({{count}})",
+    "resultsEmpty": "Chưa có kết quả theo thiết bị.",
+    "columns": {
+      "device": "Thiết bị",
+      "patch": "Bản vá",
+      "status": "Trạng thái",
+      "started": "Đã bắt đầu",
+      "completed": "Đã hoàn thành",
+      "reboot": "Khởi động lại"
+    },
+    "rebootRequired": "Bắt buộc",
+    "rebootDone": "Đã hoàn thành",
+    "rebootNotRequired": "—",
+    "skipReasons": {
+      "ring_deleted": "Đã hủy trước khi điều phối: vòng cập nhật đã bị xóa.",
+      "ring_disabled": "Đã hủy trước khi điều phối: vòng cập nhật đã bị vô hiệu hóa.",
+      "ring_unavailable": "Đã bỏ qua: vòng cập nhật đã bị xóa hoặc vô hiệu hóa trước khi thiết bị này được điều phối."
+    },
+    "errors": {
+      "load": "Không thể tải tác vụ vá"
+    }
+  },
+  "ringSelector": {
+    "label": "Vòng cập nhật:",
+    "allRings": "Tất cả các vòng",
+    "ringOption": "{{name}} (Thứ tự {{order}}, +{{days}}n)"
+  },
+  "sourceFilterChips": {
+    "sources": {
+      "all": "Tất cả",
+      "microsoft": "Microsoft",
+      "apple": "Apple",
+      "linux": "Linux",
+      "thirdParty": "Bên thứ ba"
+    }
+  },
+  "updateRingForm": {
+    "validation": {
+      "selectCategory": "Chọn một danh mục",
+      "selectSeverity": "Chọn ít nhất một mức độ nghiêm trọng để tự động phê duyệt.",
+      "selectSeverityOrThirdParty": "Chọn ít nhất một mức độ nghiêm trọng hoặc bật tính năng tự động phê duyệt ứng dụng bên thứ ba.",
+      "nameRequired": "Bắt buộc nhập tên vòng"
+    },
+    "categories": {
+      "security": "Bản vá bảo mật",
+      "feature": "Bản cập nhật tính năng",
+      "firmware": "Firmware",
+      "driver": "Trình điều khiển",
+      "definitions": "Bản cập nhật định nghĩa"
+    },
+    "severities": {
+      "critical": "Nghiêm trọng",
+      "important": "Quan trọng",
+      "moderate": "Trung bình",
+      "low": "Thấp"
+    },
+    "approveToggle": {
+      "ariaLabel": "Tự động phê duyệt bản vá",
+      "autoApprove": "Tự động phê duyệt",
+      "manual": "Thủ công"
+    },
+    "holdAfterRelease": "Giữ lại sau khi phát hành",
+    "days": "ngày",
+    "fields": {
+      "name": "Tên",
+      "rolloutOrder": "Thứ tự triển khai",
+      "description": "Mô tả",
+      "deadlineDays": "Hạn chót (ngày)",
+      "rebootGraceHours": "Thời gian ân hạn khởi động lại (giờ)",
+      "autoApproveSeverities": "Mức độ nghiêm trọng tự động phê duyệt",
+      "category": "Danh mục"
+    },
+    "placeholders": {
+      "name": "ví dụ: Thử nghiệm, Diện rộng",
+      "description": "Tùy chọn — vòng này dùng để làm gì",
+      "noDeadline": "Không có hạn chót"
+    },
+    "help": {
+      "rolloutOrder": "Số nhỏ hơn sẽ triển khai trước."
+    },
+    "installEnforcement": {
+      "title": "Thi hành cài đặt",
+      "description": "Thời gian thiết bị phải cài đặt các bản vá đã được phê duyệt và thời gian người dùng có thể trì hoãn việc khởi động lại. Hành vi khởi động lại được thiết lập theo chính sách trên tab Bản vá."
+    },
+    "featureUpdates": {
+      "title": "Bản cập nhật tính năng Windows",
+      "description": "Liệu các thiết bị trong vòng này có nhận các bản phát hành tính năng Windows hay không (ví dụ: 25H2). Breeze chỉ cài đặt chúng thông qua các quy tắc phê duyệt bên dưới; hãy thêm tùy chọn ghi đè Bản cập nhật tính năng để tự động phê duyệt chúng.",
+      "modeBlock": "Chặn",
+      "modeAllow": "Cho phép bản mới nhất",
+      "modePin": "Ghim vào một bản phát hành",
+      "productLabel": "Phiên bản Windows",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Bản phát hành",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Windows Update trên mỗi thiết bị được đặt để nhắm mục tiêu bản phát hành này (chính sách target-release của Windows Update for Business). Trừ khi cài đặt \"Breeze là nguồn Windows Update duy nhất\" của chính sách được bật, Windows có thể tự tải xuống và cài đặt bản phát hành theo lịch trình riêng ngoài việc phê duyệt của Breeze.",
+      "validation": {
+        "release": "Nhập một bản phát hành như 25H2."
+      }
+    },
+    "approvalPolicy": {
+      "title": "Chính sách phê duyệt",
+      "description": "Những gì được tự động phê duyệt trong vòng này và thời gian giữ lại bản vá sau khi nhà供应商 phát hành. Mặc định áp dụng cho mọi danh mục; thêm tùy chọn ghi đè để xử lý khác đi.",
+      "allCategories": "Tất cả danh mục",
+      "default": "Mặc định",
+      "severityNote": "Mức độ nghiêm trọng chỉ áp dụng cho các bản cập nhật HĐH. Các bản cập nhật ứng dụng bên thứ ba được điều khiển bằng công tắc bên dưới — chúng không bị chi phối bởi mức độ nghiêm trọng.",
+      "unratedSeverityNote": "Các bản vá chưa được xếp hạng (không có đánh giá mức độ nghiêm trọng) sẽ bị loại khỏi lựa chọn mức độ nghiêm trọng này và sẽ không tự động phê duyệt, ngay cả khi đã chọn tất cả mức độ nghiêm trọng, trừ khi bạn bật công tắc bên dưới.",
+      "autoApproveUnratedLabel": "Cả bản vá chưa xếp hạng cũng tự động phê duyệt",
+      "manualDefault": "Mọi bản vá trong vòng này đều cần phê duyệt thủ công.",
+      "manualCategory": "Các bản vá trong danh mục này cần phê duyệt thủ công.",
+      "noOverrides": "Tất cả danh mục tuân theo mặc định. Thêm tùy chọn ghi đè để xử lý khác đi."
+    },
+    "thirdParty": {
+      "title": "Ứng dụng bên thứ ba",
+      "description": "Tự động phê duyệt bản cập nhật ứng dụng từ winget, Chocolatey và Homebrew. Các quy tắc chặn/ghim ứng dụng vẫn được áp dụng; thời gian giữ lại được tính từ khi mỗi thiết bị lần đầu báo cáo bản cập nhật.",
+      "policyNote": "Chỉ áp dụng cho các thiết bị có chính sách cấu hình bao gồm cập nhật phần mềm bên thứ ba (cài đặt Bản vá của chính sách).",
+      "holdNote": "Được điền sẵn từ thời gian giữ lại tự động phê duyệt của vòng. Sau khi lưu, thời gian giữ lại này là độc lập và không còn tuân theo nữa."
+    },
+    "usage": {
+      "messageOne": "Vòng này áp dụng cho {{count}} thiết bị. Các thay đổi sẽ có hiệu lực trong lần kết nối tiếp theo.",
+      "messageMany": "Vòng này áp dụng cho {{count}} thiết bị. Các thay đổi sẽ có hiệu lực trong lần kết nối tiếp theo của chúng."
+    },
+    "actions": {
+      "addOverride": "Thêm ghi đè",
+      "removeOverride": "Xóa ghi đè",
+      "cancel": "Hủy",
+      "saving": "Đang lưu...",
+      "saveRing": "Lưu vòng"
+    }
+  },
+  "updateRingList": {
+    "title": "Cập nhật các vòng",
+    "summary": "{{shown}} / {{total}} vòng",
+    "searchPlaceholder": "Tìm kiếm vòng...",
+    "empty": "Không tìm thấy vòng cập nhật nào.",
+    "emptyValue": "—",
+    "none": "Không có",
+    "days": "{{count}} ngày",
+    "editRing": "Sửa {{name}}",
+    "deleteRing": "Xóa {{name}}",
+    "pageStatus": "Trang {{current}} / {{total}}",
+    "table": {
+      "order": "Thứ tự",
+      "ring": "Vòng",
+      "deferral": "Trì hoãn",
+      "deadline": "Hạn chót",
+      "devices": "Thiết bị",
+      "compliance": "Tuân thủ",
+      "updated": "Đã cập nhật",
+      "actions": "Hành động",
+      "autoApprove": "Tự động phê duyệt"
+    },
+    "badges": {
+      "manual": "Thủ công",
+      "os": "HĐH: {{severities}}",
+      "thirdParty": "Ứng dụng bên thứ ba",
+      "appRules_one": "{{count}} quy tắc ứng dụng",
+      "appRules_other": "{{count}} quy tắc ứng dụng",
+      "featureUpdatesNewest": "Cập nhật tính năng: mới nhất",
+      "featureUpdatesPinned": "Cập nhật tính năng: {{release}}"
+    }
+  },
+  "ringAppRules": {
+    "applicationRules": "Quy tắc ứng dụng",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Chặn các ứng dụng cụ thể khỏi việc vá lỗi tự động, hoặc ghim chúng ở phiên bản tối đa.",
+    "blocked": "Đã chặn",
+    "pinned": "Đã ghim",
+    "maxVersion": "Phiên bản tối đa",
+    "pinnedApplicationsNeedAVersion": "Ứng dụng được ghim cần có phiên bản.",
+    "addApplication": "Thêm ứng dụng",
+    "searchCatalogAndDetectedApplications": "Tìm kiếm danh mục và các ứng dụng đã phát hiện...",
+    "searching": "Đang tìm kiếm...",
+    "catalog": "danh mục",
+    "couldnTLoadApplicationsYouCanStill": "Không thể tải ứng dụng — bạn vẫn có thể thêm bằng ID gói bên dưới.",
+    "noMatches": "Không có kết quả phù hợp.",
+    "orEnterAPackageIDManually": "Hoặc nhập ID gói theo cách thủ công",
+    "removeRuleFor": "Xóa quy tắc cho {{application}}",
+    "scopeNote": "Các quy tắc này áp dụng cho mọi thiết bị có chính sách cấu hình liên kết với vòng này.",
+    "linuxPackage": "Gói Linux",
+    "appPackage": "Gói ứng dụng",
+    "manualRuleType": "Loại quy tắc",
+    "linuxPinHint": "Nhập phiên bản đầy đủ từ danh sách bản vá, bao gồm cả mọi epoch (ví dụ: 5:24.0.7-1)."
+  },
+  "patchDetails": {
+    "unknown": "Không rõ",
+    "source": "Nguồn",
+    "packageId": "KB / ID gói",
+    "severity": "Mức độ nghiêm trọng",
+    "releaseDate": "Ngày phát hành",
+    "firstSeen": "Lần đầu thấy trong danh mục",
+    "rings": {
+      "title": "Vòng cập nhật",
+      "note": "Khi mỗi vòng tự động phê duyệt bản vá này (quy tắc cấp vòng; quy tắc ghi đè theo danh mục không được hiển thị).",
+      "none": "Chưa cấu hình vòng cập nhật nào.",
+      "manual": "Không tự động duyệt — cần phê duyệt thủ công",
+      "immediate": "Tự động duyệt ngay lập tức",
+      "needsDate": "Đang giữ — không có ngày phát hành để bắt đầu khoảng thời gian {{count}} ngày",
+      "autoApproves": "Tự động duyệt vào {{date}}",
+      "hold_one": "Giữ lại {{count}} ngày",
+      "hold_other": "Giữ lại {{count}} ngày"
+    }
+  }
+}

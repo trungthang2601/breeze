@@ -1,0 +1,377 @@
+{
+  "titles": {
+    "adminMonitorConversion": "Chuyển đổi cảnh báo cũ",
+    "notFound": "Không tìm thấy trang",
+    "serverError": "Đã xảy ra lỗi",
+    "acceptInvite": "Chấp nhận lời mời",
+    "accountConnectedApps": "Ứng dụng đã kết nối",
+    "accountDelete": "Xóa tài khoản",
+    "accountDevices": "Thiết bị đáng tin cậy",
+    "accountInactive": "Bắt đầu",
+    "accountTestApproval": "Phê duyệt thử nghiệm",
+    "adminAccountDeletionRequestsDetail": "Yêu cầu xóa tài khoản",
+    "adminAccountDeletionRequests": "Yêu cầu xóa tài khoản",
+    "adminAiKillSwitch": "AI Kill Switch",
+    "adminConnectedApps": "Ứng dụng đã kết nối (quản trị viên)",
+    "adminLlmProviderCatalog": "Danh mục nhà cung cấp LLM",
+    "adminQuarantined": "Thiết bị bị cách ly",
+    "adminSystem": "Hệ thống",
+    "adminThirdPartyCatalog": "Danh mục bên thứ ba",
+    "adminTrustAct": "Hành động tin cậy đối tác",
+    "adminTrustQueue": "Hàng đợi tin cậy đối tác",
+    "adminSendingDomains": "Miền gửi của đối tác",
+    "adminUsersDetailDevices": "Thiết bị người dùng",
+    "aiAgentsImpact": "Tác động của AI",
+    "aiAgentsFixMemory": "Sửa bộ nhớ",
+    "flows": "Quy trình",
+    "flowDetail": "Quy trình",
+    "flowRun": "Chạy quy trình",
+    "aiAgentsRunsDetail": "Chi tiết chạy",
+    "aiAgentsRuns": "Lượt chạy Agent",
+    "aiForOffice": "Breeze AI cho Office",
+    "aiRisk": "Công cụ rủi ro AI",
+    "alertsDelivery": "Cảnh báo – Giao hàng",
+    "alertsCorrelations": "Mối tương quan cảnh báo",
+    "alertsDetail": "Chi tiết cảnh báo",
+    "alertsMonitors": "Cảnh báo – Giám sát",
+    "alertsMonitorDetail": "Cảnh báo – Trình giám sát",
+    "alerts": "Cảnh báo",
+    "analytics": "Phân tích",
+    "approvals": "Phê duyệt",
+    "auditBaselinesDetail": "Đường cơ sở kiểm toán",
+    "auditBaselines": "Đường cơ sở kiểm toán",
+    "audit": "Nhật ký kiểm toán",
+    "auth": "Đăng nhập hoặc tạo tài khoản",
+    "authConnectSso": "Kết nối đăng nhập của bạn",
+    "authMfaSetup": "Thiết lập MFA",
+    "authVerifyEmail": "Xác thực email",
+    "jobsDetail": "Sửa tác vụ",
+    "jobs": "Tác vụ",
+    "jobsNew": "Tác vụ mới",
+    "backup": "Sao lưu",
+    "billingInvoices": "Hóa đơn",
+    "billingInvoicesDetail": "Hóa đơn",
+    "billingQuotes": "Báo giá",
+    "billingQuotesDetail": "Báo giá",
+    "c2c": "Sao lưu đám mây",
+    "cisHardening": "Tiêu chuẩn CIS",
+    "configurationPoliciesDefaults": "Mặc định của Breeze",
+    "configurationPoliciesDetail": "Chính sách cấu hình",
+    "configurationPolicies": "Chính sách cấu hình",
+    "configurationPoliciesNew": "Chính sách cấu hình mới",
+    "contracts": "Hợp đồng",
+    "contractsDetail": "Hợp đồng",
+    "contractsNew": "Hợp đồng mới",
+    "devicesCompare": "So sánh thiết bị",
+    "devicesGroups": "Nhóm thiết bị",
+    "devicesUnassigned": "Thiết bị chưa gán",
+    "devicesDetail": "Chi tiết thiết bị",
+    "devices": "Thiết bị & Tài sản",
+    "devicesNetworkDetail": "Chi tiết thiết bị mạng",
+    "devicesPosture": "Trạng thái nhóm thiết bị",
+    "discovery": "Khám phá mạng",
+    "dnsSecurity": "Bảo mật DNS",
+    "dr": "Khôi phục thảm họa",
+    "extensionsNamePath": "Tiện ích mở rộng",
+    "fleet": "Phát hiện",
+    "forgotPassword": "Quên mật khẩu",
+    "incidentsDetail": "Chi tiết sự cố",
+    "incidents": "Sự cố bảo mật",
+    "dashboard": "Tổng quan",
+    "integrations": "Tích hợp",
+    "integrationsPsa": "Tích hợp PSA",
+    "integrationsWebhooks": "Webhooks",
+    "login": "Đăng nhập",
+    "logs": "Nhật ký",
+    "monitoring": "Mạng",
+    "oauthConsent": "Ủy quyền truy cập",
+    "oauthError": "Kết nối ứng dụng thất bại",
+    "onedrive": "OneDrive",
+    "organizations": "Tổ chức",
+    "organizationsDetail": "Tổ chức",
+    "pam": "Truy cập đặc quyền",
+    "partner": "Cổng thông tin đối tác",
+    "patches": "Bản vá",
+    "peripherals": "Kiểm soát ngoại vi",
+    "policiesCompliance": "Tổng quan tuân thủ",
+    "policiesDetail": "Sửa chính sách",
+    "policies": "Chính sách",
+    "policiesNew": "Chính sách mới",
+    "quick": "Hỗ trợ nhanh",
+    "verify": "Xem xét yêu cầu hỗ trợ",
+    "registerPartner": "Đăng ký công ty của bạn",
+    "remoteFilesDevice": "Trình quản lý tệp từ xa",
+    "remoteFiles": "Bắt đầu truyền tệp",
+    "remote": "Truy cập từ xa",
+    "remoteProxyTunnel": "Proxy mạng",
+    "remoteQuickSupport": "Hỗ trợ nhanh",
+    "remoteSessions": "Lịch sử phiên",
+    "remoteTerminalDevice": "Terminal từ xa",
+    "remoteTerminal": "Bắt đầu phiên Terminal",
+    "remoteTools": "Công cụ từ xa",
+    "remoteVncTunnel": "Máyδ để bàn VNC từ xa",
+    "reportsBuilder": "Trình tạo báo cáo",
+    "reportsDetailEdit": "Sửa báo cáo",
+    "reports": "Báo cáo",
+    "reportsNew": "Tạo báo cáo",
+    "reportsSeriesEdit": "Sửa báo cáo đa tổ chức",
+    "reportsTemplates": "Mẫu báo cáo",
+    "resetPassword": "Đặt lại mật khẩu",
+    "scriptsDetail": "Sửa tập lệnh",
+    "scriptsDetailExecutions": "Lịch sử thực thi",
+    "scripts": "Tập lệnh",
+    "scriptsNew": "Tập lệnh Mới",
+    "securityAdminAudit": "Kiểm toán Tài khoản Quản trị",
+    "securityAntivirus": "Độ phủ Antivirus",
+    "securityEdr": "EDR",
+    "securityEncryption": "Trạng thái Mã hóa",
+    "securityFirewall": "Trạng thái Tường lửa",
+    "security": "Bảo mật",
+    "securityPasswordPolicy": "Chính sách Mật khẩu",
+    "securityRecommendations": "Đề xuất Bảo mật",
+    "securityScore": "Điểm số Bảo mật",
+    "securityTrends": "Xu hướng Bảo mật",
+    "securityUserRisk": "Rủi ro Người dùng",
+    "securityVulnerabilities": "Lỗ hổng",
+    "sensitiveData": "Dữ liệu Nhạy cảm",
+    "settingsAccessReviews": "Đánh giá Truy cập",
+    "settingsAiAgents": "Tác nhân AI",
+    "settingsAiUsage": "Mức sử dụng AI",
+    "settingsAiScriptAuthoring": "Soạn thảo tập lệnh",
+    "settingsToolSources": "Nguồn Công cụ",
+    "settingsApiKeys": "Khóa API",
+    "settingsBilling": "Cài đặt Thanh toán",
+    "settingsCatalog": "Danh mục Sản phẩm",
+    "settingsConnectedApps": "Ứng dụng Đã kết nối",
+    "settingsDeliverableTemplates": "Mẫu Bàn giao",
+    "settingsCustomFields": "Trường Tùy chỉnh",
+    "settingsEnrollmentKeys": "Khóa Đăng ký",
+    "settingsFilters": "Bộ lọc Đã lưu",
+    "settings": "Cài đặt",
+    "settingsOfficeAddinBindings": "Liên kết Tiện ích Outlook",
+    "settingsOrganizationsDetail": "Cài đặt Tổ chức",
+    "settingsOrganizationsDetailBilling": "Thanh toán Tổ chức",
+    "settingsOrganizations": "Tổ chức",
+    "settingsPartner": "Cài đặt Đối tác",
+    "settingsPartnerServicePrincipals": "Service Principal",
+    "settingsProfile": "Cài đặt Hồ sơ",
+    "settingsRoles": "Vai trò",
+    "settingsSitesDetail": "Cài đặt Chi nhánh",
+    "settingsSites": "Chi nhánh",
+    "settingsSso": "Đăng nhập Một lần",
+    "settingsUsers": "Người dùng",
+    "settingsVariables": "Biến",
+    "settingsWebhooks": "Webhook",
+    "setup": "Thiết lập Ban đầu",
+    "software": "Thư viện Phần mềm",
+    "softwareInventory": "Phần mềm",
+    "softwarePolicies": "Phần mềm",
+    "ticketsDetail": "Phiếu hỗ trợ",
+    "tickets": "Phiếu hỗ trợ",
+    "ticketsNew": "Tạo Phiếu hỗ trợ",
+    "timesheet": "Bảng chấm công",
+    "vulnerabilities": "Lỗ hổng",
+    "aiAgentsFleetDesign": "Thiết kế Đội máy",
+    "agreementTemplates": "Mẫu thỏa thuận",
+    "agreementTemplateDetail": "Mẫu thỏa thuận",
+    "agreementTemplateNew": "Mẫu thỏa thuận mới",
+    "signedAgreements": "Thỏa thuận đã ký",
+    "settingsTicketing": "Cài đặt Phiếu hỗ trợ",
+    "securityScans": "Quét IOC",
+    "devicesTime": "Đồng bộ hóa thời gian",
+    "adminAiModels": "Mô hình AI",
+    "adminWisp": "Wisp",
+    "billingAutopay": "Thanh toán tự động",
+    "endpointMessages": "Tin nhắn Thiết bị cuối",
+    "securityDetectionRules": "Quy tắc Phát hiện",
+    "settingsPlan": "Gói & tính năng",
+    "settingsWispMemory": "Bộ nhớ Wisp",
+    "wispThread": "Luồng Wisp",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "Tác vụ AI",
+    "aiTask": "Tác vụ AI",
+    "settingsAi": "Cài đặt AI",
+    "settingsFlowLimits": "Giới hạn luồng"
+  },
+  "layout": {
+    "metaDescription": "Breeze RMM - Giám sát và Quản lý Từ xa",
+    "metaDescriptionSetup": "Breeze RMM - Thiết lập Ban đầu"
+  },
+  "authShell": {
+    "tagline": "Nền tảng RMM hiện đại được xây dựng để đạt tốc độ, sự rõ ràng và khả năng mở rộng."
+  },
+  "authFooter": {
+    "reportAbuse": "Báo cáo lạm dụng",
+    "security": "Bảo mật"
+  },
+  "errorPage": {
+    "notFoundBody": "Trang bạn đang tìm kiếm không tồn tại hoặc có thể đã được di chuyển.",
+    "serverErrorBody": "Đã xảy ra lỗi không mong đợi ở phía chúng tôi. Nhóm của chúng tôi đã được thông báo — vui lòng thử lại sau giây lát.",
+    "referenceIdLabel": "ID Tham chiếu:",
+    "dashboardLink": "Đi đến tổng quan",
+    "signInLink": "Đăng nhập"
+  },
+  "oauthErrorPage": {
+    "invalidClient": {
+      "heading": "Ứng dụng này không thể kết nối",
+      "body": "Breeze không nhận ra ứng dụng đã chuyển bạn đến đây, hoặc ứng dụng không được phép kết nối với máy chủ Breeze này. Kiểm tra xem ứng dụng đã được thiết lập với địa chỉ của máy chủ này chưa, sau đó thử lại."
+    },
+    "invalidRedirectUri": {
+      "heading": "Địa chỉ phản hồi của ứng dụng này chưa được đăng ký",
+      "body": "Ứng dụng đã yêu cầu Breeze chuyển bạn về một địa chỉ chưa từng đăng ký, vì vậy Breeze đã dừng lại ở đây để bảo vệ tài khoản của bạn. Nhà phát triển ứng dụng hoặc quản trị viên của bạn cần sửa URL chuyển hướng của ứng dụng."
+    },
+    "sessionExpired": {
+      "heading": "Phiên đăng nhập này đã hết hạn",
+      "body": "Kết nối mất quá nhiều thời gian, hoặc đã được khởi 1 trình duyệt khác. Quay lại ứng dụng và kết nối lại."
+    },
+    "invalidRequest": {
+      "heading": "Ứng dụng đã gửi yêu cầu mà Breeze không thể chấp nhận",
+      "body": "Yêu cầu kết nối của ứng dụng chưa đầy đủ hoặc yêu cầu một tính năng mà máy chủ này không hỗ trợ. Quay lại ứng dụng và thử lại. Nếu tình trạng này tiếp tục xảy ra, hãy liên hệ với nhà phát triển ứng dụng."
+    },
+    "serverError": {
+      "heading": "Breeze không thể hoàn tất kết nối",
+      "body": "Đã xảy ra lỗi ở phía chúng tôi. Chờ vài phút, sau đó quay lại ứng dụng và thử lại."
+    },
+    "generic": {
+      "heading": "Không thể hoàn tất kết nối này",
+      "body": "Quay lại ứng dụng và bắt đầu kết nối lại. Nếu tình trạng này tiếp tục xảy ra, hãy liên hệ với quản trị viên Breeze của bạn."
+    },
+    "nextStep": "Không có quyền truy cập nào được cấp. Bạn có thể đóng trang này."
+  },
+  "settingsIndex": {
+    "heading": "Cài đặt",
+    "description": "Quản lý cài đặt tổ chức, người dùng và chi nhánh của bạn.",
+    "cards": {
+      "ticketing": {
+        "title": "Quản lý Phiếu",
+        "description": "Cấu hình trạng thái phiếu, SLA ưu tiên, danh mục và mặc định xuất."
+      },
+      "catalog": {
+        "title": "Danh mục Sản phẩm",
+        "description": "Quản lý phần cứng, phần mềm, mục dịch vụ, giá cả và gói."
+      },
+      "billing": {
+        "title": "Thanh toán",
+        "description": "Tiền tệ hóa đơn, thuế, đánh số, điều khoản và mặc định chân trang."
+      },
+      "organizations": {
+        "title": "Tổ chức",
+        "description": "Quản lý tổ chức, hợp đồng và cài đặt tài khoản."
+      },
+      "users": {
+        "title": "Người dùng",
+        "description": "Mời người dùng, quản lý vai trò và kiểm soát quyền truy cập."
+      },
+      "sso": {
+        "title": "Đăng nhập Một lần",
+        "description": "Cấu hình nhà cung cấp SSO, xác minh tên miền email và bắt buộc đăng nhập SSO."
+      },
+      "accessReviews": {
+        "title": "Đánh giá Truy cập",
+        "description": "Chạy chứng nhận quyền truy cập của người dùng định kỳ và xuất bản ghi chứng thực."
+      },
+      "connectedApps": {
+        "title": "Ứng dụng Đã kết nối",
+        "description": "Xem lại và thu hồi các máy khách AI được ủy quyền truy cập vào tenant của bạn."
+      },
+      "officeAddinBindings": {
+        "title": "Liên kết Tiện ích Outlook",
+        "description": "Quản lý kỹ thuật viên được liên kết với tiện ích Outlook, và thu hồi quyền truy cập."
+      },
+      "sites": {
+        "title": "Chi nhánh",
+        "description": "Cấu hình vị trí, múi giờ và cài đặt riêng cho chi nhánh."
+      },
+      "deliverableTemplates": {
+        "title": "Mẫu Bàn giao",
+        "description": "Định nghĩa một cấp độ dịch vụ một lần và áp dụng các sản phẩm bàn giao cho bất kỳ khách hàng nào."
+      },
+      "ticketChecklistTemplates": {
+        "title": "Mẫu danh sách kiểm tra phiếu hỗ trợ",
+        "description": "Danh sách các bước có thể tái sử dụng mà kỹ thuật viên của bạn có thể áp dụng cho bất kỳ phiếu hỗ trợ nào."
+      },
+      "profile": {
+        "title": "Hồ sơ của tôi"
+      },
+      "apiKeys": {
+        "title": "Khóa API"
+      },
+      "partnerServicePrincipals": {
+        "title": "Service principal"
+      },
+      "alertTemplates": {
+        "title": "Mẫu cảnh báo"
+      },
+      "plan": {
+        "title": "Gói & tính năng",
+        "description": "Gói của bạn, các tính năng bao gồm và nguồn gốc của từng tính năng."
+      },
+      "wispMemory": {
+        "title": "Bộ nhớ Wisp",
+        "description": "Xem lại, xác nhận và thu hồi những gì Wisp ghi nhớ."
+      },
+      "flowLimits": {
+        "title": "Giới hạn luồng",
+        "description": "Giới hạn chạy hàng tháng và giới hạn token AI cho các luồng."
+      }
+    },
+    "groups": {
+      "account": "Tài khoản & Truy cập",
+      "billing": "Thanh toán & Bàn trợ giúp",
+      "devices": "Thiết bị & Đăng ký",
+      "data": "Tự động hóa & Dữ liệu",
+      "ai": "AI",
+      "integrations": "Tích hợp"
+    },
+    "search": {
+      "label": "Tìm kiếm cài đặt",
+      "placeholder": "Tìm kiếm cài đặt…"
+    },
+    "noResults": "Không có cài đặt nào khớp với tìm kiếm của bạn."
+  },
+  "settingsBillingPage": {
+    "heading": "Cài đặt thanh toán",
+    "description": "Tiền tệ hóa đơn, thuế, cách đánh số, điều khoản và chân trang cho khách hàng của bạn."
+  },
+  "settingsConnectedAppsPage": {
+    "heading": "Ứng dụng đã kết nối",
+    "description": "Ứng dụng AI đã được cấp quyền truy cập vào tenant của bạn qua OAuth. Thu hồi quyền truy cập bất cứ lúc nào — token của ứng dụng sẽ bị từ chối trong vòng 10 phút."
+  },
+  "settingsOrganizationBillingPage": {
+    "backLink": "← Cài đặt tổ chức",
+    "heading": "Cài đặt thanh toán",
+    "description": "Mã số thuế và địa chỉ thanh toán được sử dụng trên hóa đơn của tổ chức này."
+  },
+  "alertsCorrelationsPage": {
+    "heading": "Tương quan cảnh báo",
+    "description": "Xem lại các sự cố cảnh báo được nhóm, bằng chứng được chia sẻ và RCA theo yêu cầu."
+  },
+  "reportsBuilderPage": {
+    "breadcrumbReports": "Báo cáo",
+    "breadcrumbBuilder": "Trình tạo",
+    "heading": "Trình tạo báo cáo",
+    "description": "Thiết kế, lên lịch và phân phối báo cáo với bản xem trước trực tiếp."
+  },
+  "reportsNewPage": {
+    "breadcrumbReports": "Báo cáo",
+    "breadcrumbNew": "Báo cáo mới",
+    "heading": "Tạo báo cáo",
+    "description": "Cấu hình báo cáo mới để theo dõi và phân tích hạ tầng của bạn."
+  },
+  "remoteToolsPage": {
+    "loading": "Đang tải Công cụ từ xa...",
+    "loadingHint": "Chọn một thiết bị để truy cập các công cụ quản lý từ xa"
+  },
+  "remoteTerminalPage": {
+    "loading": "Đang tải Thiết bị đầu cuối từ xa...",
+    "loadingDeviceName": "Đang tải thiết bị..."
+  },
+  "authLayout": {
+    "tagline": "Giám sát & Quản lý từ xa"
+  },
+  "authPage": {
+    "description": "Breeze RMM - Đăng nhập hoặc tạo tài khoản của bạn",
+    "tagline": "Đăng nhập hoặc tạo tài khoản của bạn để bắt đầu."
+  }
+}

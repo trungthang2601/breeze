@@ -924,7 +924,7 @@ userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
           prefs,
           'locale',
           supportedLocales,
-          'en, pt-BR, es-419, fr-FR, fr-CA, de-DE, it-IT, or tr-TR'
+          'en, pt-BR, es-419, fr-FR, fr-CA, de-DE, it-IT, tr-TR, or vi'
         );
       if (validationError) {
         return c.json({ error: validationError }, 400);

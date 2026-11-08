@@ -1,0 +1,2940 @@
+{
+  "lists": {
+    "separator": ", "
+  },
+  "aiInitiator": {
+    "assistant": "Breeze AI",
+    "agent": "AI agent",
+    "flow": "Quy trình",
+    "originUnavailable": "Không có nguồn gốc",
+    "openSession": "Mở cuộc trò chuyện",
+    "openAgentRun": "Mở lượt chạy agent",
+    "tool": "Công cụ: {{name}}",
+    "occurredAt": "Đã xảy ra lúc {{time}}"
+  },
+  "nav": {
+    "fleetPosture": "Trạng thái đội máy",
+    "dashboard": "Tổng quan",
+    "devices": "Thiết bị & Tài sản",
+    "alerts": "Cảnh báo",
+    "approvals": "Phê duyệt",
+    "pendingApprovals": "{{count}} chờ phê duyệt",
+    "pendingApprovals_one": "{{count}} chờ phê duyệt",
+    "pendingApprovals_other": "{{count}} chờ phê duyệt",
+    "tickets": "Phiếu hỗ trợ",
+    "incidents": "Sự cố bảo mật",
+    "remoteAccess": "Truy cập từ xa",
+    "scripts": "Script",
+    "patches": "Bản vá",
+    "vulnerabilities": "Lỗ hổng",
+    "oneDrive": "OneDrive",
+    "aiForOffice": "Breeze AI cho Office",
+    "networkMonitor": "Mạng",
+    "jobs": "Tác vụ",
+    "flows": "Quy trình",
+    "monitoring": "Giám sát",
+    "networkDiscovery": "Phát hiện mạng",
+    "edr": "EDR",
+    "dnsSecurity": "Bảo mật DNS",
+    "pam": "PAM",
+    "userRisk": "Rủi ro người dùng",
+    "sensitiveData": "Dữ liệu nhạy cảm",
+    "peripherals": "Thiết bị ngoại vi",
+    "fileEgress": "Truyền dữ liệu ra ngoài",
+    "cisBenchmarks": "Chuẩn CIS",
+    "complianceBaselines": "Đường cơ sở tuân thủ",
+    "quotes": "Báo giá",
+    "invoices": "Hóa đơn",
+    "contracts": "Hợp đồng",
+    "agreements": "Thỏa thuận",
+    "timesheets": "Bảng chấm công",
+    "productCatalog": "Danh mục sản phẩm",
+    "deviceGroups": "Nhóm thiết bị",
+    "sites": "Chi nhánh",
+    "unassignedDevices": "Thiết bị chưa gán",
+    "configPolicies": "Chính sách cấu hình",
+    "integrations": "Tích hợp",
+    "cloudBackup": "Sao lưu đám mây",
+    "disasterRecovery": "Khôi phục thảm họa",
+    "reports": "Báo cáo",
+    "analytics": "Phân tích",
+    "auditTrail": "Nhật ký kiểm toán",
+    "eventLogs": "Nhật ký sự kiện",
+    "partner": "Đối tác",
+    "billing": "Thanh toán",
+    "organizations": "Tổ chức",
+    "aiUsage": "Mức sử dụng AI",
+    "aiProvidersModels": "Nhà cung cấp & Mô hình AI",
+    "scriptAuthoring": "Soạn thảo script",
+    "toolSources": "Nguồn công cụ",
+    "aiAgents": "AI Agent",
+    "customFields": "Trường tùy chỉnh",
+    "variables": "Biến",
+    "savedFilters": "Bộ lọc đã lưu",
+    "moreSettings": "Thêm cài đặt",
+    "users": "Người dùng",
+    "roles": "Vai trò",
+    "sso": "SSO",
+    "accessReviews": "Đánh giá quyền",
+    "enrollmentKeys": "Khóa đăng ký",
+    "deletionRequests": "Yêu cầu xóa",
+    "quarantinedDevices": "Thiết bị cách ly",
+    "thirdPartyCatalog": "Danh mục bên thứ ba",
+    "connectedAppsAdmin": "Ứng dụng đã kết nối",
+    "sectionSecurity": "Bảo mật",
+    "sectionBackup": "Sao lưu",
+    "sectionReporting": "Báo cáo",
+    "sectionSettings": "Cài đặt",
+    "sectionExtensions": "Tiện ích mở rộng",
+    "llmProviderCatalog": "Danh mục nhà cung cấp LLM",
+    "aiKillSwitch": "Công tắc ngắt AI",
+    "wisp": "Wisp",
+    "sectionAi": "AI",
+    "sectionFleetManagement": "Quản lý đội máy",
+    "sectionBilling": "Thanh toán",
+    "sectionAdministration": "Quản trị",
+    "software": "Phần mềm",
+    "softwareInventory": "Kho phần mềm",
+    "softwarePolicies": "Chính sách phần mềm",
+    "securityOverview": "Tổng quan",
+    "aiRisk": "Rủi ro AI",
+    "deviceBackup": "Sao lưu thiết bị",
+    "sectionServiceDesk": "Bộ phận hỗ trợ",
+    "serviceManagement": "Quản lý dịch vụ",
+    "ticketing": "Quản lý phiếu hỗ trợ",
+    "deliverableTemplates": "Mẫu bàn giao",
+    "securityScans": "Quét IOC",
+    "system": "Hệ thống",
+    "monitorConversion": "Chuyển đổi bộ giám sát",
+    "timeSync": "Đồng bộ thời gian",
+    "aiModels": "Mô hình AI",
+    "autopay": "Thanh toán tự động",
+    "payments": "Thanh toán",
+    "ticketsIncidents": "Sự cố",
+    "ticketsServiceRequests": "Yêu cầu dịch vụ",
+    "ticketsProblems": "Vấn đề",
+    "ticketsChanges": "Thay đổi",
+    "endpointMessages": "Tin nhắn",
+    "securityDetectionRules": "Quy tắc phát hiện",
+    "planAndFeatures": "Gói & tính năng",
+    "breezeAi": "Breeze AI",
+    "workersHeading": "Worker",
+    "agents": "Agent",
+    "runs": "Lượt chạy",
+    "aiTasks": "Tác vụ AI",
+    "findings": "Phát hiện",
+    "impact": "Tác động",
+    "aiKnowledgeSources": "Nguồn kiến thức",
+    "wispLockedServer": "Wisp chạy trên Breeze Cloud. Không khả dụng trên máy chủ này."
+  },
+  "documentTitles": {
+    "dashboard": "Tổng quan",
+    "profileSettings": "Cài đặt hồ sơ"
+  },
+  "richTextEditor": {
+    "toolbarAria": "Định dạng",
+    "bold": "Đậm",
+    "italic": "Nghiêng",
+    "underline": "Gạch chân",
+    "heading3": "Tiêu đề",
+    "heading4": "Tiêu đề phụ",
+    "bulletList": "Danh sách dấu chấm",
+    "orderedList": "Danh sách đánh số",
+    "link": "Liên kết",
+    "linkPrompt": "Nhập URL (http:// hoặc https://)",
+    "linkInvalid": "Chỉ cho phép liên kết http:// và https://",
+    "insertTable": "Bảng",
+    "addRow": "Thêm hàng",
+    "deleteRow": "Xóa hàng",
+    "addColumn": "Thêm cột",
+    "deleteColumn": "Xóa cột",
+    "deleteTable": "Xóa bảng"
+  },
+  "actions": {
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "delete": "Xóa",
+    "edit": "Sửa",
+    "create": "Tạo",
+    "add": "Thêm",
+    "remove": "Gỡ",
+    "close": "Đóng",
+    "confirm": "Xác nhận",
+    "search": "Tìm kiếm",
+    "filter": "Bộ lọc",
+    "refresh": "Làm mới",
+    "export": "Xuất",
+    "download": "Tải xuống",
+    "upload": "Tải lên",
+    "copy": "Sao chép",
+    "retry": "Thử lại",
+    "back": "Quay lại",
+    "next": "Tiếp theo",
+    "previousPage": "Trang trước",
+    "nextPage": "Trang sau",
+    "done": "Hoàn tất",
+    "apply": "Áp dụng",
+    "enable": "Bật",
+    "disable": "Tắt",
+    "view": "Xem",
+    "run": "Chạy",
+    "clear": "Xóa"
+  },
+  "states": {
+    "loading": "Đang tải…",
+    "saving": "Đang lưu…",
+    "saved": "Đã lưu",
+    "error": "Đã có lỗi xảy ra",
+    "empty": "Không tìm thấy kết quả",
+    "enabled": "Đã bật",
+    "disabled": "Đã tắt",
+    "active": "Đang hoạt động",
+    "inactive": "Không hoạt động",
+    "online": "Trực tuyến",
+    "offline": "Ngoại tuyến",
+    "pending": "Đang chờ",
+    "unknown": "Không rõ",
+    "processing": "Đang xử lý…",
+    "copied": "Đã sao chép",
+    "resolving": "Đang phân giải…"
+  },
+  "labels": {
+    "name": "Tên",
+    "description": "Mô tả",
+    "status": "Trạng thái",
+    "type": "Loại",
+    "organization": "Tổ chức",
+    "site": "Chi nhánh",
+    "device": "Thiết bị",
+    "user": "Người dùng",
+    "createdAt": "Đã tạo",
+    "updatedAt": "Đã cập nhật",
+    "actions": "Thao tác",
+    "all": "Tất cả",
+    "yes": "Có",
+    "no": "Không",
+    "none": "Không có",
+    "optional": "Tùy chọn",
+    "required": "Bắt buộc"
+  },
+  "runContext": {
+    "label": "Chạy với tư cách",
+    "scriptDefault": "Mặc định của script",
+    "scriptDefaultNamed": "Mặc định của script ({{context}})",
+    "system": "Hệ thống",
+    "user": "Người dùng đang đăng nhập",
+    "elevated": "Nâng quyền",
+    "unknown": "Chưa ghi nhận",
+    "userInSession": "Người dùng đang đăng nhập (phiên {{session}})",
+    "sessionLabel": "Phiên mục tiêu",
+    "sessionAny": "Mọi phiên hoạt động",
+    "effectiveLabel": "Ngữ cảnh chạy"
+  },
+  "shared": {
+    "accessDenied": {
+      "title": "Từ chối truy cập",
+      "message": "Bạn không có quyền xem nội dung này.",
+      "contactAdmin": "Nếu bạn cho rằng mình phải có quyền truy cập, hãy liên hệ với quản trị viên."
+    },
+    "help": "Trợ giúp",
+    "more": "Thêm",
+    "alpha": {
+      "label": "Alpha",
+      "disclaimer": "Tính năng này đang trong giai đoạn truy cập sớm. Chức năng có thể thay đổi và một số thao tác có thể không hoạt động như mong đợi. Không khuyến nghị sử dụng cho môi trường sản xuất mà chưa thử nghiệm."
+    },
+    "mcp": {
+      "connecting": "Kết nối AI agent?",
+      "title": "Hướng dẫn AI agent của bạn đến đây",
+      "description": "Dán URL này vào MCP client của bạn (Claude.ai, ChatGPT, Cursor, …). Bạn sẽ được chuyển lại đây để ủy quyền kết nối qua OAuth. Bạn thích dùng API key hơn? Hãy gửi tiêu đề X-API-Key với phạm vi ai:read/ai:write."
+    },
+    "progress": {
+      "count": "{{current}} / {{total}}",
+      "remaining": "và {{count}} mục khác…",
+      "remaining_one": "và {{count}} mục khác…",
+      "remaining_other": "và {{count}} mục khác…",
+      "status": {
+        "pending": "Đang chờ",
+        "running": "Đang chạy",
+        "success": "Thành công",
+        "failed": "Thất bại"
+      }
+    },
+    "scope": {
+      "system": "Hệ thống",
+      "partnerWide": "Toàn đối tác"
+    },
+    "toast": {
+      "undo": "Hoàn tác",
+      "dismiss": "Bỏ qua"
+    },
+    "timezoneSelect": {
+      "searchPlaceholder": "Tìm kiếm múi giờ…",
+      "noResults": "Không tìm thấy múi giờ phù hợp",
+      "invalidStored": "“{{value}}” không phải là múi giờ hợp lệ. Hãy chọn một múi giờ trong danh sách — cài đặt này không thể lưu cho đến khi bạn chọn."
+    }
+  },
+  "dashboard": {
+    "greeting": {
+      "welcome": "Xin chào",
+      "morning": "Chào buổi sáng",
+      "afternoon": "Chào buổi chiều",
+      "evening": "Chào buổi tối"
+    },
+    "updated": {
+      "justNow": "Vừa xong",
+      "secondsAgo": "{{count}}s trước",
+      "secondsAgo_one": "{{count}}s trước",
+      "secondsAgo_other": "{{count}}s trước",
+      "minutesAgo": "{{count}}m trước",
+      "minutesAgo_one": "{{count}}m trước",
+      "minutesAgo_other": "{{count}}m trước",
+      "hoursAgo": "{{count}}h trước",
+      "hoursAgo_one": "{{count}}h trước",
+      "hoursAgo_other": "{{count}}h trước"
+    },
+    "refresh": "Làm mới tổng quan",
+    "stats": {
+      "totalDevices": "Tổng thiết bị",
+      "warnings": "Cảnh báo",
+      "critical": "Nghiêm trọng",
+      "openTickets": "Phiếu đang mở",
+      "unassignedCount": "{{count}} chưa gán",
+      "unassignedCount_one": "{{count}} chưa gán",
+      "unassignedCount_other": "{{count}} chưa gán",
+      "patchCompliance": "Tuân thủ bản vá",
+      "loadFailed": "Không thể tải"
+    },
+    "emptyDevices": {
+      "title": "Chưa có thiết bị nào được đăng ký",
+      "description": "Đăng ký thiết bị đầu tiên của bạn để bắt đầu giám sát hệ thống.",
+      "add": "Thêm thiết bị"
+    },
+    "fleetStatus": {
+      "title": "Trạng thái hệ thống",
+      "onlineCount": "{{online}}/{{total}} trực tuyến",
+      "allOnline": "Tất cả thiết bị đều trực tuyến",
+      "healthy": "Hệ thống của bạn hoạt động tốt",
+      "viewOffline": "Xem tất cả {{count}} ngoại tuyến",
+      "other": "Khác"
+    },
+    "activity": {
+      "title": "Hoạt động gần đây",
+      "viewAuditLog": "Xem nhật ký kiểm toán",
+      "empty": "Chưa có hoạt động nào",
+      "emptyDescription": "Các hành động như đăng ký thiết bị, chạy tập lệnh và thay đổi cấu hình sẽ xuất hiện ở đây.",
+      "action": "Hành động",
+      "target": "Mục tiêu",
+      "time": "Thời gian"
+    },
+    "recentlyViewed": {
+      "title": "Tiếp tục phần việc đang làm dở",
+      "kind": {
+        "device": "Thiết bị",
+        "org": "Tổ chức",
+        "ticket": "Phiếu hỗ trợ",
+        "alert": "Cảnh báo",
+        "site": "Chi nhánh",
+        "page": "Trang"
+      }
+    },
+    "alerts": {
+      "title": "Cảnh báo gần đây",
+      "viewAll": "Xem tất cả",
+      "allClear": "Mọi thứ bình thường",
+      "empty": "Không có cảnh báo hoạt động nào trên hệ thống",
+      "fallbackTitle": "Cảnh báo",
+      "noDevicesTitle": "Chưa có thiết bị nào báo cáo",
+      "noDevicesHint": "Cảnh báo sẽ xuất hiện sau khi thiết bị được đăng ký.",
+      "noActiveAlerts": "Không có cảnh báo nào",
+      "deviceStatusUnavailable": "Trạng thái thiết bị không khả dụng — không thể xác nhận phạm vi giám sát hệ thống."
+    },
+    "customizer": {
+      "title": "Trình tùy chỉnh tổng quan",
+      "newName": "Tên tổng quan mới",
+      "widgetLibrary": "Thư viện tiện ích",
+      "widgetLibraryHint": "Kéo tiện ích vào lưới hoặc chạm để thêm.",
+      "emailPlaceholder": "email@company.com",
+      "noSharedUsers": "Chưa có người dùng được chia sẻ nào.",
+      "grid": "Lưới tổng quan",
+      "gridHint": "Kéo để di chuyển. Thay đổi kích thước từ tay cầm góc.",
+      "emptyGrid": "Kéo tiện ích vào đây để bắt đầu xây dựng trang tổng quan.",
+      "trendChart": "Biểu đồ xu hướng",
+      "revertLayout": "Hoàn nguyên bố cục",
+      "saveDashboards": "Lưu tổng quan",
+      "saveFailed": "Lưu thất bại",
+      "shareDashboard": "Chia sẻ tổng quan",
+      "widgetsPlaced": "Đã đặt {{count}} tiện ích",
+      "widgetsPlaced_one": "Đã đặt {{count}} tiện ích",
+      "widgetsPlaced_other": "Đã đặt {{count}} tiện ích",
+      "dashboardSettings": "Cài đặt tổng quan",
+      "layout": "Bố cục",
+      "dashboardName": "Tên tổng quan",
+      "widgetSettings": "Cài đặt tiện ích",
+      "widgetTitle": "Tiêu đề",
+      "refreshInterval": "Tần suất làm mới (phút)",
+      "severityFilter": "Bộ lọc mức độ nghiêm trọng",
+      "chartType": "Loại biểu đồ",
+      "timeRange": "Khoảng thời gian",
+      "showTrend": "Hiển thị đường xu hướng thiết bị",
+      "showLegend": "Hiển thị chú thích",
+      "removeWidget": "Xóa tiện ích",
+      "selectWidget": "Chọn một tiện ích để cấu hình cài đặt.",
+      "summary": "Tiện ích: {{widgets}} · Chia sẻ với: {{shared}}",
+      "preview": {
+        "devices": "{{count}} thiết bị",
+        "online": "{{percent}}% trực tuyến",
+        "activeAlerts": "{{count}} cảnh báo hoạt động",
+        "filter": "Bộ lọc: {{filter}}",
+        "lastRefresh": "Làm mới lần cuối {{minutes}}m"
+      },
+      "severity": {
+        "all": "Tất cả mức độ",
+        "critical": "Chỉ mức nghiêm trọng",
+        "high": "Chỉ mức cao",
+        "medium": "Chỉ mức trung bình",
+        "low": "Chỉ mức thấp"
+      },
+      "chart": {
+        "line": "Đường",
+        "bar": "Thanh",
+        "area": "Vùng"
+      },
+      "ranges": {
+        "24h": "24 giờ qua",
+        "7d": "7 ngày qua",
+        "30d": "30 ngày qua"
+      },
+      "defaultPerRole": "Tổng quan mặc định theo vai trò"
+    },
+    "attention": {
+      "title": "Cần chú ý"
+    },
+    "security": {
+      "title": "Trạng thái bảo mật",
+      "good": "Hoạt động tốt",
+      "fair": "Cần cải thiện",
+      "poor": "Có rủi ro",
+      "empty": "Chưa có dữ liệu bảo mật",
+      "trendLabel": "Xu hướng điểm số 30 ngày",
+      "atRiskCount": "{{count}} thiết bị có rủi ro",
+      "atRiskCount_one": "{{count}} thiết bị có rủi ro",
+      "atRiskCount_other": "{{count}} thiết bị có rủi ro",
+      "threatsCount": "{{count}} mối đe dọa đang hoạt động",
+      "threatsCount_one": "{{count}} mối đe dọa đang hoạt động",
+      "threatsCount_other": "{{count}} mối đe dọa đang hoạt động"
+    },
+    "patch": {
+      "title": "Tuân thủ bản vá",
+      "installed": "Đã cài đặt",
+      "failed": "Thất bại",
+      "devicesCompliant": "{{compliant}} / {{total}} thiết bị đã vá đầy đủ",
+      "criticalPending": "{{count}} bản vá quan trọng đang chờ",
+      "criticalPending_one": "{{count}} bản vá quan trọng đang chờ",
+      "criticalPending_other": "{{count}} bản vá quan trọng đang chờ",
+      "unratedPending": "{{count}} bản vá chưa xếp hạng đang chờ (sẽ không tự động duyệt)",
+      "unratedPending_one": "{{count}} bản vá chưa xếp hạng đang chờ (sẽ không tự động duyệt)",
+      "unratedPending_other": "{{count}} bản vá chưa xếp hạng đang chờ (sẽ không tự động duyệt)",
+      "empty": "Chưa có dữ liệu bản vá",
+      "imagesNotChecked_one": "{{count}} ảnh container chưa được kiểm tra",
+      "imagesNotChecked_other": "{{count}} ảnh container chưa được kiểm tra",
+      "devicesNeedPatches_one": "{{count}} thiết bị cần vá lỗi",
+      "devicesNeedPatches_other": "{{count}} thiết bị cần vá lỗi",
+      "viewPendingDevices": "Xem thiết bị có bản vá đang chờ",
+      "viewFailedDevices": "Xem thiết bị có bản vá thất bại",
+      "viewCriticalDevices": "Xem thiết bị có bản vá quan trọng"
+    },
+    "vuln": {
+      "title": "Lỗ hổng bảo mật",
+      "criticalOpen": "Nghiêm trọng chưa xử lý",
+      "kev": "Đã bị khai thác thực tế",
+      "patchReady": "Có sẵn bản vá",
+      "viewCritical": "Xem CVE quan trọng",
+      "viewPatchReady": "Xem CVE có thể vá",
+      "viewOpen": "Xem CVE chưa xử lý",
+      "totalOpen": "{{count}} phát hiện chưa xử lý",
+      "totalOpen_one": "{{count}} phát hiện chưa xử lý",
+      "totalOpen_other": "{{count}} phát hiện chưa xử lý",
+      "allClear": "Không có lỗ hổng nào chưa xử lý",
+      "kevCves": "{{count}} CVE",
+      "kevCves_one": "{{count}} CVE",
+      "kevCves_other": "{{count}} CVE",
+      "kevDevices": "{{count}} thiết bị",
+      "kevDevices_one": "{{count}} thiết bị",
+      "kevDevices_other": "{{count}} thiết bị",
+      "noDevicesTitle": "Chưa có thiết bị nào gửi báo cáo",
+      "noDevicesHint": "Đăng ký thiết bị để bắt đầu quét lỗ hổng.",
+      "noneReported": "Không có phát hiện chưa xử lý nào",
+      "coverageUnknown": "Trạng thái thiết bị không khả dụng — không thể xác nhận phạm vi quét."
+    },
+    "refreshFailed": "Không thể làm mới — đang hiển thị dữ liệu cũ hơn"
+  },
+  "filters": {
+    "advanced": "Bộ lọc nâng cao",
+    "collapse": "Thu gọn",
+    "computed": "Đã tính toán",
+    "match": "Khớp",
+    "allConditions": "Tất cả điều kiện (AND)",
+    "anyCondition": "Bất kỳ điều kiện nào (OR)",
+    "condition": "Điều kiện",
+    "addCondition": "Thêm điều kiện",
+    "removeCondition": "Xóa điều kiện",
+    "addGroup": "Thêm nhóm",
+    "conditionCount": "{{count}} điều kiện",
+    "conditionCount_one": "{{count}} điều kiện",
+    "conditionCount_other": "{{count}} điều kiện",
+    "activeConditionCount": "{{count}} điều kiện đang hoạt động",
+    "activeConditionCount_one": "{{count}} điều kiện đang hoạt động",
+    "activeConditionCount_other": "{{count}} điều kiện đang hoạt động",
+    "selectField": "Chọn trường",
+    "searchFields": "Tìm kiếm trường…",
+    "noFields": "Không có trường nào khớp với tìm kiếm",
+    "group": {
+      "label": "Nhóm",
+      "match": "Nhóm: Khớp",
+      "all": "Tất cả (AND)",
+      "any": "Bất kỳ (OR)",
+      "remove": "Xóa nhóm"
+    },
+    "saved": {
+      "title": "Bộ lọc đã lưu",
+      "edit": "Sửa bộ lọc",
+      "create": "Tạo bộ lọc",
+      "new": "Bộ lọc mới",
+      "nameRequired": "Tên là bắt buộc",
+      "namePlaceholder": "ví dụ: Windows Servers",
+      "description": "Mô tả (tùy chọn)",
+      "descriptionPlaceholder": "Mô tả nội dung bộ lọc này khớp",
+      "conditions": "Điều kiện",
+      "saveChanges": "Lưu thay đổi",
+      "search": "Tìm kiếm bộ lọc…",
+      "noMatches": "Không có bộ lọc nào khớp với tìm kiếm",
+      "empty": "Chưa có bộ lọc nào được lưu. Hãy tạo một bộ lọc để dùng lại cho các nhóm và bản triển khai.",
+      "createFirst": "Tạo bộ lọc đầu tiên",
+      "created": "Đã tạo {{date}}",
+      "deleteConfirm": "Xóa bộ lọc này?",
+      "duplicate": "Nhân bản",
+      "saveFailed": "Không thể lưu bộ lọc",
+      "deleteFailed": "Không thể xóa bộ lọc",
+      "ownerOrgHint": "Bộ lọc đã lưu thuộc về một tổ chức. Hãy chọn tổ chức sở hữu bộ lọc này."
+    },
+    "targets": {
+      "modes": {
+        "all": "Tất cả thiết bị",
+        "manual": "Chọn thiết bị",
+        "groups": "Nhóm thiết bị",
+        "filter": "Bộ lọc nâng cao"
+      },
+      "allManaged": "Áp dụng cho tất cả thiết bị được quản lý",
+      "totalDevices": "Tổng số {{count}} thiết bị",
+      "selectedDevices": "Đã chọn {{count}} thiết bị",
+      "searchDevices": "Tìm kiếm thiết bị…",
+      "noDevices": "Không tìm thấy thiết bị nào",
+      "selectedGroups": "Đã chọn {{count}} nhóm",
+      "noGroups": "Không có nhóm thiết bị nào",
+      "deviceCount": "{{count}} thiết bị",
+      "loadSaved": "Tải bộ lọc đã lưu:",
+      "select": "Chọn",
+      "dynamic": "Động",
+      "refusedGroup": "Không khả dụng làm mục tiêu: quy tắc của nhóm này khớp với các trường mà thiết bị tự báo cáo ({{fields}})."
+    },
+    "preview": {
+      "title": "Thiết bị khớp",
+      "addConditions": "Thêm điều kiện lọc để xem các thiết bị phù hợp",
+      "matchCount": "thiết bị khớp",
+      "matchCount_one": "thiết bị khớp",
+      "matchCount_other": "thiết bị khớp",
+      "showing": "Hiển thị {{shown}} / {{total}}",
+      "noMatches": "Không có thiết bị nào khớp với tiêu chí lọc hiện tại"
+    },
+    "operators": {
+      "equals": "bằng",
+      "notEquals": "không bằng",
+      "greaterThan": "lớn hơn",
+      "greaterThanOrEquals": "lớn hơn hoặc bằng",
+      "lessThan": "nhỏ hơn",
+      "lessThanOrEquals": "nhỏ hơn hoặc bằng",
+      "contains": "chứa",
+      "notContains": "không chứa",
+      "startsWith": "bắt đầu bằng",
+      "endsWith": "kết thúc bằng",
+      "matches": "khớp với regex",
+      "in": "là một trong",
+      "notIn": "không là một trong",
+      "hasAny": "có bất kỳ",
+      "hasAll": "có tất cả",
+      "isEmpty": "trống",
+      "isNotEmpty": "không trống",
+      "isNull": "trống",
+      "isNotNull": "không trống",
+      "before": "trước",
+      "after": "sau",
+      "between": "trong khoảng",
+      "withinLast": "trong vòng",
+      "notWithinLast": "không trong vòng",
+      "below": "dưới",
+      "atLeast": "ít nhất"
+    },
+    "value": {
+      "noValue": "Không cần giá trị",
+      "enterNumber": "Nhập một số",
+      "to": "đến",
+      "typeAndEnter": "Nhập và nhấn Enter",
+      "regex": "Biểu thức chính quy",
+      "ipExample": "ví dụ: 192.168.1.",
+      "macExample": "ví dụ: AA:BB:CC",
+      "hostnameExample": "ví dụ: srv-web-01",
+      "softwareExample": "ví dụ: Chrome",
+      "enterValue": "Nhập giá trị",
+      "units": {
+        "minutes": "phút",
+        "hours": "giờ",
+        "days": "ngày",
+        "weeks": "tuần",
+        "months": "tháng"
+      },
+      "enumOverrides": {
+        "decommissioned": "Đã xóa"
+      },
+      "softwareName": "Tên phần mềm",
+      "softwareVersion": "Phiên bản phần mềm"
+    }
+  },
+  "account": {
+    "nav": {
+      "label": "Phần tài khoản",
+      "devices": "Thiết bị tin cậy",
+      "connectedApps": "Ứng dụng đã kết nối",
+      "delete": "Xóa tài khoản"
+    },
+    "backToSettings": "Quay lại cài đặt",
+    "returnDashboard": "Quay lại tổng quan",
+    "signedInAs": "Đăng nhập với tư cách",
+    "email": "Email",
+    "reason": "Lý do (tùy chọn)",
+    "revoke": "Thu hồi",
+    "revoked": "Đã thu hồi",
+    "revoking": "Đang thu hồi…",
+    "errors": {
+      "network": "Lỗi mạng. Vui lòng thử lại.",
+      "revokeNetwork": "Lỗi mạng khi thu hồi"
+    },
+    "approval": {
+      "title": "Kiểm tra luồng phê duyệt",
+      "description": "Gửi thông báo đẩy phê duyệt thử nghiệm đến thiết bị Breeze Mobile của bạn. Nhấn vào thông báo sẽ hiển thị màn hình phê duyệt trên điện thoại trong 60 giây. Việc phê duyệt hoặc từ chối không thực hiện hành động thực tế nào — đây chỉ là tính năng kiểm tra.",
+      "sendTitle": "Gửi phê duyệt thử nghiệm đến điện thoại của bạn",
+      "sendDescription": "Chúng tôi sẽ gửi thông báo trong vài giây. Phê duyệt sẽ tự động hết hạn sau 60 giây nếu bạn không thao tác.",
+      "sending": "Đang gửi…",
+      "send": "Gửi phê duyệt thử nghiệm đến điện thoại của tôi",
+      "sent": "Đã gửi. Kiểm tra điện thoại của bạn trong giây lát.",
+      "delivered": "Đã gửi thông báo đẩy tới {{sent}} / {{count}} thiết bị đã đăng ký. Phê duyệt sẽ hết hạn sau 60 giây.",
+      "delivered_one": "Đã gửi thông báo đẩy tới {{sent}} / {{count}} thiết bị đã đăng ký. Phê duyệt sẽ hết hạn sau 60 giây.",
+      "delivered_other": "Đã gửi thông báo đẩy tới {{sent}} / {{count}} thiết bị đã đăng ký. Phê duyệt sẽ hết hạn sau 60 giây.",
+      "noDevices": "Không tìm thấy thiết bị Breeze Mobile nào đã đăng ký trên tài khoản của bạn. Hãy đăng nhập ứng dụng ít nhất một lần rồi thử lại.",
+      "tip": "Mẹo: trang này an toàn để chia sẻ với người đánh giá App Store. Họ có thể đăng nhập bằng tài khoản thử nghiệm được cung cấp, nhấp vào nút và xác minh quy trình phê duyệt từ đầu đến cuối.",
+      "errors": {
+        "send": "Không thể gửi phê duyệt thử nghiệm. Vui lòng thử lại."
+      }
+    },
+    "deletion": {
+      "title": "Xóa tài khoản của bạn",
+      "description": "Gửi yêu cầu xóa sẽ thông báo cho quản trị viên trong tổ chức của bạn. Tài khoản của bạn sẽ được xử lý và xóa trong vòng 30 ngày. Bạn có thể hủy bất cứ lúc nào trước thời hạn đó.",
+      "warningTitle": "Đây là yêu cầu, không phải việc xóa ngay lập tức.",
+      "warningDescription": "Sau khi gửi, quản trị viên từ tổ chức của bạn sẽ nhận được thông báo qua email. Tài khoản của bạn sẽ được xử lý trong vòng 30 ngày. Bạn có thể đăng nhập và hủy bất cứ lúc nào trước đó.",
+      "confirmPassword": "Xác nhận mật khẩu của bạn",
+      "typePrefix": "Nhập",
+      "typeSuffix": "để xác nhận",
+      "reason": "Lý do (tùy chọn)",
+      "reasonPlaceholder": "Giúp chúng tôi cải thiện — điều gì khiến bạn quyết định rời đi?",
+      "submitting": "Đang gửi…",
+      "submit": "Yêu cầu xóa tài khoản",
+      "received": "Đã nhận yêu cầu xóa",
+      "processedByPrefix": "Chúng tôi đã thông báo cho quản trị viên trong tổ chức của bạn. Tài khoản của bạn sẽ được xử lý trước",
+      "reference": "Mã tham chiếu",
+      "submitted": "Đã gửi",
+      "processesBy": "Xử lý bởi",
+      "cancelling": "Đang hủy…",
+      "cancelRequest": "Hủy yêu cầu xóa",
+      "errors": {
+        "load": "Không thể tải trạng thái tài khoản của bạn. Vui lòng làm mới trang.",
+        "submit": "Không thể gửi yêu cầu của bạn. Vui lòng thử lại.",
+        "cancel": "Không thể hủy yêu cầu của bạn. Vui lòng thử lại."
+      }
+    },
+    "devices": {
+      "title": "Thiết bị tin cậy",
+      "description": "Điện thoại và máy tính bảng bạn đã ghép nối với ứng dụng di động Breeze. Các thiết bị này có thể phê duyệt các yêu cầu MCP rủi ro cao thay cho bạn. Hãy thu hồi bất kỳ thiết bị nào bạn không còn sử dụng.",
+      "empty": "Không có thiết bị được ghép nối",
+      "emptyDescription": "Cài đặt ứng dụng di động Breeze và đăng nhập để ghép nối thiết bị. Các yêu cầu phê duyệt sẽ hiển thị trên điện thoại của bạn.",
+      "thisDevice": "Thiết bị này",
+      "blocked": "Đã chặn",
+      "platform": "Nền tảng",
+      "lastActive": "Hoạt động lần cuối",
+      "revokeElsewhere": "Thu hồi từ thiết bị khác",
+      "revokedToast": "Đã thu hồi thiết bị.",
+      "revokeTitle": "Thu hồi {{device}}?",
+      "revokeDescription": "Token thông báo đẩy của thiết bị sẽ bị xóa ngay lập tức và mọi yêu cầu phê duyệt đang chờ sẽ thất bại. Để sử dụng lại ứng dụng, bạn cần ghép nối lại từ bước đăng nhập.",
+      "onlyDeviceTitle": "Đây là thiết bị tin cậy duy nhất của bạn.",
+      "onlyDeviceDescription": "Cho đến khi bạn ghép nối lại từ lần đăng nhập mới, bạn sẽ không thể phê duyệt bất kỳ thứ gì từ điện thoại của mình.",
+      "reasonPlaceholder": "Mất điện thoại, thay thiết bị, …",
+      "revokeAction": "Thu hồi thiết bị"
+    },
+    "apps": {
+      "title": "Ứng dụng đã kết nối",
+      "description": "Các AI client (Claude.ai, ChatGPT, Cursor, …) mà bạn đã ủy quyền thay mặt bạn thực hiện hành động. Thu hồi quyền truy cập bất cứ lúc nào — token sẽ ngừng hoạt động trong vòng 10 phút.",
+      "empty": "Không có ứng dụng kết nối",
+      "emptyDescription": "Khi bạn ủy quyền cho phiên trò chuyện Claude.ai, ChatGPT, Cursor hoặc bất kỳ MCP client nào khác, ứng dụng đó sẽ xuất hiện ở đây để bạn có thể thu hồi sau này.",
+      "authorized": "Đã ủy quyền",
+      "lastUsed": "Sử dụng lần cuối",
+      "lastDecision": "Quyết định gần nhất",
+      "revokedToast": "Đã thu hồi quyền truy cập của {{app}}. Token sẽ ngừng hoạt động trong vòng 10 phút.",
+      "revokeTitle": "Thu hồi {{app}}?",
+      "revokeDescription": "Tất cả các quyền cấp phép và refresh token cho client này sẽ bị xóa. Token sẽ ngừng hoạt động trong vòng 10 phút. Bạn sẽ cần ủy quyền lại vào lần sử dụng tiếp theo.",
+      "onlyAppTitle": "Đây là ứng dụng được ủy quyền duy nhất của bạn.",
+      "onlyAppDescription": "Sau khi thu hồi, bạn sẽ cần ủy quyền lại trước khi bất kỳ AI client nào có thể hoạt động trên tenant của bạn.",
+      "reasonPlaceholder": "Không còn cần thiết, hoạt động đáng ngờ, …",
+      "revokeAction": "Thu hồi quyền"
+    }
+  },
+  "layout": {
+    "logoAlt": "Logo {{brand}}",
+    "breadcrumb": "Đường dẫn điều hướng",
+    "redirectingToLogin": "Đang chuyển hướng đến trang đăng nhập…",
+    "scope": {
+      "catalogLine": "Danh mục — giống nhau cho mọi tổ chức",
+      "fleetLine": "Đang hiển thị tất cả các tổ chức · {{count}}",
+      "orgRequiredLine": "Trang này hiển thị từng tổ chức một — hãy chọn một tổ chức để tiếp tục."
+    },
+    "org": {
+      "allOrganizations": "Tất cả tổ chức",
+      "selectTitle": "Chọn Tổ chức (Cmd+O)",
+      "switching": "Đang chuyển…",
+      "organizations": "Tổ chức",
+      "noneAvailable": "Không có tổ chức nào",
+      "status": {
+        "active": "Đang hoạt động",
+        "trial": "Dùng thử",
+        "suspended": "Đã đình chỉ",
+        "inactive": "Không hoạt động"
+      },
+      "toast": {
+        "showingAll": "Hiển thị tất cả tổ chức",
+        "showing": "Hiển thị {{name}}",
+        "switched": "Đã chuyển sang {{name}}",
+        "linkedOrgUnavailable": "Tổ chức được liên kết không khả dụng. Đang hiển thị lựa chọn hiện tại của bạn."
+      },
+      "fleetView": "Chế độ xem toàn bộ · {{count}} tổ chức",
+      "noSelection": "Chọn tổ chức",
+      "searchOrganizations": "Tìm kiếm tổ chức…",
+      "noMatches": "Không có tổ chức nào khớp",
+      "legacyFilterNotice": "Bộ lọc tổ chức giờ đây tuân theo bộ chọn ở tiêu đề.",
+      "recent": "Gần đây",
+      "pane": {
+        "destinations": {
+          "overview": "Tổng quan",
+          "devices": "Thiết bị",
+          "tickets": "Phiếu hỗ trợ",
+          "alerts": "Cảnh báo",
+          "sites": "Chi nhánh",
+          "billing": "Thanh toán"
+        },
+        "offlineCount": "{{count}} ngoại tuyến",
+        "openCount": "{{count}} đang mở",
+        "criticalCount": "{{count}} nghiêm trọng",
+        "noCritical": "không có",
+        "hint": "Bấm vào tên để chuyển · bấm vào trang để chuyển và đi tới đó"
+      }
+    },
+    "header": {
+      "menu": "Menu",
+      "openMenu": "Mở menu điều hướng",
+      "ai": "Breeze AI",
+      "aiTitle": "Breeze AI (⌘⇧A)",
+      "help": "Trợ giúp và tài liệu",
+      "helpTitle": "Trợ giúp & Tài liệu (Cmd+Shift+H)",
+      "theme": "Giao diện",
+      "themeOptions": {
+        "light": "Sáng",
+        "dark": "Tối",
+        "system": "Hệ thống"
+      },
+      "density": "Độ gọn giao diện",
+      "densityOptions": {
+        "comfortable": "Thoải mái",
+        "compact": "Gọn",
+        "dense": "Rất gọn"
+      },
+      "densityOptionLabel": "Độ gọn giao diện {{label}}",
+      "densityDescription": "Áp dụng cho toàn bộ ứng dụng.",
+      "accountMenu": "Menu tài khoản",
+      "userAvatar": "Ảnh đại diện người dùng",
+      "guest": "Khách",
+      "notSignedIn": "Chưa đăng nhập",
+      "mfaEnabled": "Đã bật 2FA",
+      "account": "Tài khoản",
+      "profile": "Hồ sơ",
+      "apiKeys": "Khóa API",
+      "partnerServicePrincipals": "Service Principal",
+      "billingSupport": "Thanh toán & hỗ trợ",
+      "opening": "Đang mở…",
+      "billing": "Thanh toán",
+      "contactSupport": "Liên hệ hỗ trợ",
+      "activityLog": "Nhật ký hoạt động",
+      "signingOut": "Đang đăng xuất…",
+      "signOut": "Đăng xuất",
+      "billingErrors": {
+        "noRecord": "Không có gói đăng ký nào đang hoạt động. Liên hệ hỗ trợ.",
+        "notConfigured": "Tính năng thanh toán không khả dụng trên bản triển khai này.",
+        "unavailable": "Dịch vụ thanh toán tạm thời không khả dụng. Vui lòng thử lại sau.",
+        "rateLimited": "Quá nhiều yêu cầu. Vui lòng đợi vài phút và thử lại.",
+        "open": "Không thể mở cổng thanh toán",
+        "missingUrl": "Thiếu URL cổng thanh toán trong phản hồi"
+      }
+    },
+    "search": {
+      "prompt": "Tìm kiếm Breeze",
+      "placeholder": "Tìm kiếm thiết bị, tập lệnh, cảnh báo, cài đặt…",
+      "searching": "Đang tìm kiếm…",
+      "startTyping": "Bắt đầu gõ để tìm kiếm trên thiết bị, tập lệnh, cảnh báo và cài đặt.",
+      "noResults": "Không tìm thấy kết quả. Hãy thử truy vấn khác.",
+      "navigationHint": "Dùng phím mũi tên để điều hướng, Enter để mở",
+      "closeHint": "Esc để đóng",
+      "sections": {
+        "quick-actions": "Thao tác nhanh",
+        "recent": "Gần đây",
+        "devices": "Thiết bị",
+        "scripts": "Tập lệnh",
+        "alerts": "Cảnh báo",
+        "users": "Người dùng",
+        "settings": "Cài đặt",
+        "recent-devices": "Thiết bị gần đây",
+        "recent-pages": "Đã truy cập gần đây"
+      },
+      "actions": {
+        "newDevice": "Thiết bị mới",
+        "newDeviceDescription": "Thêm thiết bị vào hệ thống",
+        "runScript": "Chạy tập lệnh",
+        "runScriptDescription": "Thực thi tập lệnh trên thiết bị",
+        "alertRules": "Quy tắc cảnh báo",
+        "alertRulesDescription": "Quản lý cảnh báo trong Chính sách cấu hình",
+        "keyboardShortcuts": "Phím tắt",
+        "keyboardShortcutsDescription": "Mọi phím và tổ hợp phím trên một thẻ",
+        "askBreezeAi": "Hỏi Breeze AI",
+        "askBreezeAiDescription": "Mở bảng bên Breeze AI",
+        "wispHome": "Mở Wisp",
+        "wispHomeDescription": "Đi tới trang chủ Wisp của bạn"
+      },
+      "numberHint": "{{mod}}1–9 để mở"
+    },
+    "notifications": {
+      "title": "Thông báo",
+      "ariaUnread": "Thông báo, {{count}} chưa đọc",
+      "ariaUnread_one": "Thông báo, {{count}} chưa đọc",
+      "ariaUnread_other": "Thông báo, {{count}} chưa đọc",
+      "unread": "{{count}} chưa đọc",
+      "unread_one": "{{count}} chưa đọc",
+      "unread_other": "{{count}} chưa đọc",
+      "markAllRead": "Đánh dấu tất cả đã đọc",
+      "markAllUnread": "Đánh dấu tất cả chưa đọc",
+      "confirmClear": "Xác nhận xóa",
+      "clearAll": "Xóa tất cả",
+      "loading": "Đang tải thông báo…",
+      "empty": "Chưa có thông báo nào.",
+      "recently": "Gần đây",
+      "markUnread": "Đánh dấu chưa đọc",
+      "markRead": "Đánh dấu đã đọc",
+      "preferences": "Tùy chọn thông báo",
+      "types": {
+        "alert": "Cảnh báo",
+        "device": "Thiết bị",
+        "script": "Tập lệnh",
+        "automation": "Tự động hóa",
+        "system": "Hệ thống",
+        "user": "Người dùng",
+        "security": "Bảo mật",
+        "ticket": "Phiếu hỗ trợ",
+        "approval": "Phê duyệt",
+        "ai": "AI",
+        "unknown": "Thông báo"
+      }
+    },
+    "sidebar": {
+      "autoHide": "Tự động ẩn thanh bên",
+      "collapse": "Thu gọn thanh bên",
+      "expand": "Mở rộng thanh bên",
+      "collapseSections": "Thu gọn tất cả mục",
+      "closeMenu": "Đóng menu",
+      "recent": "Gần đây",
+      "hideRecent": "Ẩn mục gần đây",
+      "showRecent": "Hiện mục gần đây"
+    },
+    "orgRequired": {
+      "title": "Chọn một tổ chức",
+      "description": "Trang này hiển thị từng tổ chức một.",
+      "moreHint": "Tìm tổ chức khác? Sử dụng bộ chuyển đổi ở trên (⌘O)."
+    },
+    "orgLoadFailed": {
+      "title": "Không thể tải danh sách tổ chức",
+      "description": "Đã xảy ra lỗi khi tải danh sách tổ chức. Kiểm tra kết nối và thử lại.",
+      "retry": "Thử lại"
+    },
+    "shortcuts": {
+      "title": "Phím tắt",
+      "general": "Chung",
+      "goTo": "Đi đến",
+      "goToHint": "Nhấn g, thả ra, sau đó nhấn phím.",
+      "then": "sau đó",
+      "search": "Tìm kiếm trên Breeze",
+      "searchSlash": "Tìm kiếm (cũng mở bằng phím này)",
+      "cycleSidebar": "Chuyển đổi chế độ thanh bên",
+      "help": "Mở bảng trợ giúp",
+      "showThis": "Hiển thị thẻ này",
+      "orgSwitcher": "Mở bộ chuyển đổi tổ chức",
+      "aiSidebar": "Bật/tắt Breeze AI",
+      "close": "Đóng hộp thoại hoặc menu",
+      "typingNote": "Phím tắt đơn tạm dừng khi bạn đang nhập vào một trường.",
+      "create": "Tạo",
+      "createHint": "Nhấn c, thả ra, sau đó nhấn phím.",
+      "paletteNumber": "Mở kết quả tìm kiếm theo số thứ tự",
+      "newItems": {
+        "ticket": "Phiếu hỗ trợ mới",
+        "quote": "Báo giá mới",
+        "invoice": "Hóa đơn mới",
+        "contract": "Hợp đồng mới",
+        "script": "Script mới"
+      },
+      "charKeysOn": "Phím tắt ký tự đang bật.",
+      "charKeysOff": "Phím tắt ký tự đang tắt. Chỉ phím tắt Ctrl/Cmd hoạt động.",
+      "charKeysManage": "Thay đổi trong cài đặt hồ sơ"
+    }
+  },
+  "migrationBanner": {
+    "message_one": "{{count}} thiết bị đang chạy phiên bản hosted agent trên máy chủ tự lưu trữ này. Hãy chuyển sang phiên bản self-host agent.",
+    "message_other": "{{count}} thiết bị đang chạy phiên bản hosted agent trên máy chủ tự lưu trữ này. Hãy chuyển sang phiên bản self-host agent.",
+    "cta": "Cách di chuyển"
+  },
+  "longTail": {
+    "catalog": {
+      "CatalogEnrichButton": {
+        "aiEstimate": "Ước tính bởi AI: {{guidance}}{{suffix}}",
+        "autoFill": "Tra cứu sản phẩm",
+        "busyMessage": "Đang tra cứu chi tiết sản phẩm — thường mất 5–15 giây.",
+        "defaultGuidanceSuffix": "— nhập giá của bạn bên dưới.",
+        "errors": {
+          "autoFill": "Không thể tự động điền — vui lòng nhập thủ công."
+        },
+        "placeholder": "Tên sản phẩm hoặc SKU",
+        "searching": "Đang tìm kiếm trên web…"
+      },
+      "CatalogItemPicker": {
+        "bundle": "Gói sản phẩm",
+        "itemTypes": {
+          "hardware": "Phần cứng",
+          "software": "Phần mềm",
+          "service": "Dịch vụ"
+        },
+        "noResults": "Không tìm thấy mục danh mục phù hợp.",
+        "placeholder": "Tìm kiếm danh mục theo tên hoặc SKU",
+        "noPriceInCurrency": "Không có giá {{currency}}"
+      },
+      "PolishButton": {
+        "actions": {
+          "applyChanges": "Áp dụng thay đổi"
+        },
+        "defaultLabel": "Làm sạch mô tả",
+        "empty": "trống",
+        "errors": {
+          "enterText": "Nhập tên hoặc mô tả để làm gọn trước.",
+          "polishFailed": "Không thể làm gọn nội dung đó — thử chỉnh sửa thủ công."
+        },
+        "messages": {
+          "applied": "Đã áp dụng văn bản được làm gọn.",
+          "noChanges": "Đã ở trạng thái tốt — không có thay đổi nào được đề xuất."
+        },
+        "noChange": "Không thay đổi",
+        "polishing": "Đang làm gọn…",
+        "preview": {
+          "addedLabel": "Đã thêm (xác minh đây là dữ liệu thực):",
+          "description": "Thao tác này giúp làm sạch câu chữ và định dạng. Các số, thông số đo lường và giá của bạn được giữ nguyên như đã nhập — hãy xem lại phần trước/sau bên dưới trước khi áp dụng.",
+          "dialogTitle": "Xem trước bản làm gọn",
+          "removedLabel": "Đã xóa:",
+          "title": "Xem lại văn bản được làm gọn",
+          "warningDescription": "Kiểm tra tự động phát hiện số, thông số đo lường hoặc mã có thể đã thay đổi. Hãy so sánh kỹ phần trước/sau — AI có thể viết lại nội dung, nhưng không được làm thay đổi thông số kỹ thuật, giá hoặc kiểu máy.",
+          "warningTitle": "⚠️ Kiểm tra kỹ các chi tiết trước khi áp dụng."
+        },
+        "title": "Làm sạch câu chữ bằng AI — số và thông số kỹ thuật được giữ nguyên; hãy xem bản xem trước trước khi áp dụng"
+      }
+    },
+    "monitors": {
+      "MonitorDetailModal": {
+        "actions": {
+          "checkNow": "Kiểm tra ngay"
+        },
+        "consecutiveFailures": "{{count}} lần lỗi liên tiếp",
+        "consecutiveFailures_plural": "{{count}} lần lỗi liên tiếp",
+        "errors": {
+          "generic": "Đã xảy ra lỗi",
+          "loadDetails": "Không thể tải chi tiết giám sát",
+          "triggerCheck": "Không thể kích hoạt kiểm tra"
+        },
+        "fallbackTitle": "Trình giám sát",
+        "labels": {
+          "lastChecked": "Kiểm tra lần cuối: {{time}}",
+          "response": "Phản hồi: {{response}}",
+          "status": "Trạng thái:"
+        },
+        "notFound": "Không tìm thấy trình giám sát",
+        "recentResults": {
+          "response": "Phản hồi",
+          "time": "Thời gian",
+          "title": "Kết quả gần đây"
+        },
+        "status": {
+          "degraded": "Suy giảm"
+        },
+        "time": {
+          "daysAgo": "{{count}} ngày trước",
+          "hoursAgo": "{{count}} giờ trước",
+          "justNow": "Vừa xong",
+          "minutesAgo": "{{count}} phút trước",
+          "never": "Không bao giờ"
+        },
+        "types": {
+          "dnsCheck": "Kiểm tra DNS",
+          "httpCheck": "Kiểm tra HTTP",
+          "icmpPing": "ICMP Ping",
+          "tcpPort": "Cổng TCP"
+        },
+        "certificate": {
+          "title": "Chứng chỉ",
+          "issuer": "Bên phát hành",
+          "expires": "Hết hạn",
+          "observedHost": "Host quan sát được",
+          "state": "Trạng thái",
+          "states": {
+            "observed": "Đã quan sát",
+            "handshakeFailed": "Bắt tay thất bại",
+            "notTls": "Không có TLS"
+          }
+        },
+        "openMonitor": "Mở trình giám sát cho kiểm tra này",
+        "notConverted": "Xem lại kết quả chuyển đổi trên tab Kết quả."
+      },
+      "NetworkMonitorList": {
+        "actions": {
+          "runCheckNow": "Chạy kiểm tra ngay",
+          "viewDetails": "Xem chi tiết",
+          "newCheck": "Kiểm tra mới"
+        },
+        "assetFilter": "Đang lọc trình giám sát theo tài sản đã chọn.",
+        "empty": {
+          "action": "Tạo trình giám sát.",
+          "prefix": "Chưa có kiểm tra mạng nào."
+        },
+        "errors": {
+          "fetchMonitors": "Không thể lấy danh sách giám sát",
+          "generic": "Đã xảy ra lỗi",
+          "triggerCheck": "Không thể kích hoạt kiểm tra"
+        },
+        "filters": {
+          "allStatus": "Tất cả trạng thái",
+          "allTypes": "Tất cả loại"
+        },
+        "headers": {
+          "interval": "Chu kỳ",
+          "lastChecked": "Kiểm tra lần cuối",
+          "response": "Phản hồi",
+          "target": "Mục tiêu",
+          "monitor": "Màn hình theo dõi",
+          "openMonitor": "Mở màn hình theo dõi"
+        },
+        "loading": "Đang tải màn hình theo dõi...",
+        "messages": {
+          "checkQueued": "Đã xếp hàng kiểm tra mạng"
+        },
+        "status": {
+          "degraded": "Giảm hiệu suất"
+        },
+        "time": {
+          "daysAgo": "{{count}} ngày trước",
+          "hoursAgo": "{{count}} giờ trước",
+          "justNow": "Vừa xong",
+          "minutesAgo": "{{count}} phút trước",
+          "never": "Chưa bao giờ"
+        },
+        "types": {
+          "dnsCheck": "Kiểm tra DNS",
+          "httpCheck": "Kiểm tra HTTP",
+          "icmpPing": "ICMP Ping",
+          "tcpPort": "Cổng TCP"
+        },
+        "notConverted": "Chưa chuyển đổi"
+      },
+      "NetworkCheckConversionBanner": {
+        "pending_one": "{{count}} kiểm tra mạng cần xem xét.",
+        "pending_other": "{{count}} kiểm tra mạng cần xem xét.",
+        "review": "Xem lại chuyển đổi",
+        "title": "Chuyển đổi kiểm tra mạng",
+        "convert": "Chuyển đổi {{count}}",
+        "converted_one": "Đã chuyển đổi {{count}} kiểm tra mạng",
+        "converted_other": "Đã chuyển đổi {{count}} kiểm tra mạng",
+        "failed": "Không thể chuyển đổi kiểm tra mạng",
+        "outcome": {
+          "convertible": "Có thể chuyển đổi",
+          "unconvertible": "Không thể chuyển đổi"
+        }
+      }
+    },
+    "psa": {
+      "PsaAlertTicketingCard": {
+        "title": "Phiếu cảnh báo",
+        "scopeNote": "Toàn đối tác; không có ghi đè theo từng tổ chức.",
+        "pausedBanner": "Đã tạm dừng: PSA từ chối thông tin đăng nhập. Chạy Kiểm tra kết nối để tiếp tục.",
+        "yes": "Bật",
+        "no": "Tắt",
+        "selectPlaceholder": "Chọn…",
+        "priorityDefault": "Mặc định của PSA",
+        "closedSuffix": "{{name}} (đã đóng)",
+        "saved": "Đã lưu cài đặt phiếu cảnh báo",
+        "saving": "Đang lưu…",
+        "save": "Lưu",
+        "conflict": "Các cài đặt này đã bị thay đổi ở nơi khác. Các giá trị mới nhất đã được tải; vui lòng xem lại và lưu lại.",
+        "errors": {
+          "save": "Không thể lưu cài đặt phiếu cảnh báo"
+        },
+        "status": {
+          "active": "Phiếu cảnh báo đã được bật cho kết nối này.",
+          "notExternal": "Gắn kết nối này làm PSA quản lý dịch vụ (chế độ ngoài) để sử dụng phiếu cảnh báo.",
+          "disabled": "Phiếu cảnh báo đã bị tắt.",
+          "paused": "Phiếu cảnh báo tạm dừng cho đến khi kết nối PSA hoạt động trở lại.",
+          "companyLinksUnverified": "Xác nhận liên kết công ty cho phiên bản PSA này.",
+          "invalidConfig": "Cài đặt phiếu cảnh báo đã lưu không hợp lệ. Vui lòng xem lại và lưu lại.",
+          "unsupportedProvider": "Phiếu cảnh báo không khả dụng cho nhà cung cấp PSA này.",
+          "credentialsUnusable": "Thông tin xác thực của kết nối này không đầy đủ hoặc không đọc được. Sửa kết nối và nhập lại."
+        },
+        "fields": {
+          "enabled": "Bật phiếu cảnh báo",
+          "board": "Bảng",
+          "openStatus": "Trạng thái phiếu mới",
+          "closedStatus": "Trạng thái đã đóng",
+          "priorityHeading": "Mức ưu tiên PSA theo mức độ nghiêm trọng của cảnh báo",
+          "minSeverity": "Mức độ nghiêm trọng tối thiểu",
+          "minSeverityHelp": "Thấp bao gồm màn hình theo dõi mức cảnh báo",
+          "closeOnResolve": "Đóng phiếu khi cảnh báo được giải quyết",
+          "noteOnAcknowledge": "Thêm ghi chú khi cảnh báo được xác nhận",
+          "confirmCompanyLinks": "Liên kết công ty của tổ chức khớp với phiên bản PSA này"
+        },
+        "severity": {
+          "critical": "Nghiêm trọng",
+          "high": "Cao",
+          "medium": "Trung bình",
+          "low": "Thấp",
+          "info": "Thông tin"
+        },
+        "options": {
+          "error": "Không thể tải tùy chọn từ PSA",
+          "retry": "Thử lại",
+          "truncated": "Chỉ hiển thị các kết quả đầu tiên từ PSA."
+        },
+        "readOnly": {
+          "enabled": "Phiếu cảnh báo"
+        },
+        "loadError": {
+          "message": "Không thể tải cài đặt phiếu cảnh báo",
+          "retry": "Thử lại"
+        },
+        "configInvalid": {
+          "warning": "Không thể đọc cài đặt phiếu cảnh báo đã lưu. Lưu sẽ thay thế chúng.",
+          "confirm": "Thay thế cài đặt không đọc được"
+        }
+      },
+      "PsaCompanyImport": {
+        "title": "Nhập công ty",
+        "subtitle": "Tạo tổ chức từ các công ty trong {{name}}.",
+        "intro": "Công ty được đối chiếu với các tổ chức hiện có của bạn trước. Không có gì được tạo cho đến khi bạn xem danh sách bên dưới và xác nhận.",
+        "capHint": "Tối đa {{cap}} công ty được lấy mỗi lần nhập.",
+        "empty": "Kết nối này không trả về công ty nào.",
+        "alreadyLinked_one": "{{count}} công ty đã bị bỏ qua vì đã được nhập từ kết nối này.",
+        "alreadyLinked_other": "{{count}} công ty đã bị bỏ qua vì đã được nhập từ kết nối này.",
+        "malformed_one": "{{count}} bản ghi không thể đọc được (không có ID hoặc tên hợp lệ) và đã bị bỏ qua.",
+        "malformed_other": "{{count}} bản ghi không thể đọc được (không có ID hoặc tên hợp lệ) và đã bị bỏ qua.",
+        "actions": {
+          "fetch": "Lấy công ty",
+          "fetching": "Đang lấy công ty…",
+          "import": "Nhập {{count}} mục đã chọn",
+          "importing": "Đang nhập…"
+        },
+        "truncated": {
+          "title": "Danh sách công ty một phần",
+          "body": "Danh sách công ty bị cắt ngắn sau {{fetched}} trên tổng số {{cap}} công ty, do đó quá trình nhập này sẽ không hoàn chỉnh. Bất kỳ công ty nào chưa được đọc sẽ không được liên kết.",
+          "cap": "Đã đạt giới hạn {{cap}} công ty mỗi lần nhập sau khi lấy được {{fetched}}, do đó quá trình nhập này sẽ không hoàn chỉnh. Bất kỳ công ty nào vượt quá giới hạn đó sẽ không được đọc và không được liên kết.",
+          "timeBudget": "Kết nối này phản hồi quá chậm, do đó danh sách công ty bị cắt ngắn sau {{fetched}} công ty. Quá trình nhập này sẽ không hoàn chỉnh — các công ty chưa được đọc sẽ không được liên kết.",
+          "pageGuard": "Danh sách công ty trải dài quá nhiều trang và đã dừng sau {{fetched}} công ty. Quá trình nhập này sẽ không hoàn chỉnh — các công ty chưa được đọc sẽ không được liên kết."
+        },
+        "errors": {
+          "previewFailed": "Không thể tải công ty từ kết nối này.",
+          "importFailed": "Không thể nhập công ty."
+        }
+      },
+      "PsaConnectionForm": {
+        "actions": {
+          "testConnection": "Kiểm tra kết nối",
+          "testing": "Đang kiểm tra...",
+          "toggleVisibility": "Hiển thị hoặc ẩn giá trị này"
+        },
+        "credentialsNote": {
+          "jira": "Điền một phương thức xác thực: email cộng với API token cho Jira Cloud, tên người dùng cộng với mật khẩu cho Jira Server, hoặc mã thông báo truy cập cá nhân."
+        },
+        "defaultSubmitLabel": "Lưu kết nối",
+        "fields": {
+          "apiKey": "API key",
+          "apiToken": "API token hoặc key",
+          "clientId": "Client ID",
+          "clientSecret": "Client Secret",
+          "companyId": "Company ID",
+          "connectionName": "Tên kết nối",
+          "defaultQueue": "Dự án hoặc hàng đợi mặc định",
+          "email": "Địa chỉ email",
+          "instanceUrl": "URL phiên bản",
+          "integrationCode": "Mã tích hợp",
+          "password": "Mật khẩu",
+          "personalAccessToken": "Mã thông báo truy cập cá nhân",
+          "privateKey": "Khóa riêng tư",
+          "provider": "Nhà cung cấp",
+          "publicKey": "Khóa công khai",
+          "secret": "Bí mật",
+          "syncDirection": "Chiều đồng bộ",
+          "syncInterval": "Chu kỳ đồng bộ",
+          "username": "Tên người dùng hoặc email"
+        },
+        "help": {
+          "defaultQueue": "Tùy chọn. Được sử dụng khi tạo phiếu từ cảnh báo của Breeze."
+        },
+        "keepExisting": "(để trống để giữ nguyên)",
+        "placeholders": {
+          "apiKey": "api-key",
+          "apiToken": "api-token",
+          "clientId": "oauth-client-id",
+          "clientSecret": "client-secret",
+          "companyId": "company-id",
+          "connectionName": "ví dụ: Jira Production",
+          "defaultQueue": "ví dụ: IT Support",
+          "email": "admin@example.com",
+          "existingCredential": "********",
+          "integrationCode": "integration-code",
+          "password": "password",
+          "personalAccessToken": "personal-access-token",
+          "privateKey": "private-key",
+          "publicKey": "public-key",
+          "secret": "api-secret",
+          "username": "admin@example.com"
+        },
+        "providerHints": {
+          "autotask": "Sử dụng thông tin xác thực người dùng Autotask API của bạn.",
+          "connectwise": "Sử dụng thông tin xác thực hoặc API key của ConnectWise Manage.",
+          "freshservice": "Sử dụng API key hoặc thông tin xác thực OAuth của Freshservice.",
+          "jira": "Sử dụng Atlassian API token và email tài khoản Jira của bạn để xác thực.",
+          "servicenow": "Sử dụng người dùng ServiceNow có quyền REST API.",
+          "zendesk": "Sử dụng API token hoặc thông tin xác thực OAuth client."
+        },
+        "sections": {
+          "basicInformation": "Thông tin cơ bản",
+          "connectionDetails": "Chi tiết kết nối",
+          "credentials": "Thông tin xác thực",
+          "syncSettings": "Đồng bộ phiếu hỗ trợ"
+        },
+        "sync": {
+          "unavailable": "Đồng bộ phiếu hỗ trợ chưa khả dụng. Có thể kiểm tra và sử dụng các kết nối để nhập công ty thành tổ chức; không có dữ liệu phiếu hỗ trợ nào được chuyển giữa Breeze và PSA của bạn."
+        },
+        "testDirtyHint": "Lưu trước — Kiểm tra sẽ dùng thông tin đã lưu, không tính các chỉnh sửa chưa lưu.",
+        "validation": {
+          "nameRequired": "Tên kết nối là bắt buộc",
+          "validUrl": "Phải là URL hợp lệ"
+        },
+        "ownerScope": {
+          "legend": "Quyền sở hữu",
+          "allOrganizations": "Tất cả tổ chức",
+          "partnerWideHint": "(toàn bộ đối tác — PSA riêng của MSP)",
+          "thisOrganizationOnly": "Chỉ tổ chức này",
+          "organization": "Tổ chức"
+        }
+      },
+      "PsaConnectionList": {
+        "actions": {
+          "pause": "Tạm dừng",
+          "resume": "Tiếp tục",
+          "syncNow": "Đồng bộ ngay",
+          "importCompanies": "Nhập công ty"
+        },
+        "connectionCount": "{{filtered}} trên {{total}} kết nối",
+        "empty": {
+          "noConnections": "Kết nối nhà cung cấp PSA để kiểm tra và nhập các công ty.",
+          "noMatches": "Không có kết nối nào khớp với tìm kiếm hoặc bộ lọc của bạn.",
+          "title": "Chưa cấu hình kết nối PSA nào"
+        },
+        "filters": {
+          "allStatuses": "Tất cả trạng thái",
+          "statusFilterLabel": "Trạng thái"
+        },
+        "headers": {
+          "connection": "Kết nối",
+          "lastSync": "Đồng bộ lần cuối",
+          "provider": "Nhà cung cấp"
+        },
+        "never": "Chưa bao giờ",
+        "searchPlaceholder": "Tìm kiếm kết nối",
+        "status": {
+          "paused": "Đã tạm dừng",
+          "syncing": "Đang đồng bộ"
+        },
+        "title": "Kết nối PSA",
+        "allOrgs": "Tất cả tổ chức",
+        "partnerWideTitle": "Kết nối toàn bộ đối tác — được chia sẻ bởi mọi tổ chức",
+        "partnerWideLocked": "Kết nối toàn bộ đối tác — yêu cầu quyền truy cập toàn bộ tổ chức đối tác để sửa đổi"
+      },
+      "PsaConnectionsPage": {
+        "actions": {
+          "addConnection": "Thêm kết nối",
+          "createConnection": "Tạo kết nối",
+          "deleteConnection": "Xóa kết nối",
+          "deleting": "Đang xóa...",
+          "saveChanges": "Lưu thay đổi",
+          "tryAgain": "Thử lại"
+        },
+        "delete": {
+          "activeWarning": "Kết nối này đang hoạt động. Xóa kết nối này sẽ gỡ bỏ ngay lập tức.",
+          "confirm": "Bạn có chắc chắn muốn xóa {{name}} không?",
+          "irreversible": "Hành động này không thể hoàn tác.",
+          "title": "Xóa kết nối PSA",
+          "warningLabel": "Cảnh báo:"
+        },
+        "errors": {
+          "deleteConnection": "Không thể xóa kết nối",
+          "fetchConnections": "Không thể tải kết nối PSA",
+          "generic": "Đã xảy ra lỗi",
+          "saveConnection": "Không thể lưu kết nối",
+          "startSync": "Không thể bắt đầu đồng bộ",
+          "testFailed": "Kiểm tra thất bại",
+          "updateStatus": "Không thể cập nhật trạng thái kết nối"
+        },
+        "loading": "Đang tải kết nối PSA...",
+        "modal": {
+          "addDescription": "Thiết lập kết nối PSA mới cho tổ chức của bạn.",
+          "addTitle": "Thêm kết nối PSA",
+          "editDescription": "Cập nhật chi tiết kết nối PSA.",
+          "editTitle": "Sửa kết nối PSA"
+        },
+        "subtitle": "Kiểm tra kết nối PSA và nhập các công ty thành tổ chức.",
+        "test": {
+          "failedMessage": "Không thể kết nối với nhà cung cấp PSA.",
+          "failedTitle": "Kết nối thất bại",
+          "successMessage": "Thông tin xác thực PSA hợp lệ.",
+          "successTitle": "Kết nối thành công",
+          "testing": "Đang kiểm tra {{name}}",
+          "title": "Kết quả kiểm tra kết nối",
+          "verifyHelp": "Xác minh thông tin xác thực và quyền API cho kết nối này."
+        },
+        "title": "Tích hợp PSA"
+      },
+      "PsaTicketList": {
+        "empty": {
+          "noMatches": "Không có phiếu hỗ trợ nào khớp với tìm kiếm hoặc bộ lọc của bạn.",
+          "noTickets": "Chưa có phiếu hỗ trợ cảnh báo nào. Bật tính năng tạo phiếu cảnh báo trên kết nối ConnectWise Manage đã liên kết để bắt đầu.",
+          "title": "Không có phiếu hỗ trợ PSA"
+        },
+        "filters": {
+          "allStatuses": "Tất cả trạng thái",
+          "statusFilterLabel": "Trạng thái"
+        },
+        "headers": {
+          "linkedAlert": "Cảnh báo đã liên kết",
+          "ticket": "Phiếu hỗ trợ",
+          "updated": "Đã cập nhật"
+        },
+        "searchPlaceholder": "Tìm kiếm phiếu hỗ trợ",
+        "ticketCount": "{{filtered}} trên {{total}} phiếu hỗ trợ",
+        "title": "Phiếu hỗ trợ cảnh báo",
+        "unlinked": "Chưa liên kết"
+      },
+      "PsaAlertTicketingActivity": {
+        "title": "Hoạt động phiếu hỗ trợ",
+        "refresh": "Làm mới",
+        "redrive": "Chạy lại",
+        "loading": "Đang tải hoạt động phiếu hỗ trợ…",
+        "loadFailed": "Không thể tải hoạt động phiếu hỗ trợ. Làm mới để thử lại.",
+        "actionFailed": "Không thể cập nhật hoạt động phiếu hỗ trợ.",
+        "actionSucceeded": "Đã cập nhật hoạt động phiếu hỗ trợ.",
+        "help": "Chạy lại sẽ thử lại các bản tạo và cảnh báo thất bại không có liên kết công ty. Đánh dấu đã xử lý sẽ dừng công việc trên ánh xạ mà không thay đổi phiếu hỗ trợ PSA.",
+        "empty": "Không có phiếu hỗ trợ nào cần xử lý.",
+        "viewAlert": "Xem cảnh báo",
+        "createAnyway": "Vẫn tạo",
+        "markHandled": "Đánh dấu đã xử lý",
+        "duplicateWarning": "Phiếu hỗ trợ có thể đã tồn tại trong PSA. Hãy kiểm tra ở đó trước: thao tác thử lại một lần này có thể tạo bản sao trùng lặp.",
+        "confirmCreate": "Tạo thêm một phiếu hỗ trợ",
+        "cancel": "Hủy",
+        "previous": "Trang trước",
+        "next": "Trang sau",
+        "page": "Trang {{page}} trên {{total}}",
+        "states": {
+          "never_attempted": "Đã xếp hàng",
+          "create_in_flight": "Đang tạo",
+          "created": "Đã tạo",
+          "create_outcome_unknown": "Không rõ kết quả tạo",
+          "rejected": "Đã từ chối",
+          "failed": "Thất bại",
+          "needs_attention": "Cần chú ý",
+          "handled": "Đã xử lý",
+          "skipped_no_company": "Không có liên kết công ty",
+          "skipped_ambiguous_company": "Liên kết công ty mơ hồ",
+          "skipped_resolved_before_create": "Đã giải quyết trước khi tạo"
+        }
+      }
+    },
+    "webhooks": {
+      "ownership": {
+        "label": "Quyền sở hữu",
+        "allOrganizations": "Tất cả tổ chức",
+        "thisOrganizationOnly": "Chỉ tổ chức này",
+        "all": "Tất cả",
+        "organization": "Tổ chức",
+        "test": "Kiểm tra"
+      },
+      "WebhookDeliveryHistory": {
+        "deliveryAttempts": "{{count}} lần thử gửi",
+        "empty": "Chưa có lần thử gửi nào.",
+        "headers": {
+          "action": "Thao tác",
+          "event": "Sự kiện",
+          "response": "Phản hồi",
+          "timestamp": "Thời gian"
+        },
+        "retrying": "Đang thử lại...",
+        "status": {
+          "failed": "Thất bại",
+          "pending": "Đang chờ",
+          "success": "Thành công"
+        },
+        "title": "Lịch sử gửi"
+      },
+      "WebhookForm": {
+        "actions": {
+          "addHeader": "Thêm tiêu đề",
+          "autoGenerate": "Tự động tạo"
+        },
+        "authentication": {
+          "bearer": {
+            "description": "Gửi mã token tĩnh trong phần tiêu đề.",
+            "title": "Token Bearer"
+          },
+          "hmac": {
+            "description": "Ký các yêu cầu bằng mã bí mật dùng chung.",
+            "title": "Chữ ký HMAC"
+          },
+          "subtitle": "Chọn cách đích đến của bạn xác thực webhook.",
+          "title": "Xác thực"
+        },
+        "defaultSubmitLabel": "Lưu webhook",
+        "events": {
+          "alertCreated": {
+            "description": "Kích hoạt khi một cảnh báo được tạo.",
+            "label": "Đã tạo cảnh báo"
+          },
+          "alertResolved": {
+            "description": "Kích hoạt khi một cảnh báo được giải quyết.",
+            "label": "Đã giải quyết cảnh báo"
+          },
+          "deviceOffline": {
+            "description": "Kích hoạt khi một thiết bị ngắt kết nối.",
+            "label": "Thiết bị ngoại tuyến"
+          },
+          "deviceOnline": {
+            "description": "Kích hoạt khi một thiết bị kết nối.",
+            "label": "Thiết bị trực tuyến"
+          },
+          "deviceReinstalled": {
+            "description": "Kích hoạt khi một máy tính cài lại được gắn kết lại với bản ghi thiết bị hiện có.",
+            "label": "Đã cài đặt lại thiết bị"
+          },
+          "scriptCompleted": {
+            "description": "Kích hoạt khi một tập lệnh chạy xong.",
+            "label": "Tập lệnh đã hoàn thành"
+          },
+          "ticketCreated": {
+            "description": "Kích hoạt khi một phiếu hỗ trợ được tạo.",
+            "label": "Đã tạo phiếu hỗ trợ"
+          },
+          "ticketMerged": {
+            "description": "Kích hoạt khi một phiếu hỗ trợ được gộp vào phiếu khác.",
+            "label": "Đã gộp phiếu hỗ trợ"
+          },
+          "ticketCommented": {
+            "description": "Kích hoạt khi một bình luận hoặc ghi chú được thêm vào phiếu hỗ trợ.",
+            "label": "Đã bình luận phiếu hỗ trợ"
+          },
+          "ticketStatusChanged": {
+            "description": "Kích hoạt khi phiếu hỗ trợ thay đổi trạng thái.",
+            "label": "Đã đổi trạng thái phiếu hỗ trợ"
+          },
+          "ticketUpdated": {
+            "description": "Kích hoạt khi các trường của phiếu hỗ trợ được chỉnh sửa.",
+            "label": "Đã cập nhật phiếu hỗ trợ"
+          },
+          "ticketAssigned": {
+            "description": "Kích hoạt khi một phiếu hỗ trợ được phân công hoặc hủy phân công.",
+            "label": "Đã phân công phiếu hỗ trợ"
+          },
+          "migrationWindowClosed": {
+            "description": "Kích hoạt mỗi tổ chức một lần khi cửa sổ di chuyển phiếu hỗ trợ đóng lại, kèm theo số lượng đã nhập.",
+            "label": "Đã đóng cửa sổ di chuyển"
+          },
+          "integrationHealthOpened": {
+            "description": "Kích hoạt khi sự cố kết nối được mở cho kết nối của tổ chức.",
+            "label": "Đã mở sự cố sức khỏe kết nối"
+          },
+          "integrationHealthResolved": {
+            "description": "Kích hoạt khi sự cố sức khỏe kết nối được giải quyết.",
+            "label": "Đã giải quyết sự cố sức khỏe kết nối"
+          },
+          "alertAcknowledged": {
+            "label": "Đã ghi nhận cảnh báo",
+            "description": "Kích hoạt khi một cảnh báo được ghi nhận."
+          },
+          "alertSuppressed": {
+            "label": "Đã chặn cảnh báo",
+            "description": "Kích hoạt khi một cảnh báo bị chặn."
+          },
+          "alertEscalated": {
+            "label": "Đã leo thang cảnh báo",
+            "description": "Kích hoạt khi một bước chính sách leo thang chạy cho cảnh báo vẫn đang hoạt động."
+          }
+        },
+        "fields": {
+          "bearerToken": "Token Bearer",
+          "endpointUrl": "URL điểm cuối",
+          "events": "Sự kiện",
+          "jsonPreview": "Xem trước JSON",
+          "name": "Tên webhook",
+          "signingSecret": "Mã bí mật ký",
+          "templateJson": "Mẫu (JSON)"
+        },
+        "headers": {
+          "empty": "Không có tiêu đề tùy chỉnh nào được cấu hình.",
+          "subtitle": "Tiêu đề tùy chọn được gửi cùng mỗi yêu cầu.",
+          "title": "Tiêu đề tùy chỉnh"
+        },
+        "help": {
+          "bearerToken": "Token này được gửi dưới dạng tiêu đề Authorization.",
+          "signingSecret": "Sử dụng mã bí mật này để xác thực chữ ký webhook."
+        },
+        "invalidJsonPreview": "JSON không hợp lệ trong mẫu.",
+        "otherEvents": {
+          "allEvents": "Tất cả sự kiện (*)",
+          "allEventsHint": "Webhook này đăng ký tất cả sự kiện, vì vậy các sự kiện riêng lẻ bên dưới không được sử dụng. Xóa \"Tất cả sự kiện\" để chọn các sự kiện cụ thể.",
+          "remove": "Xóa {{event}}",
+          "title": "Sự kiện đã đăng ký khác"
+        },
+        "payload": {
+          "previewEmpty": "Bản xem trước xuất hiện khi JSON hợp lệ.",
+          "subtitle": "Xác định cấu trúc payload JSON gửi đến đích đến của bạn.",
+          "title": "Mẫu payload"
+        },
+        "placeholders": {
+          "bearerToken": "Nhập token bearer",
+          "endpointUrl": "https://api.example.com/webhooks",
+          "headerKey": "Khóa tiêu đề",
+          "headerValue": "Giá trị tiêu đề",
+          "name": "Webhook Production",
+          "signingSecret": "Nhập mã bí mật ký"
+        },
+        "subtitle": "Đặt đích đến, sự kiện, xác thực và tiêu đề.",
+        "title": "Cấu hình webhook",
+        "validation": {
+          "eventRequired": "Chọn ít nhất một sự kiện",
+          "headerKeyRequired": "Khóa tiêu đề là bắt buộc",
+          "invalidUrl": "URL không hợp lệ",
+          "nameRequired": "Tên webhook là bắt buộc",
+          "payloadJsonRequired": "Mẫu payload phải là JSON hợp lệ",
+          "secretRequired": "Mã bí mật là bắt buộc đối với xác thực HMAC",
+          "tokenRequired": "Token là bắt buộc đối với xác thực bearer",
+          "urlRequired": "URL là bắt buộc"
+        },
+        "neverDelivered": {
+          "marker": "Chưa từng gửi",
+          "explanation": "Breeze không bao giờ gửi sự kiện này. Sự kiện này sẽ bị xóa khi bạn lưu webhook.",
+          "banner": "Breeze không bao giờ gửi sự kiện này, vì vậy webhook này chưa từng gửi. Hãy chọn sự kiện khác trước khi lưu."
+        },
+        "payloadVersion": {
+          "title": "Phiên bản payload",
+          "v2": {
+            "label": "v2 (khuyên dùng)",
+            "description": "Sự kiện cảnh báo bao gồm tên máy, chi nhánh, tổ chức, trạng thái và liên kết tới cảnh báo."
+          },
+          "v1": {
+            "label": "v1 (gốc)",
+            "description": "Payload cảnh báo gốc, được giữ lại cho các tích hợp hiện có."
+          }
+        }
+      },
+      "WebhookList": {
+        "actions": {
+          "deleteWebhook": "Xóa webhook",
+          "editWebhook": "Sửa webhook",
+          "test": "Kiểm tra"
+        },
+        "empty": "Không tìm thấy webhook nào.",
+        "failedCount": "{{count}} thất bại",
+        "filters": {
+          "allStatuses": "Tất cả trạng thái",
+          "statusFilterLabel": "Trạng thái"
+        },
+        "headers": {
+          "events": "Sự kiện",
+          "lastTriggered": "Kích hoạt lần cuối",
+          "url": "URL"
+        },
+        "moreEvents": "+{{count}} mục khác",
+        "notAvailable": "N/A",
+        "searchPlaceholder": "Tìm theo tên hoặc URL",
+        "successCount": "{{count}} thành công",
+        "title": "Webhook",
+        "webhookCount": "{{filtered}} / {{total}} webhook"
+      },
+      "WebhooksPage": {
+        "actions": {
+          "createWebhook": "Tạo Webhook",
+          "deleting": "Đang xóa...",
+          "editWebhook": "Sửa webhook",
+          "newWebhook": "Webhook mới",
+          "saveChanges": "Lưu Thay Đổi",
+          "testWebhook": "Kiểm tra webhook",
+          "tryAgain": "Thử lại"
+        },
+        "auth": {
+          "bearerToken": "Mã thông báo Bearer",
+          "header": "Tiêu đề: {{header}}",
+          "hmacSignature": "Chữ ký HMAC"
+        },
+        "delete": {
+          "confirm": "Bạn có chắc chắn muốn xóa <strong>{{name}}</strong> không? Hành động này không thể hoàn tác.",
+          "title": "Xóa Webhook"
+        },
+        "details": {
+          "authentication": "Xác thực",
+          "endpoint": "Điểm cuối",
+          "noPayloadTemplate": "Chưa có mẫu payload nào được lưu.",
+          "payloadPreview": "Xem trước mẫu payload",
+          "testEvent": "Sự kiện thử nghiệm",
+          "testEventHelp": "Gửi một payload mẫu cho sự kiện đã chọn đến điểm cuối này.",
+          "title": "Chi tiết webhook"
+        },
+        "emptySelection": "Chọn một webhook để xem lịch sử gửi và công cụ kiểm tra.",
+        "errors": {
+          "deleteWebhook": "Không thể xóa webhook",
+          "disableWebhook": "Không thể vô hiệu hóa webhook",
+          "enableWebhook": "Không thể bật webhook",
+          "fetchDeliveries": "Không thể lấy lịch sử gửi",
+          "fetchWebhooks": "Không thể lấy danh sách webhook",
+          "generic": "Đã xảy ra lỗi",
+          "invalidPayloadTemplate": "Mẫu payload không phải là JSON hợp lệ.",
+          "loadDeliveries": "Không thể tải lịch sử gửi",
+          "retryDelivery": "Không thể thử gửi lại",
+          "saveWebhook": "Không thể lưu webhook",
+          "testFailed": "Kiểm tra thất bại"
+        },
+        "loading": "Đang tải webhook...",
+        "loadingDeliveryHistory": "Đang tải lịch sử gửi...",
+        "modal": {
+          "createTitle": "Tạo Webhook",
+          "editTitle": "Sửa Webhook"
+        },
+        "subtitle": "Gửi sự kiện đến các hệ thống bên ngoài.",
+        "success": {
+          "created": "Đã tạo webhook",
+          "disabled": "Đã vô hiệu hóa webhook",
+          "enabled": "Đã bật webhook",
+          "retryQueued": "Đã đưa vào hàng đợi thử lại",
+          "testQueued": "Đã đưa vào hàng đợi kiểm tra",
+          "updated": "Đã cập nhật webhook",
+          "deleted": "Đã xóa webhook \"{{name}}\""
+        },
+        "title": "Webhook"
+      }
+    },
+    "c2c": {
+      "C2CDashboard": {
+        "status": {
+          "active": "đang hoạt động",
+          "completed": "đã hoàn thành",
+          "failed": "thất bại",
+          "error": "lỗi",
+          "revoked": "đã thu hồi",
+          "running": "đang chạy",
+          "syncing": "đang đồng bộ",
+          "pending": "đang chờ"
+        },
+        "consentSuccess": "Đã tạo kết nối Microsoft 365 thành công",
+        "errors": {
+          "fetchConnections": "Không thể lấy danh sách kết nối",
+          "loadConnections": "Không thể tải kết nối",
+          "fetchConfigs": "Không thể lấy cấu hình",
+          "loadConfigs": "Không thể tải cấu hình",
+          "fetchJobs": "Không thể lấy tác vụ",
+          "loadJobs": "Không thể tải tác vụ",
+          "fetchItems": "Không thể lấy mục",
+          "loadItems": "Không thể tải mục"
+        },
+        "tabs": {
+          "connections": "Kết nối",
+          "configs": "Cấu hình",
+          "jobs": "Tác vụ",
+          "items": "Mục"
+        },
+        "providers": {
+          "microsoft365": "Microsoft 365",
+          "googleWorkspace": "Google Workspace"
+        },
+        "loading": "Đang tải dữ liệu sao lưu đám mây...",
+        "alphaDisclaimer": "Sao lưu đám mây sang đám mây đang trong giai đoạn truy cập sớm. Có thể thiết lập kết nối để đánh giá, nhưng tác vụ đồng bộ và khôi phục chưa được triển khai.",
+        "consentFailed": "Cấp quyền M365 thất bại: {{error}}",
+        "title": "Sao Lưu Đám Mây sang Đám Mây",
+        "description": "Thiết lập kết nối đám mây ngay; quá trình thực thi đồng bộ và khôi phục vẫn đang được phát triển.",
+        "addConnection": "Thêm Kết Nối",
+        "table": {
+          "provider": "Nhà cung cấp",
+          "displayName": "Tên Hiển Thị",
+          "lastSync": "Đồng Bộ Lần Cuối",
+          "scope": "Phạm vi",
+          "targetUsers": "Người Dùng Mục Tiêu",
+          "jobId": "ID Tác Vụ",
+          "started": "Đã Bắt Đầu",
+          "completed": "Đã Hoàn Thành",
+          "transferred": "Đã Truyền",
+          "nameOrSubject": "Tên / Chủ Đề",
+          "path": "Đường dẫn",
+          "size": "Kích thước",
+          "date": "Ngày"
+        },
+        "empty": {
+          "connections": "Chưa cấu hình kết nối nào. Nhấp vào \"Thêm Kết Nối\" để bắt đầu.",
+          "configs": "Chưa có cấu hình sao lưu nào. Hãy thêm kết nối trước, sau đó cấu hình sao lưu.",
+          "jobs": "Chưa có tác vụ đồng bộ nào chạy.",
+          "items": "Không tìm thấy mục nào. Chạy đồng bộ để tạo các mục sao lưu."
+        },
+        "syncNotImplemented": "Tác vụ đồng bộ chưa được triển khai",
+        "targetUsersCount": "{{count}} người dùng",
+        "searchItemsPlaceholder": "Tìm kiếm mục...",
+        "filters": {
+          "allTypes": "Tất cả loại"
+        },
+        "itemTypes": {
+          "email": "Email",
+          "file": "Tệp",
+          "calendar": "Lịch",
+          "contact": "Liên hệ",
+          "chat": "Trò chuyện"
+        },
+        "filterByUserEmail": "Lọc theo email người dùng",
+        "restoreSelected": "Khôi Phục Mục Đã Chọn"
+      },
+      "C2CConnectionWizard": {
+        "errors": {
+          "generateConsentUrl": "Không thể tạo URL cấp quyền",
+          "noConsentUrl": "Không có URL cấp quyền nào được trả về",
+          "initiateConsentFlow": "Không thể khởi tạo luồng cấp quyền",
+          "saveConnection": "Không thể lưu kết nối"
+        },
+        "steps": {
+          "provider": "Nhà cung cấp",
+          "grantAccess": "Cấp Quyền Truy Cập",
+          "confirm": "Xác nhận",
+          "credentials": "Thông tin xác thực",
+          "scope": "Phạm vi"
+        },
+        "title": "Thêm kết nối đám mây",
+        "selectProvider": "Chọn nhà cung cấp đám mây để sao lưu.",
+        "providers": {
+          "microsoft365": "Microsoft 365",
+          "googleWorkspace": "Google Workspace",
+          "azureAd": "Azure AD",
+          "googleCloud": "Google Cloud"
+        },
+        "oneClickTitle": "Tích hợp Microsoft 365 một cú nhấp chuột",
+        "oneClickDescription": "Hệ thống Breeze của bạn đã có sẵn ứng dụng Microsoft 365 được cấu hình trước. Nhấp vào \"Cấp quyền\" để cho phép truy cập sao lưu vào tenant M365 của bạn. Quản trị viên toàn cục (Global Admin) phải phê duyệt yêu cầu cấp quyền.",
+        "displayName": "Tên hiển thị",
+        "displayNamePlaceholder": "Microsoft 365",
+        "manualDisplayNamePlaceholder": "Kết nối M365 của tôi",
+        "selectBackupScope": "Chọn nội dung muốn sao lưu",
+        "scopes": {
+          "mailbox": "Hộp thư Exchange",
+          "onedrive": "OneDrive",
+          "sharepoint": "SharePoint",
+          "teams": "Teams",
+          "gmail": "Gmail",
+          "drive": "Google Drive",
+          "calendar": "Lịch"
+        },
+        "useOwnAppRegistration": "Hoặc sử dụng đăng ký ứng dụng của riêng bạn",
+        "switchToManual": "Chuyển sang nhập thông tin xác thực thủ công",
+        "switchToGrantAccess": "Chuyển sang Cấp quyền bằng một cú nhấp chuột (khuyên dùng)",
+        "enterCredentials": "Nhập thông tin xác thực ứng dụng {{provider}} của bạn.",
+        "tenantId": "ID Tenant",
+        "clientId": "ID Client",
+        "clientIdPlaceholder": "ID Ứng dụng (client)",
+        "clientSecret": "Mật khẩu Client Secret",
+        "clientSecretPlaceholder": "Giá trị client secret",
+        "selectBackupScopeSentence": "Chọn nội dung muốn sao lưu.",
+        "reviewGrantAccess": "Xem lại và cấp quyền. Bạn sẽ được chuyển hướng đến Microsoft để ủy quyền kết nối.",
+        "summary": {
+          "provider": "Nhà cung cấp:",
+          "displayName": "Tên hiển thị:",
+          "scopes": "Phạm vi:",
+          "auth": "Xác thực:",
+          "tenantId": "ID Tenant:"
+        },
+        "platformAppConsent": "Ứng dụng nền tảng (đồng thuận một cú nhấp chuột)",
+        "redirectingToMicrosoft": "Đang chuyển hướng đến Microsoft...",
+        "grantAccessWithMicrosoft": "Cấp quyền với Microsoft",
+        "validationUnavailable": "Xác thực kết nối chưa khả dụng. Lưu kết nối để hoàn tất thiết lập.",
+        "saveConnection": "Lưu kết nối"
+      },
+      "C2CRestoreDialog": {
+        "providers": {
+          "microsoft365": "Microsoft 365",
+          "googleWorkspace": "Google Workspace"
+        },
+        "errors": {
+          "loadBackupItems": "Không thể tải các mục sao lưu",
+          "loadRestoreTargets": "Không thể tải các đích khôi phục",
+          "startRestore": "Không thể bắt đầu khôi phục"
+        },
+        "title": "Khôi phục mục trên đám mây",
+        "description": "Tìm kiếm các mục đã sao lưu ngay; tính năng thực thi khôi phục chưa được tích hợp.",
+        "searchItems": "Tìm kiếm mục",
+        "searchPlaceholder": "Tìm theo tiêu đề hoặc tên tệp",
+        "allTypes": "Tất cả loại",
+        "itemTypes": {
+          "email": "Email",
+          "file": "Tệp",
+          "calendar_event": "Lịch",
+          "contact": "Liên hệ",
+          "chat_message": "Trò chuyện"
+        },
+        "filterByUserEmail": "Lọc theo email người dùng",
+        "reset": "Đặt lại",
+        "selectItems": "Chọn mục",
+        "resultCount": "{{count}} kết quả, đã chọn {{selected}}",
+        "resultCount_one": "{{count}} kết quả, đã chọn {{selected}}",
+        "resultCount_other": "{{count}} kết quả, đã chọn {{selected}}",
+        "restoreSetReady": "Bộ khôi phục đã sẵn sàng",
+        "table": {
+          "item": "Mục",
+          "path": "Đường dẫn",
+          "size": "Kích thước",
+          "date": "Ngày"
+        },
+        "loadingItems": "Đang tải mục...",
+        "emptySearch": "Không có mục sao lưu nào khớp với tìm kiếm hiện tại.",
+        "untitledItem": "Mục không có tiêu đề",
+        "restoreTarget": "Đích khôi phục",
+        "restoreOriginalTenant": "Khôi phục về tenant gốc",
+        "restoreOriginalDescription": "Sử dụng kết nối nguồn đã bảo vệ các mục ban đầu.",
+        "restoreAnotherConnection": "Khôi phục sang kết nối khác",
+        "restoreAnotherDescription": "Chuyển hướng các mục đã chọn sang một đích đám mây hoạt động khác.",
+        "targetConnection": "Kết nối đích",
+        "selectConnection": "Chọn một kết nối",
+        "selectedItems": "Các mục đã chọn",
+        "originalConnection": "Kết nối gốc",
+        "selectTarget": "Chọn đích",
+        "noUser": "Không có người dùng",
+        "restoreDisabled": "Việc gửi yêu cầu khôi phục bị vô hiệu hóa cho đến khi tính năng khôi phục giữa các đám mây được hoàn thiện.",
+        "restoreComingSoon": "Tính năng khôi phục sắp ra mắt"
+      }
+    },
+    "time": {
+      "TimerWidget": {
+        "errors": {
+          "stopFailed": "Không thể dừng bộ đếm giờ."
+        },
+        "ticketFallback": "phiếu hỗ trợ",
+        "stopTimer": "Dừng bộ đếm giờ",
+        "descriptionPlaceholder": "Bạn đã làm việc gì?",
+        "billable": "Tính phí được",
+        "stopAndSave": "Dừng & lưu"
+      },
+      "TimesheetPage": {
+        "friendly": {
+          "adminRequired": "Phê duyệt bảng chấm công yêu cầu quyền quản trị viên.",
+          "approvedImmutable": "Các mục đã phê duyệt chỉ có thể được thay đổi bởi quản trị viên.",
+          "notOwnEntry": "Bạn chỉ có thể chỉnh sửa mục thời gian của chính mình.",
+          "entryBilled": "Mục này đã được lập hóa đơn và không thể xóa. Hãy hủy hóa đơn trước.",
+          "notOwnEntryDelete": "Bạn chỉ có thể xóa mục thời gian của chính mình.",
+          "entryDeleteLost": "Mục này đã thay đổi trong khi đang bị xóa. Tải lại và thử lại.",
+          "entryNotFound": "Mục này không còn tồn tại."
+        },
+        "errors": {
+          "bulkApprovalFailed": "Phê duyệt hàng loạt thất bại. Thử lại.",
+          "saveEntryFailed": "Không thể lưu mục. Thử lại.",
+          "loadTimesheetFailed": "Không thể tải bảng chấm công. Thử lại.",
+          "deleteEntryFailed": "Không thể xóa mục. Thử lại."
+        },
+        "toasts": {
+          "bulkSkipped": "Đã cập nhật {{updated}}, đã bỏ qua {{skipped}} ({{reasons}})",
+          "bulkApproved": "Đã phê duyệt {{count}}",
+          "bulkUnapproved": "Chưa phê duyệt {{count}}",
+          "entryUpdated": "Đã cập nhật mục",
+          "entryDeleted": "Đã xóa mục"
+        },
+        "title": "Bảng chấm công",
+        "selectTechnician": "Chọn kỹ thuật viên",
+        "myTimesheet": "Bảng chấm công của tôi",
+        "previousWeek": "Tuần trước",
+        "weekOf": "Tuần từ {{week}}",
+        "nextWeek": "Tuần sau",
+        "thisWeek": "Tuần này",
+        "adminNotice": "Xem bảng chấm công của kỹ thuật viên khác yêu cầu quyền quản trị viên — đang hiển thị của bạn.",
+        "selectedCount": "Đã chọn {{count}}",
+        "approveSelected": "Phê duyệt mục đã chọn",
+        "unapprove": "Bỏ phê duyệt",
+        "billableDuration": " · {{duration}} tính phí được",
+        "noEntries": "Không có mục nào",
+        "billable": "Tính phí được",
+        "rate": "Đơn giá",
+        "selectEntry": "Chọn mục {{id}}",
+        "noDescription": "Không có mô tả",
+        "approved": "Đã duyệt",
+        "nonBillable": "không tính phí",
+        "running": "đang chạy",
+        "editEntry": "Sửa mục {{id}}",
+        "total": "Tổng: {{duration}}",
+        "billableTotal": "Tính phí: {{duration}}",
+        "billedVsWorked": "Đã làm {{worked}} h · Đã tính phí {{billed}} h",
+        "deleteEntry": "Xóa mục {{id}}",
+        "deleteConfirmTitle": "Xóa mục thời gian?",
+        "deleteConfirmMessage": "Thao tác này sẽ xóa vĩnh viễn mục {{duration}} trên phiếu hỗ trợ {{ticket}}. Không thể hoàn tác.",
+        "deleteConfirmMessageNoTicket": "Thao tác này sẽ xóa vĩnh viễn mục {{duration}}. Không thể hoàn tác.",
+        "noteInvoiceCue": "Khách hàng sẽ nhìn thấy ghi chú này trên hóa đơn trừ khi cài đặt thanh toán của bạn ẩn ghi chú."
+      },
+      "sourceBadge": {
+        "timer": "Bộ hẹn giờ",
+        "location": "Từ vị trí",
+        "remote_session": "Từ phiên điều khiển từ xa",
+        "support_session": "Từ Quick Support"
+      }
+    },
+    "snmp": {
+      "SNMPTemplateEditor": {
+        "errors": {
+          "copyOid": "Không thể sao chép OID vào khay nhớ tạm",
+          "templateNameRequired": "Tên mẫu là bắt buộc",
+          "oidRequired": "Cần ít nhất một OID",
+          "validateOids": "Không thể xác thực OID",
+          "oidValidationFailedFor": "Xác thực OID thất bại cho {{oid}}",
+          "saveTemplate": "Không thể lưu mẫu",
+          "fetchTemplates": "Không thể tải các mẫu SNMP",
+          "loadTemplates": "Không thể tải các mẫu",
+          "loadOidBrowser": "Không thể tải kết quả trình duyệt OID"
+        },
+        "loading": "Đang tải mẫu SNMP...",
+        "title": "Trình chỉnh sửa mẫu SNMP",
+        "description": "Xác định các OID được thu thập cho một loại thiết bị.",
+        "selectTemplate": "Chọn mẫu...",
+        "newTemplate": "Mẫu mới",
+        "templateDetails": "Chi tiết mẫu",
+        "vendor": "Nhà cung cấp",
+        "deviceType": "Loại thiết bị",
+        "placeholders": {
+          "name": "Cisco Core",
+          "vendor": "Cisco",
+          "deviceType": "Core Switch",
+          "description": "Switch băng thông cao với nhiều đường lên",
+          "oidName": "Thời gian hoạt động hệ thống",
+          "oidDescription": "OID này đo lường gì"
+        },
+        "oidList": "Danh sách OID",
+        "oidListDescription": "Cấu hình các OID cung cấp chỉ số và ngưỡng.",
+        "importFromFile": "Nhập từ tệp",
+        "addOid": "Thêm OID",
+        "emptyOids": "Chưa cấu hình OID nào. Nhấp vào \"Thêm OID\" để bắt đầu.",
+        "oid": "OID",
+        "oidTypes": {
+          "gauge": "Gauge",
+          "counter64": "Counter64",
+          "timeTicks": "TimeTicks",
+          "integer": "Integer",
+          "octetString": "OctetString"
+        },
+        "validated": "Đã xác thực",
+        "oidValidationFailed": "Xác thực OID thất bại",
+        "notValidatedYet": "Chưa xác thực",
+        "oidBrowser": "Trình duyệt OID",
+        "oidBrowserDescription": "Tìm kiếm các OID có sẵn và thêm vào mẫu này.",
+        "searchByOidOrName": "Tìm kiếm theo OID hoặc tên",
+        "loadingOidBrowser": "Đang tải trình duyệt OID...",
+        "noMatchingOids": "Không tìm thấy OID phù hợp.",
+        "noDescriptionProvided": "Không có mô tả nào được cung cấp.",
+        "validatingOids": "Đang xác thực OID...",
+        "saving": "Đang lưu...",
+        "saveTemplate": "Lưu mẫu"
+      },
+      "SNMPTemplateList": {
+        "errors": {
+          "fetchTemplates": "Không thể tải các mẫu SNMP",
+          "loadTemplates": "Không thể tải các mẫu SNMP",
+          "deleteTemplate": "Không thể xóa mẫu"
+        },
+        "toasts": {
+          "templateDeleted": "Đã xóa mẫu \"{{name}}\""
+        },
+        "builtIn": "Tích hợp sẵn",
+        "loading": "Đang tải mẫu SNMP...",
+        "title": "Mẫu SNMP",
+        "templatesAvailable": "{{count}} mẫu có sẵn",
+        "addTemplate": "Thêm mẫu",
+        "vendor": "Nhà cung cấp",
+        "deviceType": "Loại thiết bị",
+        "oidCount": "Số lượng OID",
+        "usage": "Sử dụng",
+        "empty": "Không tìm thấy mẫu SNMP nào.",
+        "deleteDialog": {
+          "title": "Xóa mẫu SNMP",
+          "message": "Bạn có chắc chắn muốn xóa \"{{name}}\"? Mọi thiết bị sử dụng mẫu này sẽ cần được gán lại.",
+          "confirmLabel": "Xóa mẫu"
+        }
+      }
+    },
+    "monitoring": {
+      "MonitoringAssetsDashboard": {
+        "status": {
+          "online": "Trực tuyến",
+          "warning": "Cảnh báo",
+          "offline": "Ngoại tuyến",
+          "maintenance": "Bảo trì",
+          "unknown": "Không rõ"
+        },
+        "relative": {
+          "never": "Không bao giờ",
+          "justNow": "Vừa xong",
+          "minutesAgo": "{{count}} phút trước",
+          "hoursAgo": "{{count}} giờ trước",
+          "daysAgo": "{{count}} ngày trước"
+        },
+        "errors": {
+          "fetchAssets": "Không thể tải tài sản giám sát",
+          "generic": "Đã xảy ra lỗi",
+          "loadDetails": "Không thể tải chi tiết giám sát",
+          "update": "Không thể cập nhật",
+          "disableMonitoring": "Không thể tắt giám sát",
+          "communityRequired": "Chuỗi cộng đồng (community string) là bắt buộc cho SNMP v1/v2c",
+          "usernameRequired": "Tên người dùng là bắt buộc cho SNMP v3",
+          "saveSettings": "Không thể lưu cài đặt giám sát"
+        },
+        "configuredPaused": "Đã cấu hình (Đã tạm dừng)",
+        "notConfigured": "Chưa cấu hình",
+        "paused": "Đã tạm dừng",
+        "everyInterval": "mỗi {{interval}}",
+        "lastPolled": "Đã thăm dò lần cuối {{time}}",
+        "configureMonitoring": "Cấu hình giám sát",
+        "pauseSnmpPolling": "Tạm dừng thăm dò SNMP",
+        "resumeSnmpPolling": "Tiếp tục thăm dò SNMP",
+        "disableSnmpMonitoring": "Tắt giám sát SNMP",
+        "needsOrgSelection": "Tài sản giám sát mạng được giới hạn trong một tổ chức duy nhất.",
+        "loadingAssets": "Đang tải tài sản giám sát...",
+        "showingAllDiscoveredAssets": "Hiển thị tất cả tài sản được phát hiện",
+        "showingMonitoredAssets": "Hiển thị tài sản được giám sát",
+        "manageNetworkChecks": "Quản lý kiểm tra mạng",
+        "summary": {
+          "configured": "Đã cấu hình",
+          "snmpWarnings": "Cảnh báo SNMP",
+          "shown": "Đã hiển thị"
+        },
+        "assets": "Tài sản",
+        "assetsDescription": "Góc nhìn thống nhất về việc thăm dò SNMP và kiểm tra mạng cho mỗi tài sản được phát hiện.",
+        "table": {
+          "asset": "Tài sản",
+          "overall": "Tổng thể",
+          "reachability": "Khả năng kết nối",
+          "collection": "Thu thập"
+        },
+        "ip": "IP",
+        "snmp": "SNMP",
+        "networkChecks": "Kiểm tra mạng",
+        "emptyAssets": "Không tìm thấy tài sản.",
+        "lastSeen": "Hoạt động lần cuối {{time}}",
+        "activeRatio": "{{active}}/{{total}} hoạt động",
+        "loadingDetails": "Đang tải chi tiết giám sát...",
+        "statusLine": "Trạng thái: {{status}}",
+        "createManageChecks": "Tạo và quản lý kiểm tra cho mỗi tài sản.",
+        "addNetworkCheck": "Thêm kiểm tra mạng",
+        "openChecks": "Mở kiểm tra",
+        "snmpPolling": "Truy vấn SNMP",
+        "snmpPollingDescription": "Cấu hình truy vấn SNMP theo từng tài sản. Mật khẩu không hiển thị; để trống để giữ nguyên giá trị hiện tại.",
+        "snmpVersion": "Phiên bản SNMP",
+        "snmpVersions": {
+          "v1": "v1",
+          "v2c": "v2c",
+          "v3": "v3"
+        },
+        "pollingIntervalSeconds": "Tần suất truy vấn (giây)",
+        "communityString": "Community String",
+        "leaveBlankToKeepCurrent": "(để trống để giữ nguyên)",
+        "communityPlaceholder": "public",
+        "username": "Tên đăng nhập",
+        "authProtocol": "Giao thức xác thực",
+        "authProtocols": {
+          "md5": "MD5",
+          "sha": "SHA",
+          "sha256": "SHA-256"
+        },
+        "authPassword": "Mật khẩu xác thực",
+        "leaveBlankToKeep": "Để trống để giữ nguyên",
+        "privacyProtocol": "Giao thức bảo mật",
+        "privacyProtocols": {
+          "des": "DES",
+          "aes": "AES",
+          "aes256": "AES-256"
+        },
+        "privacyPassword": "Mật khẩu bảo mật",
+        "template": "Mẫu",
+        "noTemplate": "Không có mẫu",
+        "recentSnmpMetrics": "Chỉ số SNMP gần đây",
+        "oid": "OID",
+        "value": "Giá trị",
+        "time": "Thời gian",
+        "disableActiveMonitoring": "Tắt giám sát chủ động",
+        "areYouSure": "Bạn có chắc chắn không?",
+        "disabling": "Đang tắt...",
+        "yesDisable": "Có, tắt",
+        "monitoringNotActive": "Giám sát chưa được bật cho tài sản này.",
+        "saving": "Đang lưu...",
+        "openSettings": "Cài đặt…",
+        "reachability": {
+          "responding": "Đang phản hồi",
+          "notResponding": "Không phản hồi",
+          "unverified": "Chưa xác minh",
+          "sources": {
+            "networkCheck": "kiểm tra mạng",
+            "probe": "kiểm tra ngay",
+            "scan": "quét",
+            "unifi": "UniFi",
+            "snmp": "SNMP"
+          }
+        },
+        "collectionState": {
+          "collecting": "Đang thu thập",
+          "partial": "Một phần",
+          "no_template": "Không có mẫu",
+          "failing": "Đang lỗi",
+          "paused": "Đã tạm dừng",
+          "never_polled": "Chưa từng truy vấn",
+          "not_configured": "Chưa cấu hình"
+        }
+      },
+      "MonitoringPage": {
+        "tabs": {
+          "assets": "Tài sản",
+          "templates": "Mẫu SNMP",
+          "results": "Kết quả"
+        },
+        "title": "Mạng",
+        "description": "Tài sản, mẫu SNMP và kết quả kiểm tra mạng. Các kiểm tra được tạo dưới dạng bộ giám sát trong Cảnh báo.",
+        "newCheck": "Kiểm tra mới"
+      }
+    },
+    "fleet": {
+      "FleetOrchestrationPage": {
+        "errors": {
+          "loadFailed": "Không thể tải thống kê hệ thống"
+        },
+        "title": "Phát hiện",
+        "description": "Mẫu đa thiết bị được tìm thấy, xử lý một lần thay vì nhiều lần",
+        "partialWarning": "Một số dữ liệu có thể không đầy đủ. Không thể tải: {{endpoints}}",
+        "cards": {
+          "policies": "Chính sách",
+          "deployments": "Triển khai",
+          "failedCount": "{{count}} thất bại",
+          "patches": "Bản vá",
+          "alerts": "Cảnh báo",
+          "groups": "Nhóm",
+          "automations": "Tự động hóa",
+          "maintenance": "Bảo trì",
+          "reports": "Báo cáo"
+        },
+        "aiFleetActions": "Hành động AI cho hệ thống",
+        "aiFleetActionsHint": "Nhấn để hỏi Breeze AI",
+        "quickActions": {
+          "checkCompliance": "Kiểm tra tuân thủ",
+          "activeDeployments": "Triển khai đang hoạt động",
+          "criticalPatches": "Bản vá quan trọng",
+          "alertOverview": "Tổng quan cảnh báo",
+          "maintenanceWindows": "Khung thời gian bảo trì",
+          "runAutomations": "Chạy tự động hóa",
+          "deviceGroups": "Nhóm thiết bị",
+          "generateReport": "Tạo báo cáo"
+        },
+        "deploymentStatus": "Trạng thái triển khai",
+        "alertBreakdown": "Phân tích cảnh báo",
+        "patchPosture": "Tình trạng bản vá",
+        "policyCompliance": "Tuân thủ chính sách",
+        "installed": "Đã cài đặt",
+        "nonCompliant": "Không tuân thủ",
+        "status": {
+          "completed": "Đã hoàn thành",
+          "failed": "Thất bại"
+        },
+        "severity": {
+          "critical": "Quan trọng",
+          "high": "Cao",
+          "medium": "Trung bình",
+          "low": "Thấp"
+        }
+      },
+      "FindingsFeed": {
+        "title": "Phát hiện hệ thống",
+        "description": "Mẫu đa thiết bị đáng xử lý một lần thay vì nhiều lần",
+        "filters": {
+          "orgLabel": "Lọc theo tổ chức",
+          "kindLabel": "Lọc theo loại phát hiện",
+          "severityLabel": "Lọc theo mức độ nghiêm trọng",
+          "statusLabel": "Lọc theo trạng thái",
+          "allOrgs": "Tất cả tổ chức",
+          "allKinds": "Tất cả loại phát hiện",
+          "allSeverities": "Tất cả mức độ nghiêm trọng"
+        },
+        "kinds": {
+          "metricAnomalyPattern": "Bất thường chỉ số",
+          "logCorrelation": "Tương quan nhật ký",
+          "reliabilityOffenders": "Sự cố độ bền"
+        },
+        "severities": {
+          "critical": "Quan trọng",
+          "error": "Lỗi",
+          "warning": "Cảnh báo",
+          "info": "Thông tin"
+        },
+        "statuses": {
+          "open": "Mở",
+          "acknowledged": "Đã xác nhận",
+          "dismissed": "Đã bỏ qua",
+          "resolved": "Đã giải quyết"
+        },
+        "status": {
+          "active": "Mở & đã xác nhận",
+          "dismissed": "Đã bỏ qua",
+          "resolved": "Đã giải quyết"
+        },
+        "deviceCount": "{{count}} thiết bị",
+        "deviceCount_one": "{{count}} thiết bị",
+        "deviceCount_other": "{{count}} thiết bị",
+        "showing": "Đang hiển thị {{shown}} trên {{total}}",
+        "loadMore": "Tải thêm",
+        "empty": {
+          "title": "Hệ thống đang sạch",
+          "noMatchesTitle": "Không có kết quả phù hợp",
+          "body": "Không có kết quả nào khớp với các bộ lọc này."
+        },
+        "errors": {
+          "loadFailed": "Không thể tải kết quả hệ thống",
+          "banner": "Chúng tôi không thể tải kết quả hệ thống"
+        }
+      },
+      "FindingDrawer": {
+        "heading": "Chi tiết kết quả",
+        "meta": {
+          "firstSeen": "Phát hiện lần đầu {{when}}",
+          "lastSeen": "Phát hiện lần cuối {{when}}"
+        },
+        "summaryHeading": "Tổng quan",
+        "resolvedNote": {
+          "heading": "Lý do đóng",
+          "body": "Kết quả này đã được giải quyết vì tín hiệu cơ bản đã biến mất. Nó sẽ xuất hiện lại dưới dạng kết quả mới nếu mẫu sự cố lặp lại.",
+          "reason": "Lý do giải quyết: {{reason}}"
+        },
+        "dismissNotesHeading": "Ghi chú bỏ qua",
+        "evidenceHeading": "Bằng chứng",
+        "membersHeading": "Thiết bị bị ảnh hưởng",
+        "membersEmpty": "Không có thiết bị thành viên nào được ghi nhận cho kết quả này.",
+        "table": {
+          "device": "Thiết bị",
+          "source": "Nguồn",
+          "lastSeen": "Hoạt động lần cuối"
+        },
+        "runsHeading": "Lịch sử khắc phục",
+        "runsEmpty": "Chưa có quy trình khắc phục nào được chạy cho kết quả này.",
+        "runCounts": "{{succeeded}} thành công, {{failed}} thất bại, {{skipped}} bỏ qua trong tổng số {{targets}} mục tiêu",
+        "runStatuses": {
+          "queued": "Đã xếp hàng",
+          "running": "Đang chạy",
+          "partial": "Một phần",
+          "succeeded": "Thành công",
+          "failed": "Thất bại",
+          "cancelled": "Đã hủy"
+        },
+        "dismiss": {
+          "notesLabel": "Tại sao bạn bỏ qua việc này? (bắt buộc)",
+          "notesPlaceholder": "Dương tính giả đã biết, theo dõi ở nơi khác, chấp nhận rủi ro…",
+          "confirm": "Bỏ qua kết quả"
+        },
+        "actions": {
+          "remediate": "Khắc phục trên {{count}} thiết bị",
+          "remediate_one": "Khắc phục trên {{count}} thiết bị",
+          "remediate_other": "Khắc phục trên {{count}} thiết bị",
+          "remediateDisabledReason": "Không còn thiết bị nào trong kết quả này để khắc phục.",
+          "acknowledge": "Xác nhận",
+          "dismiss": "Bỏ qua",
+          "reopen": "Mở lại"
+        },
+        "errors": {
+          "loadFailed": "Không thể tải kết quả",
+          "lifecycleFailed": "Không thể cập nhật kết quả"
+        },
+        "resolutionReasons": {
+          "sourceCleared": "tín hiệu cơ bản đã biến mất"
+        }
+      },
+      "FixPicker": {
+        "title": "Khắc phục kết quả",
+        "actions": {
+          "script": "Chạy tập lệnh",
+          "scriptHint": "Chọn một tập lệnh từ thư viện của bạn và điền các tham số.",
+          "restartService": "Khởi động lại dịch vụ",
+          "restartServiceHint": "Khởi động lại một dịch vụ có tên trên mọi thiết bị được chọn.",
+          "reboot": "Khởi động lại thiết bị",
+          "rebootHint": "Khởi động lại các thiết bị được chọn ngay khi lệnh chạy được gửi đi."
+        },
+        "chooseScript": "Chọn tập lệnh…",
+        "changeScript": "Đổi tập lệnh",
+        "selectedScript": "Tập lệnh: {{name}}",
+        "serviceNameLabel": "Tên dịch vụ",
+        "serviceNamePlaceholder": "ví dụ: Spooler",
+        "rebootWarning": "Các thiết bị được chọn sẽ khởi động lại ngay khi lệnh này được gửi đi. Các phiên hoạt động sẽ kết thúc và công việc chưa lưu sẽ bị mất.",
+        "targetsHeading": "Thiết bị cần khắc phục",
+        "selectAll": "Chọn tất cả",
+        "selectNone": "Bỏ chọn",
+        "selectedCount": "Đã chọn {{selected}} trên {{total}} thiết bị",
+        "noTargets": "Chọn ít nhất một thiết bị để tiếp tục.",
+        "osIncompatibleNotice": "{{count}} thiết bị không thể chạy tập lệnh này và đã bị loại trừ. Thao tác này chỉ hỗ trợ {{os}}.",
+        "osIncompatibleNotice_one": "{{count}} thiết bị không thể chạy tập lệnh này và đã bị loại trừ. Thao tác này chỉ hỗ trợ {{os}}.",
+        "osIncompatibleNotice_other": "{{count}} thiết bị không thể chạy tập lệnh này và đã bị loại trừ. Thao tác này chỉ hỗ trợ {{os}}.",
+        "osIncompatibleReason": "Yêu cầu {{os}}",
+        "confirmAction": "Bản sửa lỗi đã chọn",
+        "confirmTargets": "Thiết bị",
+        "confirmRestartService": "Khởi động lại dịch vụ {{name}}",
+        "confirmRebootNotice": "{{count}} thiết bị sẽ khởi động lại ngay lập tức.",
+        "confirmRebootNotice_one": "{{count}} thiết bị sẽ khởi động lại ngay lập tức.",
+        "confirmRebootNotice_other": "{{count}} thiết bị sẽ khởi động lại ngay lập tức.",
+        "confirm": "Bắt đầu khắc phục",
+        "dispatchedSummary": "{{count}} thiết bị là mục tiêu của lần chạy này.",
+        "dispatchedSummary_one": "{{count}} thiết bị là mục tiêu của lần chạy này.",
+        "dispatchedSummary_other": "{{count}} thiết bị là mục tiêu của lần chạy này.",
+        "skippedHeading": "Thiết bị bị bỏ qua",
+        "skipReasons": {
+          "siteDenied": "Bạn không có quyền truy cập chi nhánh",
+          "notMember": "Không còn bị ảnh hưởng bởi kết quả này",
+          "decommissioned": "Thiết bị đã bị xóa",
+          "timeout": "Hết thời gian sau 30 phút",
+          "dispatchEnqueueFailed": "Chưa bao giờ gửi — xếp hàng thất bại",
+          "maintenanceWindow": "Thiết bị đang trong thời gian bảo trì"
+        },
+        "viewProgress": "Xem tiến trình",
+        "errors": {
+          "dispatchFailed": "Không thể bắt đầu khắc phục"
+        }
+      },
+      "RunProgress": {
+        "heading": "Lần chạy khắc phục",
+        "counts": "{{succeeded}} thành công, {{failed}} thất bại, {{skipped}} bỏ qua trong tổng số {{targets}} mục tiêu",
+        "polling": "Đang làm mới trong khi lệnh chạy đang hoạt động…",
+        "targetsEmpty": "Không có thiết bị nào trong lần chạy này hiển thị với bạn.",
+        "targetStatuses": {
+          "pending": "Đang chờ",
+          "queued": "Đã xếp hàng",
+          "succeeded": "Thành công",
+          "failed": "Thất bại",
+          "skipped": "Đã bỏ qua"
+        },
+        "errors": {
+          "loadFailed": "Không thể tải lần chạy khắc phục"
+        }
+      }
+    },
+    "help": {
+      "HelpPanel": {
+        "documentation": "Tài liệu",
+        "openInNewTab": "Mở trong tab mới",
+        "closeShortcut": "Đóng (Cmd+Shift+H)",
+        "loadError": "Không thể tải tài liệu ở bảng điều khiển bên.",
+        "embedBlocked": "Tài liệu nhúng bị chặn trên nguồn ứng dụng này. Hãy mở trang trong tab mới."
+      }
+    },
+    "incidents": {
+      "IncidentsPage": {
+        "errors": {
+          "fetchFailed": "Không thể lấy sự cố"
+        },
+        "loading": "Đang tải sự cố...",
+        "tryAgain": "Thử lại",
+        "title": "Sự cố bảo mật",
+        "description": "Các sự cố được theo dõi và kết quả EDR trên các tổ chức của bạn.",
+        "filters": {
+          "tracked": "Đã theo dõi",
+          "findings": "Kết quả",
+          "kindLabel": "Loại"
+        },
+        "emptyTitle": "Không tìm thấy sự cố nào",
+        "emptyFiltered": "Không có sự cố nào khớp với bộ lọc hiện tại.",
+        "emptyDescription": "Chưa có sự cố hoặc kết quả EDR nào được ghi nhận.",
+        "table": {
+          "title": "Tiêu đề",
+          "source": "Nguồn",
+          "severity": "Mức độ nghiêm trọng",
+          "detected": "Đã phát hiện"
+        },
+        "status": {
+          "detected": "đã phát hiện",
+          "analyzing": "đang phân tích",
+          "contained": "đã cô lập",
+          "recovering": "đang khôi phục",
+          "closed": "đã đóng"
+        },
+        "viewInSource": "Xem trong {{source}}",
+        "promoteFromEdr": "Nâng cấp từ chế độ xem EDR",
+        "pagination": "Trang {{page}} / {{totalPages}} (tổng số {{total}})",
+        "previous": "Trang trước",
+        "genericEdrProvider": "Nhà cung cấp EDR"
+      },
+      "IncidentDetailPage": {
+        "actors": {
+          "brain": "Breeze AI",
+          "user": "Kỹ thuật viên",
+          "system": "Hệ thống"
+        },
+        "errors": {
+          "notFound": "Không tìm thấy sự cố",
+          "fetchFailed": "Không thể tải sự cố"
+        },
+        "loading": "Đang tải sự cố...",
+        "backToIncidents": "← Quay lại danh sách sự cố",
+        "tryAgain": "Thử lại",
+        "dates": {
+          "detected": "Đã phát hiện",
+          "contained": "Đã cô lập",
+          "resolved": "Đã giải quyết",
+          "closed": "Đã đóng"
+        },
+        "tabs": {
+          "timeline": "Dòng thời gian",
+          "evidence": "Bằng chứng"
+        },
+        "status": {
+          "detected": "đã phát hiện",
+          "analyzing": "đang phân tích",
+          "contained": "đã cô lập",
+          "recovering": "đang khôi phục",
+          "closed": "đã đóng"
+        },
+        "summary": "Tóm tắt",
+        "timeline": {
+          "empty": "Chưa có mục dòng thời gian nào."
+        },
+        "actions": {
+          "empty": "Không có hành động nào được ghi lại.",
+          "action": "Hành động",
+          "by": "Bởi",
+          "when": "Thời gian"
+        },
+        "evidence": {
+          "empty": "Không có bằng chứng nào được thu thập.",
+          "collectedBy": "Thu thập bởi",
+          "hash": "Mã băm"
+        }
+      }
+    },
+    "logs": {
+      "LogSearch": {
+        "errors": {
+          "invalidTimeRange": "Thời gian bắt đầu phải trước thời gian kết thúc.",
+          "searchFailed": "Không thể tìm kiếm nhật ký",
+          "saveFailed": "Không thể lưu truy vấn",
+          "noRowsExport": "Không có hàng nào để xuất."
+        },
+        "savePrompt": "Đặt tên cho truy vấn đã lưu này:",
+        "title": "Nhật ký sự kiện",
+        "description": "Tìm kiếm và phân tích nhật ký từ hệ thống thiết bị của bạn.",
+        "searchPlaceholder": "mã lỗi, nguồn, dấu vết ngăn xếp...",
+        "source": "Nguồn",
+        "sourcePlaceholder": "ví dụ: kernel",
+        "start": "Bắt đầu",
+        "end": "Kết thúc",
+        "rows": "Số hàng",
+        "levels": {
+          "info": "Thông tin",
+          "warning": "Cảnh báo",
+          "error": "Lỗi",
+          "critical": "Nghiêm trọng"
+        },
+        "searchFleetLogs": "Tìm kiếm nhật ký hệ thống",
+        "saveQuery": "Lưu truy vấn",
+        "exportCsv": "Xuất CSV",
+        "resultsTitle": "Kết quả tìm kiếm",
+        "loading": "Đang tải...",
+        "resultsCount": "Hiển thị {{shown}} trên tổng số {{total}}",
+        "table": {
+          "timestamp": "Dấu thời gian",
+          "level": "Mức",
+          "category": "Danh mục",
+          "message": "Thông điệp"
+        },
+        "unknownSite": "Chi nhánh không xác định",
+        "empty": "Không có nhật ký nào khớp với bộ lọc hiện tại.",
+        "pageCount": "Trang {{page}} / {{totalPages}}",
+        "previous": "Trang trước"
+      }
+    },
+    "oauth": {
+      "ConsentForm": {
+        "errors": {
+          "requestFailed": "Yêu cầu thất bại ({{status}})",
+          "submissionFailed": "Gửi thất bại ({{status}})",
+          "network": "Lỗi mạng"
+        },
+        "loading": "Đang tải yêu cầu ủy quyền…",
+        "signInTitle": "Đăng nhập để tiếp tục",
+        "signInDescription": "Bạn cần đăng nhập vào tài khoản Breeze trước khi ủy quyền kết nối này.",
+        "signInAction": "Đăng nhập",
+        "redirectLoopTitle": "Chúng tôi không thể đăng nhập cho bạn",
+        "redirectLoopDescription": "Trình duyệt của bạn đã quay lại đây mà không có cookie đăng nhập. Cookie của bên thứ ba hoặc bộ nhớ trang web có thể bị chặn. Cho phép cookie cho trang web này và thử lại, hoặc quay lại ứng dụng khách MCP của bạn và bắt đầu lại.",
+        "expiredTitle": "Yêu cầu ủy quyền đã hết hạn",
+        "expiredDescription": "Liên kết ủy quyền này không còn hợp lệ. Quay lại ứng dụng khách MCP của bạn và bắt đầu lại kết nối.",
+        "noTenantsTitle": "Không có đối tượng thuê nào",
+        "noTenantsDescription": "Tài khoản của bạn không phải là thành viên của bất kỳ đối tượng thuê đối tác nào, vì vậy không thể ủy quyền kết nối MCP. Yêu cầu quản trị viên thêm bạn vào một đối tác trước khi tiếp tục.",
+        "consentTitle": "{{displayName}} muốn truy cập đối tượng thuê Breeze của bạn",
+        "clientId": "ID khách hàng: {{clientId}}",
+        "unverifiedLabel": "Tích hợp chưa được xác minh",
+        "unverifiedDescription": "Breeze chưa xác minh tích hợp này. Tên của tích hợp này là do người dùng tự báo cáo và có thể mạo danh một ứng dụng đáng tin cậy. Chỉ phê duyệt nếu bạn đã bắt đầu kết nối này và nhận ra đích gọi lại bên dưới.",
+        "metadataHostedAt": "Chi tiết ứng dụng được công bố bởi {{host}}",
+        "localhostRedirectWarning": "Ứng dụng này sẽ nhận được quyền truy cập trên máy tính này. Chỉ tiếp tục nếu bạn tự bắt đầu kết nối này.",
+        "callbackLabel": "Mã ủy quyền sẽ được gửi đến:",
+        "missingRedirectTitle": "Không thể xác minh đích gọi lại",
+        "missingRedirectDescription": "Yêu cầu ủy quyền này không bao gồm đích gọi lại, do đó không thể phê duyệt an toàn. Quay lại ứng dụng khách MCP của bạn và bắt đầu lại kết nối.",
+        "approving": "Đang phê duyệt…",
+        "approve": "Phê duyệt",
+        "deny": "Từ chối",
+        "revokeHint": "Bạn có thể thu hồi quyền truy cập này bất kỳ lúc nào từ Cài đặt → Ứng dụng đã kết nối.",
+        "scopeIntro": "Thao tác này sẽ cho phép ứng dụng:",
+        "scopes": {
+          "mcpRead": "Đọc dữ liệu thiết bị của bạn (thiết bị, cảnh báo, tập lệnh, tự động hóa)",
+          "mcpWrite": "Thực hiện các thay đổi không phá hủy trong thiết bị của bạn (thẻ, cảnh báo, cấu hình)",
+          "mcpExecute": "Chạy các hành động rủi ro cao trên thiết bị (lệnh, tập lệnh, thao tác từ xa)",
+          "openid": "Xác nhận danh tính của bạn",
+          "offlineAccess": "Duy trì kết nối mà không cần đăng nhập lại (mã thông báo làm mới)"
+        },
+        "tenantPickerLabel": "Kết nối với đối tượng thuê nào?"
+      }
+    },
+    "onboarding": {
+      "OnboardingTour": {
+        "steps": {
+          "navigate": {
+            "title": "Điều hướng các công cụ của bạn",
+            "description": "Các công cụ bạn sử dụng nhiều nhất luôn hiển thị. Mở rộng các phần như Bảo mật hoặc Vận hành để tìm thêm."
+          },
+          "search": {
+            "title": "Tìm kiếm bất cứ thứ gì",
+            "description": "Nhấn Cmd+K để nhanh chóng tìm thiết bị, tập lệnh, cảnh báo hoặc cài đặt."
+          },
+          "switchOrgs": {
+            "title": "Chuyển đổi tổ chức",
+            "description": "Quản lý nhiều khách hàng? Chuyển đổi giữa các tổ chức tại đây."
+          },
+          "aiHelp": {
+            "title": "Breeze AI",
+            "description": "Hỏi về đội ngũ thiết bị của bạn bằng ngôn ngữ thông thường, khắc phục sự cố hoặc tạo báo cáo. Nhấn ⌘⇧A ở bất cứ đâu."
+          }
+        },
+        "skipTour": "Bỏ qua hướng dẫn",
+        "progress": "{{current}} / {{total}}",
+        "gotIt": "Đã hiểu"
+      }
+    },
+    "partner": {
+      "PartnerDashboard": {
+        "errors": {
+          "fetchFailed": "Không thể tải bảng điều khiển đối tác"
+        },
+        "fallbackCustomer": "Khách hàng {{index}}",
+        "fallbackDevice": "Thiết bị {{index}}",
+        "loading": "Đang tải dữ liệu đối tác...",
+        "tryAgain": "Thử lại",
+        "title": "Cổng đối tác",
+        "description": "Theo dõi tình trạng khách hàng, độ bao phủ thiết bị và thanh toán trên một giao diện.",
+        "addCustomer": "Thêm khách hàng",
+        "viewAllAlerts": "Xem tất cả cảnh báo",
+        "runReport": "Chạy báo cáo",
+        "customerHealth": "Tình trạng khách hàng",
+        "customerCount": "{{filtered}} trên {{total}} khách hàng",
+        "searchCustomers": "Tìm kiếm khách hàng",
+        "allHealth": "Tất cả tình trạng",
+        "health": {
+          "healthy": "Khỏe mạnh",
+          "warning": "Cần chú ý",
+          "critical": "Có rủi ro"
+        },
+        "sort": {
+          "health": "Sắp xếp theo điểm sức khỏe",
+          "devices": "Sắp xếp theo số lượng thiết bị",
+          "name": "Sắp xếp theo tên"
+        },
+        "healthScore": "Điểm sức khỏe {{score}}",
+        "healthScoreUnavailable": "Không có điểm sức khỏe",
+        "devices": "Thiết bị",
+        "alerts": "Cảnh báo",
+        "compliance": "Tuân thủ",
+        "noCustomerMatches": "Chưa có khách hàng nào khớp với bộ lọc này.",
+        "billingSummary": "Tóm tắt thanh toán",
+        "monthlyRecurringRevenue": "Doanh thu định kỳ hàng tháng",
+        "customer": "Khách hàng",
+        "mrr": "MRR",
+        "totalMrr": "Tổng MRR",
+        "portfolioSnapshot": "Tổng quan danhportfolio",
+        "healthAndDeviceCoverage": "Tình trạng và độ bao phủ thiết bị",
+        "customers": "Khách hàng",
+        "totalDevices": "Tổng số thiết bị",
+        "openAlerts": "Cảnh báo đang mở",
+        "devicesAcrossCustomers": "Thiết bị trên các khách hàng",
+        "devicesTracked": "Đã theo dõi {{formattedCount}} thiết bị trên tất cả khách hàng",
+        "status": {
+          "online": "Trực tuyến",
+          "offline": "Ngoại tuyến",
+          "warning": "Cảnh báo",
+          "unknown": "Không rõ"
+        },
+        "lastSeen": "Hoạt động lần cuối",
+        "noDeviceInventory": "Chưa có dữ liệu kiểm kê thiết bị từ khách hàng.",
+        "healthFilterLabel": "Tình trạng",
+        "sortFilterLabel": "Sắp xếp theo"
+      }
+    },
+    "remediation": {
+      "RemediationSuggestionsPanel": {
+        "targets": {
+          "script": "Script",
+          "template": "Mẫu",
+          "playbook": "Playbook",
+          "diagnostic": "Chẩn đoán",
+          "builtin": "Hành động có sẵn",
+          "manualSteps": "Các bước thủ công",
+          "scriptDraft": "Bản nháp script"
+        },
+        "targetIdentifiers": {
+          "script": "script {{id}}",
+          "scriptMissing": "script không có ID script",
+          "template": "mẫu {{id}}",
+          "templateMissing": "mẫu không có ID mẫu",
+          "playbook": "playbook {{id}}",
+          "playbookMissing": "playbook không có ID playbook",
+          "diagnostic": "hành động chẩn đoán",
+          "builtin": "hành động có sẵn {{action}}"
+        },
+        "targetDevices": {
+          "none": "Không có thiết bị đích trong đề xuất này",
+          "one": "thiết bị {{id}}",
+          "many": "{{count}} thiết bị: {{ids}}"
+        },
+        "errors": {
+          "loadFailed": "Không tải được các bản sửa lỗi đề xuất",
+          "generateFailed": "Không thể tạo bản sửa lỗi đề xuất",
+          "updateFailed": "Không thể cập nhật bản sửa lỗi đề xuất",
+          "executeFailed": "Không thể thực thi bản sửa lỗi đề xuất",
+          "approvalFailed": "Không thể yêu cầu phê duyệt",
+          "researchFailed": "Không thể bắt đầu nghiên cứu",
+          "draftFailed": "Không thể mở bản nháp script."
+        },
+        "messages": {
+          "draftCopied": "Bộ nhớ bị chặn — tóm tắt đã được sao chép; hãy dán vào trình xây dựng script.",
+          "disabled": "Các bản sửa lỗi đề xuất đã bị tắt",
+          "generated": "Đã tạo bản sửa lỗi đề xuất",
+          "accepted": "Đã chấp nhận bản sửa lỗi đề xuất",
+          "markedEdited": "Đã đánh dấu chỉnh sửa bản sửa lỗi đề xuất",
+          "rejected": "Đã từ chối bản sửa lỗi đề xuất",
+          "updated": "Đã cập nhật bản sửa lỗi đề xuất",
+          "scriptQueued": "Đã xếp hàng script và cập nhật bản sửa lỗi đề xuất",
+          "approvalRequested": "Đã yêu cầu phê duyệt"
+        },
+        "title": "Bản sửa lỗi đề xuất",
+        "refresh": "Làm mới bản sửa lỗi đề xuất",
+        "disabledTitle": "Bản sửa lỗi đề xuất đang tắt đối với tổ chức này. Bật chúng trong Cài đặt → Đối tác → Tính năng AI, hoặc cho một tổ chức trên tab AI của họ.",
+        "suggestionsDisabled": "Đã tắt đề xuất",
+        "generate": "Tạo",
+        "empty": "Chưa có bản sửa lỗi đề xuất nào.",
+        "fields": {
+          "title": "Tiêu đề",
+          "risk": "Rủi ro",
+          "rationale": "Lý do",
+          "expectedAction": "Hành động dự kiến"
+        },
+        "risk": {
+          "low": "thấp",
+          "medium": "trung bình",
+          "high": "cao",
+          "critical": "nghiêm trọng"
+        },
+        "saveEdits": "Lưu chỉnh sửa",
+        "status": {
+          "suggested": "đã đề xuất",
+          "accepted": "đã chấp nhận",
+          "edited": "đã chỉnh sửa",
+          "rejected": "đã từ chối",
+          "executed": "đã thực thi",
+          "failed": "thất bại"
+        },
+        "statusLine": "Trạng thái: {{status}}",
+        "executionPreview": "Xem trước thực thi",
+        "preview": {
+          "willRun": "Sẽ chạy",
+          "where": "Nơi chạy",
+          "source": "Nguồn",
+          "risk": "Rủi ro",
+          "why": "Lý do",
+          "expectedAction": "Hành động dự kiến",
+          "parameters": "Tham số"
+        },
+        "accept": "Chấp nhận",
+        "reject": "Từ chối",
+        "execute": "Thực thi",
+        "requestApprovalTitle": "Yêu cầu phê duyệt PAM trước khi thực thi",
+        "requesting": "Đang yêu cầu...",
+        "requestApproval": "Yêu cầu phê duyệt",
+        "waitingApprovalTitle": "Đang đợi phê duyệt PAM",
+        "approvalPending": "Đang chờ phê duyệt",
+        "proven": {
+          "badge": "Bản sửa lỗi đã kiểm chứng",
+          "trackAllClients": "Đã thành công {{verified}}/{{attempts}} lần trên các khách hàng của bạn",
+          "trackThisClient": "Đã thành công {{verified}}/{{attempts}} lần cho khách hàng này"
+        },
+        "feedback": {
+          "worked": "Đã thành công",
+          "didNotWork": "Không thành công",
+          "recorded": "Đã ghi nhận phản hồi",
+          "failed": "Không thể ghi nhận phản hồi"
+        },
+        "done": {
+          "button": "Hoàn tất",
+          "recorded": "Đã đánh dấu hoàn tất — đang theo dõi khôi phục",
+          "failed": "Không thể đánh dấu hoàn tất"
+        },
+        "outcome": {
+          "label": "Kết quả: {{state}}",
+          "state": {
+            "pending": "đang chạy",
+            "awaitingRecovery": "đang theo dõi khôi phục",
+            "holding": "đã khôi phục — đang xác nhận lỗi không tái diễn",
+            "verified": "đã xác nhận khắc phục",
+            "failed": "không khắc phục được",
+            "recurred": "đã tái diễn",
+            "inconclusive": "chưa rõ kết quả",
+            "cancelled": "đã hủy"
+          }
+        },
+        "groups": {
+          "proven": "Cách khắc phục đã được kiểm chứng",
+          "ai": "Gợi ý từ AI",
+          "similar": "Cách khắc phục tương tự",
+          "legacy": "Khớp từ khóa trước đó"
+        },
+        "badges": {
+          "aiResearched": "AI đã nghiên cứu",
+          "aiWritten": "Viết bởi AI — hãy xem xét trước khi thực hiện"
+        },
+        "track": {
+          "lastVerified": "được xác minh lần cuối {{days}} ngày trước",
+          "neverVerified": "chưa được xác minh"
+        },
+        "research": {
+          "running": "Đang nghiên cứu…",
+          "runningDeep": "Đang nghiên cứu chuyên sâu…",
+          "stalled": "Vẫn đang nghiên cứu — vui lòng kiểm tra lại sau vài phút.",
+          "failed": "Nghiên cứu thất bại.",
+          "noSafeFix": "AI không tìm thấy cách khắc phục an toàn cho sự cố này.",
+          "checkBudget": "Kiểm tra ngân sách AI",
+          "deeper": "Nghiên cứu sâu hơn",
+          "retry": "Thử lại",
+          "denial": {
+            "credits": "Đã dùng hết điểm tín dụng AI cho kỳ thanh toán này.",
+            "dailyBudget": "Đã đạt giới hạn ngân sách AI hàng ngày cho việc nghiên cứu.",
+            "orgBudget": "Đã đạt giới hạn ngân sách AI của tổ chức này.",
+            "autoCap": "Đã đạt giới hạn nghiên cứu tự động. Bạn vẫn có thể bắt đầu nghiên cứu thủ công.",
+            "busy": "Hệ thống nghiên cứu đang bận. Vui lòng thử lại sau vài phút.",
+            "permission": "Bạn không có quyền bắt đầu nghiên cứu bằng AI.",
+            "unavailable": "Tính năng nghiên cứu bằng AI tạm thời không khả dụng.",
+            "modelUnavailable": "Mô hình AI dùng để nghiên cứu hiện không khả dụng.",
+            "notProvisioned": "Nghiên cứu bằng AI chưa được thiết lập cho bản cài đặt này."
+          }
+        },
+        "runBuiltin": "Chạy {{action}}",
+        "draftScript": "Soạn tập lệnh",
+        "emptyHint": "Tạo các kiểm tra ưu tiên cách khắc phục đã được kiểm chứng, sau đó mới hỏi AI.",
+        "reviewed": {
+          "pickerLabel": "Các bước đã xem xét",
+          "asWritten": "Các bước như đã viết (không chia sẻ)",
+          "save": "Lưu thành các bước đã xem xét",
+          "saved": "Đã lưu thành các bước đã xem xét",
+          "failed": "Không thể lưu các bước đã xem xét",
+          "stepsLabel": "Các bước (mỗi dòng một bước)"
+        }
+      }
+    },
+    "support": {
+      "SupportModal": {
+        "toasts": {
+          "sent": "Đã gửi yêu cầu hỗ trợ"
+        },
+        "errors": {
+          "notConfigured": "Hỗ trợ không khả dụng trên bản triển khai này.",
+          "upstreamUnavailable": "Dịch vụ hỗ trợ tạm thời không khả dụng. Vui lòng thử lại sau.",
+          "upstreamInvalidResponse": "Dịch vụ hỗ trợ trả về phản hồi không mong đợi. Vui lòng thử lại.",
+          "rateLimited": "Quá nhiều yêu cầu. Vui lòng đợi vài phút và thử lại.",
+          "invalidBody": "Vui lòng điền tiêu đề và nội dung.",
+          "sendFailed": "Gửi yêu cầu hỗ trợ thất bại. Vui lòng thử lại.",
+          "requestFailed": "Gửi yêu cầu hỗ trợ thất bại"
+        },
+        "title": "Liên hệ hỗ trợ",
+        "sendingAs": "Gửi với tư cách",
+        "subject": "Tiêu đề",
+        "subjectPlaceholder": "Mô tả ngắn",
+        "message": "Nội dung",
+        "messagePlaceholder": "Chúng tôi có thể giúp gì cho bạn?",
+        "sending": "Đang gửi…",
+        "send": "Gửi"
+      }
+    },
+    "mcpDomains": {
+      "legend": "Quyền truy cập công cụ",
+      "allLabel": "Tất cả công cụ (bao gồm các khu vực được thêm sau)",
+      "selectedLabel": "Chỉ các khu vực này",
+      "coreLabel": "Cốt lõi (luôn bao gồm)",
+      "error": "Chọn ít nhất một khu vực, hoặc chọn Tất cả công cụ.",
+      "allEquivalentNote": "Tất cả khu vực đã được chọn, điều này tương đương với Tất cả công cụ, bao gồm các khu vực bổ sung sau này.",
+      "reconnectNote": "Áp dụng cho kết nối này. Để thu hẹp kết nối hiện có, hãy thu hồi quyền trong Ứng dụng đã kết nối, sau đó kết nối lại.",
+      "apiKeyHint": "Chọn các khu vực công cụ mà khóa này có thể sử dụng thông qua giao diện AI/MCP.",
+      "allTools": "Tất cả công cụ",
+      "areaCount_one": "{{count}} khu vực",
+      "areaCount_other": "{{count}} khu vực",
+      "labels": {
+        "devices": "Thiết bị",
+        "scripts": "Tập lệnh & tự động hóa",
+        "patching": "Bản vá & phần mềm",
+        "monitoring": "Giám sát & cảnh báo",
+        "network": "Mạng",
+        "security": "Bảo mật & tuân thủ",
+        "backup": "Sao lưu & khôi phục",
+        "tickets": "Phiếu hỗ trợ & thời gian",
+        "billing": "Thanh toán",
+        "accounts": "Tài khoản",
+        "integrations": "Tích hợp",
+        "admin": "Quản trị",
+        "ai": "Tác nhân AI"
+      }
+    }
+  },
+  "whatsNew": {
+    "title": "Có gì mới trong {{version}}",
+    "gotIt": "Đã hiểu",
+    "later": "Nhắc lại sau",
+    "learnMore": "Tìm hiểu thêm",
+    "link": "Tính năng mới"
+  },
+  "money": {
+    "approximateTotal": "≈ {{amount}} xấp xỉ · tỷ giá tính đến {{rateDate}}",
+    "approximateFailed": "≈ tổng không khả dụng — không thể tải tỷ giá hối đoái",
+    "approximateUnavailableMissing": "≈ tổng không khả dụng — không có tỷ giá {{target}} cho {{codes}}",
+    "approximateUnavailableStale": "≈ tổng không khả dụng — tỷ giá {{target}} quá cũ đối với {{codes}}",
+    "approximateUnavailableMixed": "≈ tổng không khả dụng — không thể chuyển đổi {{codes}} sang {{target}}",
+    "approximateUnavailableCodesOverflow": "{{codes}} và thêm {{more}} mục khác"
+  },
+  "mfaEnrollmentGraceBanner": {
+    "message": "Vai trò của bạn sẽ yêu cầu xác thực hai yếu tố. Hãy đăng ký trước {{date}}.",
+    "cta": "Thiết lập 2FA",
+    "dismiss": "Bỏ nhắc nhở xác thực hai yếu tố"
+  },
+  "mfaPolicyOffBanner": {
+    "label": "Nhắc nhở MFA",
+    "message": "MFA không bắt buộc đối với đội ngũ của bạn. Các phiên chỉ dùng mật khẩu vẫn có thể chạy tập lệnh.",
+    "cta": "Yêu cầu MFA",
+    "dismiss": "Bỏ nhắc nhở chính sách MFA trong hôm nay"
+  },
+  "inheritedField": {
+    "inheritsFrom": "Kế thừa từ {{source}}",
+    "noneConfigured": "Chưa cấu hình {{source}}",
+    "overriding": "Ghi đè {{source}}",
+    "overridingWithValue": "Ghi đè {{source}} ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Khắc phục bộ nhớ",
+    "subtitle": "Các cách khắc phục đội ngũ của bạn đã chạy, và tần suất thực tế duy trì hiệu quả.",
+    "tabs": {
+      "fixes": "Cách khắc phục",
+      "steps": "Các bước đã xem xét"
+    },
+    "filters": {
+      "os": "Hệ điều hành",
+      "anyOs": "Mọi hệ điều hành",
+      "status": "Trạng thái",
+      "anyStatus": "Mọi trạng thái",
+      "scope": "Phạm vi",
+      "anyScope": "Mọi phạm vi",
+      "condition": "Tìm kiếm theo điều kiện"
+    },
+    "columns": {
+      "fix": "Khắc phục",
+      "record": "Lịch sử thực hiện",
+      "rate": "Tỷ lệ thành công",
+      "scope": "Phạm vi",
+      "os": "HĐH",
+      "condition": "Điều kiện",
+      "lastVerified": "Xác minh lần cuối",
+      "status": "Trạng thái",
+      "actions": "Thao tác"
+    },
+    "status": {
+      "active": "Đang hoạt động",
+      "demoted": "Bị hạ cấp",
+      "retired": "Đã ngừng",
+      "stale": "Cũ"
+    },
+    "scope": {
+      "everyClient": "Tất cả khách hàng",
+      "oneClient": "Khách hàng này"
+    },
+    "signature": "Chữ ký {{prefix}}",
+    "retire": {
+      "action": "Ngừng",
+      "confirmTitle": "Ngừng bản khắc phục này?",
+      "confirmBody": "Các bản khắc phục đã ngừng sẽ không còn được gợi ý nữa. Lịch sử của chúng vẫn được giữ lại.",
+      "confirm": "Ngừng bản khắc phục",
+      "success": "Đã ngừng bản khắc phục.",
+      "failed": "Không thể ngừng bản khắc phục."
+    },
+    "steps": {
+      "heading": "Các bước",
+      "retire": "Ngừng các bước",
+      "success": "Đã ngừng các bước.",
+      "failed": "Không thể ngừng các bước.",
+      "empty": "Chưa có bước nào được xem lại. Lưu các bước từ một gợi ý để xem chúng ở đây."
+    },
+    "empty": "Chưa ghi nhớ bản khắc phục nào. Các bản khắc phục xuất hiện ở đây sau khi được chạy và ghi nhận kết quả.",
+    "loadMore": "Tải thêm",
+    "never": "Không bao giờ",
+    "retry": "Thử lại",
+    "errors": {
+      "loadFailed": "Không thể tải bộ nhớ bản khắc phục."
+    }
+  },
+  "islandError": {
+    "title": "Phần này đã gặp sự cố",
+    "description": "Lỗi hiển thị đã ngăn trang này hiển thị. Hãy thử lại, và nếu sự cố vẫn tiếp diễn, hãy đính kèm thông báo dưới đây khi báo cáo.",
+    "retry": "Thử lại"
+  },
+  "featureLock": {
+    "lockedLabel": "Đã khóa",
+    "upgrade": "Xem các gói"
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "page": {
+    "title": "Bắt đầu phiên hỗ trợ",
+    "intro": "Ai đó đang hỗ trợ bạn trên máy tính này đã yêu cầu bạn mở trang này. Sẽ không có gì xảy ra cho đến khi bạn tự tải xuống và chạy chương trình."
+  },
+  "branding": {
+    "title": "Hỗ trợ nhanh {{partner}}",
+    "subtitle": "Bạn đang nhận hỗ trợ từ {{partner}}. Sẽ không có gì xảy ra cho đến khi bạn tự tải xuống và chạy chương trình."
+  },
+  "steps": {
+    "one": {
+      "title": "Nhập mã do kỹ thuật viên cung cấp",
+      "body": "Mã gồm 9 chữ số. Mã chỉ có hiệu lực trong vài phút."
+    },
+    "two": {
+      "title": "Tải ứng dụng hỗ trợ",
+      "body": "Nút bên dưới sẽ lưu một chương trình nhỏ đã tích hợp sẵn mã của bạn."
+    },
+    "three": {
+      "title": "Chạy chương trình và chấp nhận thông báo từ Windows",
+      "body": "Mở tệp bạn vừa tải, sau đó cho phép chạy. Chỉ đơn giản vậy thôi."
+    }
+  },
+  "code": {
+    "heading": "Nhập mã bạn được cung cấp",
+    "help": "Người hỗ trợ bạn sẽ đọc một mã gồm 9 chữ số, ví dụ như 234-567-892. Dấu gạch ngang không quan trọng.",
+    "label": "Mã hỗ trợ",
+    "placeholder": "234-567-892",
+    "submit": "Tiếp tục",
+    "formatError": "Mã này chưa đầy đủ. Mã có 9 ký tự, ví dụ như 234-567-892."
+  },
+  "checking": "Đang kiểm tra mã...",
+  "invalid": {
+    "title": "Mã này không còn hiệu lực",
+    "body": "Mã hỗ trợ sẽ hết hạn sau một thời gian ngắn kể từ khi được tạo và chỉ có thể sử dụng một lần. Hãy yêu cầu người hỗ trợ đọc mã mới, sau đó nhập vào ô trên."
+  },
+  "checkFailed": {
+    "title": "Không thể kiểm tra mã",
+    "body": "Kết nối internet có thể đã bị gián đoạn. Hãy kiểm tra kết nối và thử lại mã.",
+    "retry": "Thử lại"
+  },
+  "rateLimited": {
+    "title": "Quá nhiều lần thử",
+    "body": "Bạn đã nhập sai mã quá nhiều lần. Vui lòng đợi một lát rồi thử lại.",
+    "retry": "Thử lại"
+  },
+  "ready": {
+    "title": "Mã của bạn hợp lệ",
+    "codeIntro": "Mã của bạn là {{code}}."
+  },
+  "mobile": {
+    "title": "Mở trang này trên máy tính Windows cần hỗ trợ",
+    "body": "Không thể chia sẻ màn hình điện thoại hoặc máy tính bảng này với người hỗ trợ. Vui lòng truy cập máy tính Windows gặp sự cố và mở trang này ở đó.",
+    "downloadHidden": "Không có gì cần tải xuống trên thiết bị này."
+  },
+  "download": {
+    "windows": "Tải xuống cho Windows",
+    "manualFallback": "Nếu quá trình tải xuống yêu cầu nhập mã, hãy nhập: {{code}}",
+    "hintEdge": "Microsoft Edge có thể hiển thị cảnh báo tệp ít được tải xuống. Hãy chọn Giữ (Keep), sau đó chọn Vẫn giữ (Keep anyway) để hoàn tất lưu tệp.",
+    "hintChrome": "Google Chrome có thể hiển thị cảnh báo về tệp ở cuối cửa sổ. Hãy chọn Giữ lại (Keep) để hoàn tất lưu tệp.",
+    "hintGeneric": "Nếu trình duyệt hỏi có muốn giữ lại tệp không, hãy chọn giữ lại.",
+    "windowsOnly": "Chương trình hỗ trợ hiện chỉ khả dụng cho máy tính Windows.",
+    "macosLabel": "macOS (Máy tính Mac)",
+    "macosBadge": "Sắp ra mắt",
+    "macosBody": "Chương trình chưa sẵn sàng cho máy tính Mac. Hãy hỏi người hỗ trợ xem bạn nên làm gì tiếp theo.",
+    "macosPrimaryTitle": "Chương trình hỗ trợ chưa sẵn sàng cho máy tính Mac",
+    "macosPrimaryBody": "Hãy hỏi người hỗ trợ xem bạn nên làm gì, hoặc mở trang này trên máy tính Windows cần hỗ trợ."
+  },
+  "windowsPrompt": {
+    "title": "Windows sẽ hỏi bạn trước khi chạy",
+    "body": "Khi bạn mở tệp, Windows sẽ hiển thị thông báo hỏi bạn có muốn cho phép chạy hay không. Tệp đã được ký số, vì vậy thông báo sẽ hiển thị nhà phát hành: phải là {{publisher}}. Nếu thông báo hiển thị nhà phát hành không xác định hoặc là bất kỳ tên nào khác không mong đợi, hãy đóng thông báo và gọi cho người hỗ trợ thay vì tiếp tục.",
+    "bodyUnsigned": "Khi bạn mở tệp, Windows sẽ hiển thị thông báo hỏi bạn có muốn cho phép chạy hay không. Thông báo có thể hiển thị nhà phát hành không xác định — điều này bình thường đối với chương trình này và không phải là dấu hiệu lỗi. Chỉ tiếp tục nếu bạn đã bắt đầu phiên này với người hỗ trợ. Nếu không, hãy đóng thông báo và không chạy tệp.",
+    "publisher": "nhà phát hành của Breeze"
+  },
+  "trust": {
+    "title": "Chức năng của chương trình",
+    "seeScreen": "Trong khi phiên hỗ trợ đang diễn ra, người hỗ trợ có thể nhìn thấy màn hình của bạn.",
+    "temporary": "Chương trình chạy một lần rồi tự xóa. Không có gì được cài đặt lại trên máy tính này.",
+    "stopAnyTime": "Bạn có thể dừng chia sẻ bất cứ lúc nào bằng cách đóng cửa sổ chương trình.",
+    "onlyIfExpected": "Nếu bạn không mong đợi điều này, vui lòng không chạy. Đóng trang này lại và liên hệ với bộ phận hỗ trợ quen thuộc của bạn."
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "assetCheckout": {
+    "expectedReturnDate": "Ngày trả dự kiến",
+    "notes": "Ghi chú (tùy chọn)",
+    "notesPlaceholder": "Thêm chi tiết nhận hoặc giao hàng",
+    "requesting": "Đang yêu cầu: {{assetName}}",
+    "submit": "Yêu cầu xuất kho",
+    "submitting": "Đang gửi yêu cầu...",
+    "title": "Xuất kho tài sản",
+    "validation": {
+      "expectedReturnDate": "Chọn ngày trả dự kiến"
+    }
+  },
+  "assetHistory": {
+    "actions": {
+      "check-in": "nhập kho",
+      "check-out": "xuất kho"
+    },
+    "description": "Hoạt động nhập kho và xuất kho gần đây",
+    "title": "Lịch sử tài sản"
+  },
+  "branding": {
+    "defaultName": "Breeze Portal"
+  },
+  "customerDeviceList": {
+    "deviceCount": "{{count}} thiết bị liên kết với tài khoản của bạn",
+    "deviceCount_one": "{{count}} thiết bị liên kết với tài khoản của bạn",
+    "deviceCount_other": "{{count}} thiết bị liên kết với tài khoản của bạn",
+    "title": "Thiết bị của tôi"
+  },
+  "deviceStatus": {
+    "lastSeen": "Hoạt động lần cuối {{lastSeen}}",
+    "status": {
+      "maintenance": "bảo trì",
+      "offline": "ngoại tuyến",
+      "online": "trực tuyến"
+    },
+    "unknown": "Không xác định"
+  },
+  "header": {
+    "customerPortal": "Cổng thông tin khách hàng",
+    "profile": "Hồ sơ",
+    "signOut": "Đăng xuất"
+  },
+  "login": {
+    "email": "Email",
+    "emailPlaceholder": "you@company.com",
+    "forgotPassword": "Quên mật khẩu?",
+    "lookup": "Tra cứu",
+    "needHelp": "Cần trợ giúp?",
+    "organization": "Tổ chức",
+    "organizationPlaceholder": "Acme Corp hoặc ORG-123",
+    "password": "Mật khẩu",
+    "passwordPlaceholder": "Nhập mật khẩu của bạn",
+    "signingIn": "Đang đăng nhập...",
+    "submit": "Đăng nhập",
+    "validation": {
+      "email": "Nhập địa chỉ email hợp lệ",
+      "organization": "Nhập tên hoặc mã tổ chức của bạn",
+      "passwordLength": "Mật khẩu phải có ít nhất 8 ký tự"
+    }
+  },
+  "passwordReset": {
+    "confirm": {
+      "code": "Mã đặt lại",
+      "codePlaceholder": "123456",
+      "confirmPassword": "Xác nhận mật khẩu",
+      "confirmPasswordPlaceholder": "Nhập lại mật khẩu mới của bạn",
+      "newPassword": "Mật khẩu mới",
+      "newPasswordPlaceholder": "Nhập mật khẩu mới",
+      "resetting": "Đang đặt lại mật khẩu...",
+      "submit": "Đặt lại mật khẩu"
+    },
+    "email": "Email",
+    "emailPlaceholder": "you@company.com",
+    "rememberedPassword": "Đã nhớ mật khẩu?",
+    "request": {
+      "sending": "Đang gửi email đặt lại...",
+      "submit": "Gửi liên kết đặt lại"
+    },
+    "signIn": "Đăng nhập",
+    "validation": {
+      "code": "Nhập mã đặt lại gồm 6 chữ số",
+      "email": "Nhập địa chỉ email hợp lệ",
+      "passwordLength": "Mật khẩu phải có ít nhất 8 ký tự",
+      "passwordsMatch": "Mật khẩu không khớp"
+    }
+  },
+  "sidebar": {
+    "collapse": "Thu gọn điều hướng cổng thông tin",
+    "expand": "Mở rộng điều hướng cổng thông tin",
+    "items": {
+      "assetCheckout": "Xuất kho tài sản",
+      "helpCenter": "Trung tâm trợ giúp",
+      "myDevices": "Thiết bị của tôi",
+      "overview": "Tổng quan",
+      "supportTickets": "Phiếu hỗ trợ"
+    },
+    "navigation": "Điều hướng cổng thông tin"
+  }
+}

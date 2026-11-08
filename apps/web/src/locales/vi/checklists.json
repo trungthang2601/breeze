@@ -1,0 +1,93 @@
+{
+  "card": {
+    "title": "Danh sách công việc",
+    "progress": "{{done}} / {{total}}",
+    "empty": "Chưa có bước nào.",
+    "addPlaceholder": "Thêm bước",
+    "add": "Thêm",
+    "internalOnly": "Nội bộ — không bao giờ hiển thị cho khách hàng",
+    "detailPlaceholder": "Ghi chú tùy chọn cho bước này"
+  },
+  "actions": {
+    "moveUp": "Di chuyển lên",
+    "moveDown": "Di chuyển xuống",
+    "delete": "Xóa",
+    "edit": "Sửa",
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "retry": "Thử lại"
+  },
+  "source": {
+    "manual": "Thủ công",
+    "deliverable": "Sản phẩm bàn giao",
+    "checklist_template": "Mẫu",
+    "operator_task": "Bước tác vụ AI"
+  },
+  "operator": {
+    "viewTask": "Xem tác vụ",
+    "badgeTitle": "Được tạo bởi tác vụ AI. Đánh dấu khi hoàn thành và tác vụ sẽ tiếp tục."
+  },
+  "editDoneWarning": "Thay đổi nội dung bước sẽ xóa thông tin ai đã hoàn thành và thời gian. Chỉ chỉnh sửa ghi chú sẽ giữ nguyên dấu tích.",
+  "resolveConfirm": {
+    "title": "Danh sách chưa hoàn thành",
+    "body_one": "{{count}}/{{total}} bước chưa được tích. Vẫn giải quyết?",
+    "body_other": "{{count}}/{{total}} bước chưa được tích. Vẫn giải quyết?",
+    "confirm": "Vẫn giải quyết",
+    "cancel": "Quay lại"
+  },
+  "errors": {
+    "loadFailed": "Không thể tải danh sách công việc.",
+    "saveFailed": "Không thể lưu bước trong danh sách.",
+    "reorderFailed": "Không thể sắp xếp lại danh sách.",
+    "tickRequiresUser": "Đánh dấu bước yêu cầu phiên đăng nhập của người dùng.",
+    "operatorStepWaiting": "Một tác vụ AI vẫn đang chờ bước này nên không thể xóa. Hãy tích chọn khi hoàn thành hoặc dừng tác vụ trước."
+  },
+  "templates": {
+    "title": "Mẫu danh sách công việc",
+    "subtitle": "Quy trình có thể tái sử dụng mà kỹ thuật viên có thể áp dụng cho mọi phiếu hỗ trợ.",
+    "allOrganizations": "Tất cả tổ chức",
+    "partnerWideHint": "Áp dụng cho mọi tổ chức bạn quản lý, hiện tại và trong tương lai.",
+    "thisOrganizationOnly": "Chỉ tổ chức này",
+    "scope": "Ai có thể sử dụng mẫu này",
+    "name": "Tên",
+    "description": "Mô tả",
+    "instructions": "Hướng dẫn nội bộ",
+    "instructionsHint": "Nội bộ — không bao giờ hiển thị cho khách hàng.",
+    "isActive": "Đang hoạt động",
+    "inactiveHint": "Mẫu không hoạt động vẫn giữ liên kết ở nơi đang được sử dụng nhưng sẽ ẩn khỏi danh sách chọn.",
+    "steps": "Các bước",
+    "addStep": "Thêm một bước",
+    "stepLabelPlaceholder": "Nhãn bước",
+    "empty": "Chưa có mẫu nào.",
+    "create": "Mẫu mới",
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "delete": "Xóa",
+    "apply": "Áp dụng mẫu",
+    "applyCta": "Áp dụng",
+    "choosePlaceholder": "Chọn một mẫu",
+    "applyMode": {
+      "append": "Thêm các bước này vào danh sách hiện tại",
+      "replaceUnticked": "Thay thế các bước chưa tích (giữ lại các bước đã hoàn thành)"
+    },
+    "errors": {
+      "loadFailed": "Không thể tải mẫu danh sách công việc.",
+      "saveFailed": "Không thể lưu mẫu danh sách công việc.",
+      "applyFailed": "Không thể áp dụng mẫu danh sách công việc.",
+      "operatorStepWaiting": "Một tác vụ AI đang chờ một trong các bước chưa tích của phiếu này, nên mẫu không thể thay thế chúng. Hãy chọn “Thêm các bước này vào danh sách hiện tại”, tích chọn khi hoàn thành, hoặc dừng tác vụ trước.",
+      "saveAsFailed": "Không thể lưu danh sách thành mẫu.",
+      "noSteps": "Phiếu này không có bước nào có thể tái sử dụng để lưu.",
+      "duplicateFailed": "Không thể nhân bản mẫu danh sách."
+    },
+    "duplicate": "Nhân bản",
+    "duplicateSuccess": "Đã nhân bản thành “{{name}}”.",
+    "saveAs": {
+      "cta": "Lưu thành mẫu",
+      "name": "Tên mẫu",
+      "allOrganizations": "Cho phép tất cả tổ chức sử dụng",
+      "submit": "Lưu mẫu",
+      "success": "Đã lưu thành mẫu “{{name}}”.",
+      "skipped": "Đã bỏ qua: {{operator}} bước tác vụ AI và {{duplicates}} bước trùng lặp."
+    }
+  }
+}

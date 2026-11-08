@@ -1,0 +1,1557 @@
+{
+  "automationEditPage": {
+    "errors": {
+      "fetch": "Không thể tải tự động hóa",
+      "generic": "Đã xảy ra lỗi",
+      "save": "Không thể lưu tự động hóa",
+      "invalidTarget": "Mục tiêu thiết bị không hợp lệ: {{detail}}"
+    },
+    "loading": "Đang tải tự động hóa...",
+    "breadcrumb": {
+      "automations": "Tác vụ",
+      "new": "Tự động hóa Mới",
+      "edit": "Sửa Tự động hóa"
+    },
+    "title": {
+      "create": "Tạo Tự động hóa",
+      "edit": "Sửa Tự động hóa"
+    },
+    "description": {
+      "create": "Xây dựng quy trình tự động với bộ kích hoạt, điều kiện và hành động.",
+      "edit": "Sửa đổi cấu hình tự động hóa."
+    },
+    "managed": {
+      "title": "Quản lý bởi AI agent",
+      "description": "Tự động hóa này được duy trì bởi AI agent của nó. Vui lòng cấu hình agent thay thế."
+    },
+    "actions": {
+      "create": "Tạo Tự động hóa",
+      "saveChanges": "Lưu Thay đổi",
+      "backToAutomations": "Quay lại Tác vụ"
+    }
+  },
+  "automationForm": {
+    "cron": {
+      "invalid": "Biểu thức cron không hợp lệ",
+      "everyHourAtMinuteZero": "Mỗi giờ vào phút thứ 0",
+      "everyFiveMinutes": "Mỗi 5 phút",
+      "everyFifteenMinutes": "Mỗi 15 phút",
+      "everyThirtyMinutes": "Mỗi 30 phút",
+      "everyDayAtMidnight": "Mỗi ngày lúc nửa đêm",
+      "everyDayAtNine": "Mỗi ngày lúc 9:00 SA",
+      "weekdaysAtNine": "Ngày trong tuần lúc 9:00 SA",
+      "everySundayAtMidnight": "Mỗi Chủ Nhật lúc nửa đêm",
+      "firstDayEveryMonth": "Ngày đầu tiên của mỗi tháng lúc nửa đêm",
+      "everyMinute": "Mỗi phút",
+      "everyNMinutes": "Mỗi {{count}} phút",
+      "everyHourAtMinute": "Mỗi giờ vào phút {{minute}}",
+      "quickPresets": "Cài đặt sẵn nhanh:",
+      "presets": {
+        "everyFifteenMin": "Mỗi 15 phút",
+        "everyHour": "Mỗi giờ",
+        "dailyNine": "Hàng ngày 9 SA",
+        "weekdaysNine": "Ngày trong tuần 9 SA",
+        "weeklySunday": "Hàng tuần Chủ Nhật"
+      }
+    },
+    "alertWorkflow": {
+      "severity": "Mức độ nghiêm trọng",
+      "kind": "Loại theo dõi",
+      "hint": "Để trống một nhóm để khớp với bất kỳ giá trị nào. Các bộ lọc nâng cao hiện có được giữ nguyên."
+    },
+    "validation": {
+      "valueRequired": "Giá trị là bắt buộc",
+      "nameRequired": "Tên tự động hóa là bắt buộc",
+      "actionRequired": "Cần có ít nhất một hành động"
+    },
+    "triggerTypes": {
+      "schedule": {
+        "label": "Lịch chạy",
+        "description": "Chạy theo lịch cron"
+      },
+      "event": {
+        "label": "Sự kiện",
+        "description": "Chạy khi có sự kiện xảy ra"
+      },
+      "webhook": {
+        "label": "Webhook",
+        "description": "Chạy qua HTTP webhook"
+      },
+      "manual": {
+        "label": "Thủ công",
+        "description": "Chỉ chạy thủ công"
+      }
+    },
+    "eventTypes": {
+      "deviceOnline": "Thiết bị Trực tuyến",
+      "deviceOffline": "Thiết bị Ngoại tuyến",
+      "alertTriggered": "Cảnh báo được Kích hoạt",
+      "alertResolved": "Cảnh báo đã Giải quyết",
+      "scriptCompleted": "Script Hoàn thành",
+      "scriptFailed": "Script Thất bại",
+      "policyViolation": "Vi phạm Chính sách",
+      "huntressIncidentCreated": "Sự cố Huntress được Tạo",
+      "huntressIncidentUpdated": "Sự cố Huntress được Cập nhật",
+      "huntressAgentOffline": "Huntress Agent Ngoại tuyến",
+      "sentinelOneThreatDetected": "Phát hiện Mối đe dọa SentinelOne",
+      "sentinelOneDeviceIsolated": "Thiết bị SentinelOne bị Cô lập",
+      "sentinelOneThreatActionCompleted": "Hành động Mối đe dọa SentinelOne hoàn thành"
+    },
+    "conditionTypes": {
+      "group": "Nhóm",
+      "operatingSystem": "Hệ điều hành",
+      "tag": "Thẻ"
+    },
+    "operators": {
+      "is": "Là",
+      "isNot": "Không phải là",
+      "contains": "Chứa",
+      "doesNotContain": "Không chứa"
+    },
+    "actionTypes": {
+      "runScript": "Chạy Script",
+      "sendNotification": "Gửi Thông báo",
+      "createAlert": "Tạo Cảnh báo",
+      "executeCommand": "Thực thi Lệnh",
+      "deploySoftware": "Triển khai Phần mềm",
+      "aiTriage": "Phân loại AI"
+    },
+    "severity": {
+      "critical": "Nghiêm trọng",
+      "high": "Cao",
+      "medium": "Trung bình",
+      "low": "Thấp",
+      "info": "Thông tin"
+    },
+    "failure": {
+      "stop": {
+        "label": "Dừng Thực thi",
+        "description": "Dừng tất cả các hành động còn lại"
+      },
+      "continue": {
+        "label": "Tiếp tục",
+        "description": "Tiếp tục với các hành động còn lại"
+      },
+      "notify": {
+        "label": "Thông báo & Tiếp tục",
+        "description": "Gửi thông báo và tiếp tục"
+      }
+    },
+    "actions": {
+      "saveAutomation": "Lưu tự động hóa",
+      "copyUrl": "Sao chép URL",
+      "addCondition": "Thêm Điều kiện",
+      "addAction": "Thêm Hành động",
+      "removeAction": "Xóa hành động"
+    },
+    "scope": {
+      "title": "Phạm vi",
+      "allOrganizations": "Tất cả tổ chức",
+      "partnerWide": "(tự động hóa toàn đối tác)",
+      "organizationOnly": "Chỉ tổ chức này"
+    },
+    "fields": {
+      "name": "Tên tự động hóa",
+      "actionType": "Loại hành động",
+      "cronExpression": "Biểu thức Cron",
+      "eventType": "Loại Sự kiện",
+      "webhookUrl": "URL Webhook",
+      "webhookSecret": "Mã bí mật Webhook (tùy chọn)",
+      "mode": "Chế độ",
+      "script": "Script",
+      "runAs": "Chạy với tư cách",
+      "notificationChannel": "Kênh Thông báo",
+      "severity": "Mức độ nghiêm trọng",
+      "message": "Tin nhắn",
+      "command": "Lệnh",
+      "whenOffline": "Nếu thiết bị ngoại tuyến",
+      "software": "Phần mềm",
+      "failureNotificationChannel": "Kênh Thông báo Thất bại"
+    },
+    "options": {
+      "whenOffline": {
+        "queue": "Hàng đợi (mặc định)",
+        "skip": "Bỏ qua"
+      }
+    },
+    "hints": {
+      "whenOffline": "Công việc trong hàng đợi sẽ chờ thiết bị và chạy khi thiết bị kết nối trở lại, hoặc hết hạn sau 7 ngày. Bỏ qua sẽ làm bước này thất bại ngay lập tức."
+    },
+    "placeholders": {
+      "name": "Kiểm tra bảo trì hàng ngày",
+      "description": "Mô tả những gì tự động hóa này làm...",
+      "webhookSecret": "Để trống để tự động tạo",
+      "value": "Giá trị",
+      "selectScript": "Chọn một script...",
+      "selectChannel": "Chọn kênh...",
+      "alertMessage": "Nội dung cảnh báo",
+      "selectSoftware": "Chọn phần mềm..."
+    },
+    "sections": {
+      "trigger": "Bộ kích hoạt",
+      "deviceTargeting": "Nhắm mục tiêu thiết bị (Tùy chọn)",
+      "deviceTargetingDescription": "Lọc các thiết bị áp dụng tự động hóa này",
+      "actions": "Hành động",
+      "actionsDescription": "Xác định những gì xảy ra khi tự động hóa này chạy",
+      "onFailure": "Hành vi khi lỗi"
+    },
+    "webhook": {
+      "generatedAfterSaving": "URL webhook sẽ được tạo sau khi lưu.",
+      "postHint": "Gửi yêu cầu POST đến URL này để kích hoạt tự động hóa"
+    },
+    "manual": {
+      "hint": "Tự động hóa này chỉ chạy khi được kích hoạt thủ công từ giao diện hoặc API."
+    },
+    "modes": {
+      "simple": "Cơ bản",
+      "advanced": "Nâng cao"
+    },
+    "software": {
+      "installLatestHint": "Cài đặt phiên bản mới nhất của phần mềm đã chọn; bỏ qua thiết bị đã có sẵn."
+    },
+    "empty": {
+      "noActions": "Chưa có hành động nào. Nhấp vào \"Thêm hành động\" để tạo."
+    },
+    "partnerGroupsNote": "Tự động hóa toàn đối tác không thể nhắm mục tiêu vào các nhóm thiết bị hoặc thiết bị cụ thể, vì mỗi thiết bị thuộc về một tổ chức riêng lẻ. Hãy sử dụng Tất cả thiết bị hoặc Bộ lọc nâng cao.",
+    "partnerTargetBlocked": "Tự động hóa toàn đối tác này nhắm mục tiêu vào các nhóm thiết bị hoặc thiết bị cụ thể, điều này không được hỗ trợ. Hãy thay đổi mục tiêu thành Tất cả thiết bị hoặc Bộ lọc nâng cao trước khi lưu."
+  },
+  "automationList": {
+    "elevated": "Nâng quyền",
+    "relativeTime": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "title": "Tự động hóa",
+    "summary": "Hiển thị {{shown}} / {{total}} tự động hóa",
+    "searchPlaceholder": "Tìm kiếm tự động hóa...",
+    "filters": {
+      "allTriggers": "Tất cả bộ kích hoạt",
+      "allStatus": "Tất cả trạng thái",
+      "triggerLabel": "Bộ kích hoạt",
+      "statusLabel": "Trạng thái"
+    },
+    "trigger": {
+      "schedule": "Lịch chạy",
+      "event": "Sự kiện",
+      "webhook": "Webhook",
+      "manual": "Thủ công"
+    },
+    "headers": {
+      "trigger": "Kích hoạt",
+      "lastRun": "Lần chạy cuối"
+    },
+    "empty": "Không tìm thấy tự động hóa nào. Thử điều chỉnh tìm kiếm hoặc bộ lọc.",
+    "partnerWideTitle": "Tự động hóa toàn đối tác — áp dụng cho mọi tổ chức",
+    "allOrgs": "Toàn đối tác",
+    "managedByAgent": "Được quản lý bởi AI agent",
+    "managedByAgentHint": "Tự động hóa này được duy trì bởi AI agent của nó. Hãy cấu hình agent thay thế.",
+    "never": "Không bao giờ",
+    "actions": {
+      "viewHistory": "Xem lịch sử",
+      "runNow": "Chạy ngay",
+      "runHistory": "Lịch sử chạy"
+    },
+    "pagination": {
+      "showing": "Hiển thị {{start}} đến {{end}} của {{total}}",
+      "page": "Trang {{page}} / {{total}}"
+    },
+    "status": {
+      "idle": "Đang rảnh",
+      "running": "Đang chạy",
+      "success": "Thành công",
+      "failed": "Thất bại",
+      "partial": "Một phần"
+    }
+  },
+  "automationRunHistory": {
+    "relativeTime": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "deviceCount": "{{count}} thiết bị",
+    "resultCount": {
+      "passed": "{{count}} đạt",
+      "failed": "{{count}} lỗi",
+      "skipped": "{{count}} đã bỏ qua",
+      "cancelled": "{{count}} đã hủy"
+    },
+    "duration": "Thời lượng: {{duration}}",
+    "progress": {
+      "finished": "Đã hoàn thành {{finished}} / {{total}} thiết bị"
+    },
+    "deviceResults": {
+      "title": "Kết quả thiết bị",
+      "loading": "Đang tải kết quả thiết bị...",
+      "error": "Không thể tải kết quả thiết bị. Hãy thử mở lại.",
+      "empty": "Không có kết quả theo từng thiết bị được ghi lại cho lần chạy này."
+    },
+    "errors": {
+      "cancelRun": "Không thể hủy lần chạy."
+    },
+    "actions": {
+      "hideLogs": "Ẩn nhật ký",
+      "viewLogs": "Xem nhật ký",
+      "cancelRun": "Hủy chạy",
+      "partnerScopeTooltip": "Lần chạy này áp dụng cho mọi tổ chức dưới tài khoản đối tác của bạn. Hãy yêu cầu quản trị viên đối tác đầy đủ hủy, hoặc dừng các tiến trình thực thi riêng lẻ trên thiết bị của bạn.",
+      "confirmCancelRunTitle": "Hủy lần chạy này?",
+      "confirmCancelRunMessage": "Breeze sẽ dừng mọi tiến trình thực thi mà lần chạy này vẫn đang chờ. Các hành động đang diễn ra có thể hoàn tất trước khi kịp dừng lại.",
+      "cancelRunSuccess_one": "Đã hủy — Đã dừng {{count}} tiến trình thực thi.",
+      "cancelRunSuccess_other": "Đã hủy — Đã dừng {{count}} tiến trình thực thi.",
+      "uncancellableActions_one": "{{count}} hành động không thể dừng và có thể vẫn đang chạy.",
+      "uncancellableActions_other": "{{count}} hành động không thể dừng và có thể vẫn đang chạy."
+    },
+    "timestamps": {
+      "started": "Bắt đầu: {{date}}",
+      "completed": "Hoàn thành: {{date}}"
+    },
+    "title": "Lịch sử chạy",
+    "summary": "Hiển thị {{shown}} / {{total}} lần chạy",
+    "filters": {
+      "allStatus": "Tất cả trạng thái"
+    },
+    "status": {
+      "success": "Thành công",
+      "failed": "Thất bại",
+      "partial": "Một phần",
+      "running": "Đang chạy",
+      "pending": "Đang chờ",
+      "skipped": "Đã bỏ qua",
+      "cancelled": "Đã hủy"
+    },
+    "empty": "Không có lịch sử chạy.",
+    "triggeredBy": {
+      "scheduled": "Đã lên lịch",
+      "event": "Kích hoạt theo sự kiện",
+      "webhook": "Webhook",
+      "manual": "Thủ công",
+      "api": "Gọi API"
+    },
+    "scriptOutput": {
+      "show_one": "Hiển thị đầu ra script",
+      "show_other": "Hiển thị đầu ra script ({{count}})",
+      "hide_one": "Ẩn đầu ra script",
+      "hide_other": "Ẩn đầu ra script ({{count}})",
+      "exitCode": "Mã thoát {{code}}",
+      "empty": "Không có đầu ra",
+      "stderr": "stderr",
+      "untitled": "Script",
+      "awaiting": "Đang đợi agent báo cáo...",
+      "truncated": "Đầu ra bị cắt bớt — xem lịch sử script của thiết bị để lấy toàn bộ văn bản."
+    },
+    "commandOutput": {
+      "show_one": "Hiển thị đầu ra lệnh",
+      "show_other": "Hiển thị đầu ra lệnh ({{count}})",
+      "hide_one": "Ẩn đầu ra lệnh",
+      "hide_other": "Ẩn đầu ra lệnh ({{count}})",
+      "label": "Lệnh (hành động {{index}})",
+      "truncated": "Đầu ra bị cắt bớt — toàn bộ văn bản không được lưu trong chế độ xem này."
+    }
+  },
+  "automationsPage": {
+    "fallback": {
+      "untitled": "Tự động hóa không có tiêu đề"
+    },
+    "errors": {
+      "fetch": "Không thể tải danh sách tự động hóa",
+      "generic": "Đã xảy ra lỗi",
+      "run": "Không thể chạy tự động hóa",
+      "enable": "Không thể bật tự động hóa",
+      "disable": "Không thể tắt tự động hóa",
+      "delete": "Không thể xóa tự động hóa"
+    },
+    "loading": "Đang tải tự động hóa...",
+    "title": "Tác vụ",
+    "description": "Tự động hóa theo lịch, theo yêu cầu, webhook và theo sự kiện.",
+    "actions": {
+      "new": "Tác vụ mới",
+      "deleting": "Đang xóa..."
+    },
+    "deleteDialog": {
+      "title": "Xóa tác vụ",
+      "confirmPrefix": "Bạn có chắc chắn muốn xóa",
+      "confirmSuffix": "Hành động này không thể hoàn tác."
+    },
+    "tabs": {
+      "ariaLabel": "Loại tác vụ",
+      "all": "Tất cả",
+      "scheduled": "Theo lịch",
+      "on-demand": "Theo yêu cầu",
+      "webhooks": "Webhook",
+      "event-rules": "Luồng cảnh báo"
+    }
+  },
+  "complianceDashboard": {
+    "relativeTime": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "noData": "Không có dữ liệu",
+    "status": {
+      "compliant": "Tuân thủ",
+      "nonCompliant": "Không tuân thủ",
+      "unknown": "Không xác định"
+    },
+    "trend": {
+      "notEnoughData": "Không đủ dữ liệu để xem xu hướng",
+      "noChange": "Không thay đổi",
+      "vsLastPeriod": "so với kỳ trước"
+    },
+    "overview": {
+      "overall": "Mức độ tuân thủ chung",
+      "deviceRatio": "{{compliant}} / {{total}} thiết bị",
+      "passingAllPolicies": "thiết bị đạt mọi chính sách",
+      "withViolations": "thiết bị vi phạm",
+      "pendingEvaluation": "thiết bị chờ đánh giá"
+    },
+    "sections": {
+      "byStatus": "Tuân thủ theo trạng thái",
+      "trend": "Xu hướng tuân thủ",
+      "policyBreakdown": "Chi tiết chính sách",
+      "nonCompliantDevices": "Thiết bị không tuân thủ"
+    },
+    "legend": {
+      "compliant": "Tuân thủ ({{count}})",
+      "nonCompliant": "Không tuân thủ ({{count}})",
+      "unknown": "Không xác định ({{count}})"
+    },
+    "empty": {
+      "noPolicies": "Chưa cấu hình chính sách nào",
+      "allCompliant": "Tất cả thiết bị đều tuân thủ!",
+      "notEvaluated": "Chưa có thiết bị nào được đánh giá.",
+      "noViolationsPending_one": "Không tìm thấy vi phạm; {{count}} thiết bị vẫn đang chờ đánh giá.",
+      "noViolationsPending_other": "Không tìm thấy vi phạm; {{count}} thiết bị vẫn đang chờ đánh giá.",
+      "noMatchingDevices": "Không tìm thấy thiết bị phù hợp."
+    },
+    "policyComplianceRatio": "{{compliant}} / {{total}} tuân thủ",
+    "searchDevices": "Tìm kiếm thiết bị...",
+    "violationCount_one": "{{count}} vi phạm",
+    "violationCount_other": "{{count}} vi phạm",
+    "moreViolations_one": "+{{count}} vi phạm khác",
+    "moreViolations_other": "+{{count}} vi phạm khác",
+    "lastChecked": "Kiểm tra lần cuối: {{date}}",
+    "pagination": {
+      "showing": "Hiển thị từ {{start}} đến {{end}} của {{total}}",
+      "page": "Trang {{page}} / {{total}}"
+    }
+  },
+  "compliancePage": {
+    "errors": {
+      "fetch": "Không thể tải dữ liệu tuân thủ",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "loading": "Đang tải dữ liệu tuân thủ...",
+    "backToPolicies": "Quay lại danh sách chính sách",
+    "policyTitle": "Tuân thủ: {{policy}}",
+    "policyFallback": "Chính sách",
+    "title": "Tổng quan tuân thủ",
+    "description": {
+      "policy": "Xem trạng thái tuân thủ cho chính sách này.",
+      "overview": "Tổng quan về mức độ tuân thủ chính sách trên tất cả thiết bị."
+    }
+  },
+  "policiesPage": {
+    "errors": {
+      "fetch": "Không thể tải chính sách",
+      "generic": "Đã xảy ra lỗi",
+      "enable": "Không thể bật chính sách",
+      "disable": "Không thể tắt chính sách",
+      "delete": "Không thể xóa chính sách"
+    },
+    "loading": "Đang tải chính sách...",
+    "title": "Chính sách",
+    "description": "Xác định và thực thi các chính sách tuân thủ trên thiết bị của bạn.",
+    "actions": {
+      "complianceDashboard": "Tổng quan tuân thủ",
+      "new": "Chính sách mới",
+      "deleting": "Đang xóa..."
+    },
+    "stats": {
+      "activePolicies": "Chính sách đang hoạt động",
+      "overallCompliance": "Mức độ tuân thủ chung",
+      "devicesMonitored": "Thiết bị được giám sát"
+    },
+    "deleteDialog": {
+      "title": "Xóa chính sách",
+      "confirmPrefix": "Bạn có chắc chắn muốn xóa",
+      "confirmSuffix": "Hành động này không thể hoàn tác."
+    }
+  },
+  "policyEditPage": {
+    "errors": {
+      "fetch": "Không thể tải chính sách",
+      "generic": "Đã xảy ra lỗi",
+      "save": "Không thể lưu chính sách"
+    },
+    "loading": "Đang tải chính sách...",
+    "breadcrumb": {
+      "policies": "Chính sách",
+      "new": "Chính sách mới",
+      "edit": "Sửa chính sách"
+    },
+    "title": {
+      "create": "Tạo chính sách",
+      "edit": "Sửa chính sách"
+    },
+    "description": {
+      "create": "Xác định quy tắc tuân thủ và hành vi thực thi.",
+      "edit": "Sửa đổi cấu hình chính sách."
+    },
+    "actions": {
+      "create": "Tạo chính sách",
+      "saveChanges": "Lưu thay đổi",
+      "backToPolicies": "Quay lại danh sách chính sách"
+    }
+  },
+  "policyForm": {
+    "validation": {
+      "softwareNameRequired": "Tên phần mềm là bắt buộc",
+      "versionRequired": "Phiên bản là bắt buộc đối với toán tử chính xác/tối thiểu/tối đa",
+      "diskSpacePositive": "Dung lượng trống tối thiểu phải lớn hơn 0",
+      "registryPathRequired": "Đường dẫn registry là bắt buộc",
+      "registryValueRequired": "Tên giá trị registry là bắt buộc",
+      "configPathRequired": "Đường dẫn tệp cấu hình là bắt buộc",
+      "configKeyRequired": "Khóa cấu hình là bắt buộc",
+      "nameRequired": "Tên chính sách là bắt buộc",
+      "ruleRequired": "Cần ít nhất một quy tắc",
+      "minimumInterval": "Khoảng thời gian tối thiểu là 5 phút",
+      "maximumInterval": "Khoảng thời gian tối đa là 24 giờ"
+    },
+    "enforcement": {
+      "monitor": {
+        "label": "Giám sát",
+        "description": "Theo dõi trạng thái tuân thủ mà không cần hành động. Lý tưởng cho việc triển khai chính sách ban đầu."
+      },
+      "warn": {
+        "label": "Cảnh báo",
+        "description": "Tạo cảnh báo khi phát hiện vi phạm. Thông báo cho quản trị viên nhưng không tự động khắc phục."
+      },
+      "enforce": {
+        "label": "Thực thi",
+        "description": "Tự động chạy tập lệnh khắc phục khi phát hiện vi phạm. Sử dụng thận trọng."
+      }
+    },
+    "ruleTypes": {
+      "requiredSoftware": "Phần mềm bắt buộc",
+      "prohibitedSoftware": "Phần mềm cấm",
+      "minimumDiskSpace": "Dung lượng đĩa tối thiểu",
+      "osVersion": "Yêu cầu phiên bản HĐH",
+      "registryCheck": "Kiểm tra Registry (Windows)",
+      "configFileCheck": "Kiểm tra tệp cấu hình"
+    },
+    "targetTypes": {
+      "allDevices": "Tất cả thiết bị",
+      "specificSites": "Chi nhánh cụ thể",
+      "specificGroups": "Nhóm cụ thể",
+      "specificTags": "Thẻ cụ thể"
+    },
+    "versionOperators": {
+      "any": "Mọi phiên bản",
+      "exact": "Phiên bản chính xác",
+      "minimum": "Phiên bản tối thiểu",
+      "maximum": "Phiên bản tối đa"
+    },
+    "osTypes": {
+      "any": "Mọi HĐH",
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "actions": {
+      "savePolicy": "Lưu chính sách",
+      "addRule": "Thêm quy tắc",
+      "removeRule": "Xóa quy tắc"
+    },
+    "fields": {
+      "name": "Tên chính sách",
+      "ruleType": "Loại quy tắc",
+      "targetType": "Loại đối tượng",
+      "softwareName": "Tên phần mềm",
+      "versionCheck": "Kiểm tra phiên bản",
+      "version": "Phiên bản",
+      "minimumFreeSpace": "Dung lượng trống tối thiểu (GB)",
+      "diskPath": "Ổ đĩa/Đường dẫn (tùy chọn)",
+      "operatingSystem": "Hệ điều hành",
+      "minimumVersion": "Phiên bản tối thiểu",
+      "registryPath": "Đường dẫn Registry",
+      "valueName": "Tên giá trị",
+      "expectedValue": "Giá trị mong đợi",
+      "configFilePath": "Đường dẫn file cấu hình",
+      "configKey": "Khóa cấu hình",
+      "remediationScript": "Script khắc phục",
+      "evaluateEvery": "Đánh giá định kỳ"
+    },
+    "placeholders": {
+      "name": "Chính sách chuẩn bảo mật",
+      "description": "Mô tả nội dung chính sách này...",
+      "softwareNameRequired": "VD: Google Chrome",
+      "version": "Phiên bản",
+      "softwareNameProhibited": "VD: BitTorrent",
+      "diskPath": "C: hoặc /home",
+      "minimumVersion": "VD: 10.0 hoặc 22.04",
+      "registryPath": "HKLM\\SOFTWARE\\Policies\\...",
+      "remediationScript": "Chọn script khắc phục..."
+    },
+    "sections": {
+      "targetDevices": "Thiết bị mục tiêu",
+      "targetDevicesDescription": "Chọn thiết bị áp dụng chính sách này",
+      "rules": "Quy tắc chính sách",
+      "rulesDescription": "Xác định nội dung kiểm tra của chính sách",
+      "enforcement": "Mức độ thực thi",
+      "enforcementDescription": "Chọn cách xử lý vi phạm",
+      "checkInterval": "Tần suất kiểm tra"
+    },
+    "selectTargets": "Chọn {{target}}",
+    "targetLabels": {
+      "sites": "Chi nhánh",
+      "groups": "Nhóm",
+      "tags": "Thẻ",
+      "sitesLower": "chi nhánh",
+      "groupsLower": "nhóm",
+      "tagsLower": "thẻ"
+    },
+    "empty": {
+      "noTargets": "Không có {{target}}.",
+      "noRules": "Chưa có quy tắc. Nhấp \"Thêm quy tắc\" để tạo."
+    },
+    "hints": {
+      "prohibitedSoftware": "Vi phạm nếu phát hiện phần mềm này được cài đặt",
+      "checkInterval": "Tần suất kiểm tra tuân thủ trên thiết bị"
+    },
+    "remediation": {
+      "title": "Tự động khắc phục",
+      "description": "Khi bật thực thi, script khắc phục sẽ tự động chạy trên các thiết bị không tuân thủ."
+    }
+  },
+  "policyList": {
+    "relativeTime": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "notAvailable": "N/A",
+    "title": "Chính sách",
+    "summary": "{{shown}} / {{total}} chính sách",
+    "searchPlaceholder": "Tìm kiếm chính sách...",
+    "filters": {
+      "allEnforcement": "Tất cả mức thực thi",
+      "allStatus": "Tất cả trạng thái",
+      "enforcementLabel": "Thực thi",
+      "statusLabel": "Trạng thái"
+    },
+    "enforcement": {
+      "monitor": {
+        "label": "Giám sát"
+      },
+      "warn": {
+        "label": "Cảnh báo"
+      },
+      "enforce": {
+        "label": "Thực thi"
+      }
+    },
+    "headers": {
+      "enforcement": "Thực thi",
+      "compliance": "Tuân thủ",
+      "lastEvaluated": "Đánh giá lần cuối"
+    },
+    "empty": "Không tìm thấy chính sách. Hãy thử điều chỉnh tìm kiếm hoặc bộ lọc.",
+    "partnerWideTitle": "Chính sách toàn đối tác — đánh giá thiết bị ở mọi tổ chức",
+    "allOrgs": "Toàn đối tác",
+    "ruleCount": "{{count}} quy tắc",
+    "moreTargets": " +{{count}} mục khác",
+    "actions": {
+      "viewDetails": "Xem chi tiết",
+      "viewCompliance": "Xem mức tuân thủ"
+    },
+    "never": "Không bao giờ",
+    "pagination": {
+      "showing": "Hiển thị từ {{start}} đến {{end}} của {{total}}",
+      "page": "Trang {{page}} / {{total}}"
+    }
+  },
+  "executionDetails": {
+    "output": {
+      "emptyMarker": "(trống)",
+      "noOutput": "Không có đầu ra",
+      "title": "Đầu ra",
+      "stdout": "Đầu ra chuẩn (stdout)",
+      "stderr": "Lỗi chuẩn (stderr)"
+    },
+    "customFields": {
+      "title": "Ghi trường tùy chỉnh",
+      "applied": "Đã áp dụng",
+      "rejected": "Đã từ chối",
+      "none": "Không có",
+      "reasons": {
+        "unknown_field": "Không có trường tùy chỉnh với khóa này — hãy kiểm tra chính tả với khóa trường trong Cài đặt → Trường tùy chỉnh",
+        "not_script_writable": "Trường không cho phép script ghi — hãy bật \"Cho phép script ghi vào trường này\" trong Cài đặt → Trường tùy chỉnh",
+        "not_applicable_to_device": "Trường không áp dụng cho loại thiết bị này",
+        "device_not_found": "Không tìm thấy thiết bị",
+        "invalid_type": "Giá trị sai kiểu dữ liệu",
+        "out_of_range": "Giá trị nằm ngoài phạm vi cho phép",
+        "not_a_choice": "Giá trị không nằm trong các lựa chọn cho phép của trường",
+        "too_long": "Giá trị quá dài",
+        "invalid_date": "Giá trị không phải là ngày hợp lệ",
+        "marker_unparseable": "Không thể phân tích điểm đánh dấu dưới dạng JSON",
+        "too_many_lines": "Quá nhiều dòng đánh dấu trong lần chạy này",
+        "too_many_keys": "Quá nhiều khóa trong điểm đánh dấu",
+        "marker_too_large": "Điểm đánh dấu vượt quá giới hạn kích thước",
+        "forbidden_key": "Khóa không được phép",
+        "envelope_unparseable": "Không thể phân tích kết quả có cấu trúc",
+        "envelope_unsupported_version": "Kết quả có cấu trúc sử dụng phiên bản không được hỗ trợ"
+      }
+    },
+    "actions": {
+      "copyToClipboard": "Sao chép vào clipboard",
+      "runAgain": "Chạy lại"
+    },
+    "title": "Chi tiết thực thi",
+    "statusDescription": {
+      "running": "Script đang chạy...",
+      "completed": "Script hoàn tất thành công",
+      "failed": "Thực thi script thất bại",
+      "timeout": "Thực thi script đã hết thời gian",
+      "pending": "Script đang chờ thực thi",
+      "queued": "Script đang chờ phân phối đến thiết bị",
+      "queuedAwaitingPickup": "Chưa có phiên agent hoạt động nào nhận script này. Script sẽ được phân phối trong lần kết nối tiếp theo của agent thiết bị.",
+      "deviceOffline": "Thiết bị đang ngoại tuyến. Script sẽ được phân phối khi thiết bị kết nối lại.",
+      "cancelling": "Đã yêu cầu dừng — đang chờ thiết bị xác nhận.",
+      "cancelled": "Script đã bị dừng trên thiết bị"
+    },
+    "fields": {
+      "startedAt": "Bắt đầu lúc",
+      "duration": "Thời lượng",
+      "exitCode": "Mã thoát",
+      "completedAt": "Hoàn thành lúc",
+      "runAs": "Ngữ cảnh chạy"
+    },
+    "status": {
+      "running": "Đang chạy...",
+      "pending": "Đang chờ",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "timeout": "Hết thời gian",
+      "queued": "Đang chờ hàng đợi",
+      "queuedOffline": "Đang chờ — thiết bị ngoại tuyến",
+      "queuedAwaitingPickup": "Đang chờ — đợi thiết bị nhận",
+      "cancelling": "Đang dừng...",
+      "cancelled": "Đã hủy",
+      "completedCancelTooLate": "Đã hoàn thành — yêu cầu dừng đến quá trễ",
+      "failedCancelTooLate": "Thất bại — yêu cầu dừng đến quá trễ",
+      "timeoutCancelTooLate": "Hết thời gian — yêu cầu dừng đến quá trễ",
+      "cancelFailed": "Dừng thất bại — thiết bị không thể dừng tiến trình"
+    }
+  },
+  "executionHistory": {
+    "relativeTime": {
+      "yesterday": "Hôm qua {{time}}"
+    },
+    "searchPlaceholder": "Tìm kiếm...",
+    "filters": {
+      "allStatus": "Tất cả Trạng thái",
+      "allTime": "Tất cả thời gian",
+      "lastHour": "1 giờ qua",
+      "lastDay": "24 giờ qua",
+      "lastWeek": "7 ngày qua",
+      "lastMonth": "30 ngày qua",
+      "statusLabel": "Trạng thái",
+      "dateLabel": "Khoảng thời gian"
+    },
+    "status": {
+      "pending": "Đang chờ",
+      "running": "Đang chạy...",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "timeout": "Hết thời gian",
+      "queued": "Đang chờ hàng đợi",
+      "queuedOffline": "Đang chờ — thiết bị ngoại tuyến",
+      "queuedAwaitingPickup": "Đang chờ — chờ nhận",
+      "cancelling": "Đang dừng...",
+      "cancelled": "Đã hủy",
+      "completedCancelTooLate": "Đã hoàn thành — yêu cầu dừng đến quá trễ",
+      "failedCancelTooLate": "Thất bại — yêu cầu dừng đến quá trễ",
+      "timeoutCancelTooLate": "Hết thời gian — yêu cầu dừng đến quá trễ",
+      "cancelFailed": "Dừng thất bại — thiết bị không thể dừng tiến trình"
+    },
+    "summary": "{{shown}} / {{total}}",
+    "headers": {
+      "script": "Script",
+      "started": "Đã bắt đầu",
+      "duration": "Thời lượng",
+      "exitCode": "Mã thoát"
+    },
+    "empty": "Không tìm thấy lượt chạy nào. Hãy thử điều chỉnh bộ lọc.",
+    "errors": {
+      "noLongerCancellable": "Lượt chạy này đã kết thúc và không thể dừng nữa.",
+      "cancelFailed": "Không thể dừng lượt chạy."
+    },
+    "actions": {
+      "viewDetails": "Xem chi tiết",
+      "stop": "Dừng",
+      "forceStop": "Buộc dừng",
+      "confirmStopTitle": "Dừng lượt chạy này?",
+      "confirmStopMessage": "Breeze sẽ yêu cầu thiết bị dừng {{script}}. Việc này có thể mất vài giây — Buộc dừng sẽ bỏ qua thời gian chờ và tắt tiến trình ngay lập tức."
+    },
+    "pagination": {
+      "showing": "Hiển thị {{start}} đến {{end}} của {{total}}",
+      "page": "Trang {{page}} / {{total}}"
+    }
+  },
+  "scriptAiInput": {
+    "placeholder": {
+      "ready": "Mô tả script bạn cần...",
+      "opening": "Đang mở Breeze AI..."
+    },
+    "actions": {
+      "stopGenerating": "Dừng tạo",
+      "sendMessage": "Gửi tin nhắn"
+    }
+  },
+  "scriptAiMessages": {
+    "tool": {
+      "applyFailed": "Không thể áp dụng vào trình soạn thảo",
+      "applied": "Đã áp dụng vào trình soạn thảo",
+      "call": "Gọi công cụ"
+    },
+    "approval": {
+      "title": "Cần Phê duyệt",
+      "approve": "Phê duyệt",
+      "reject": "Từ chối"
+    },
+    "empty": {
+      "title": "Breeze AI",
+      "description": "Yêu cầu Breeze AI viết hoặc xem xét script này."
+    }
+  },
+  "scriptAiPanel": {
+    "title": "Breeze AI",
+    "actions": {
+      "redoTitle": "Áp dụng lại thay đổi của AI",
+      "redo": "Làm lại",
+      "revertTitle": "Hoàn tác thay đổi AI gần nhất",
+      "revert": "Hoàn tác",
+      "dismiss": "Bỏ qua"
+    }
+  },
+  "scriptCategoryTree": {
+    "errors": {
+      "fetch": "Không thể tải các script",
+      "generic": "Đã xảy ra lỗi",
+      "rename": "Không thể đổi tên danh mục"
+    },
+    "allScripts": "Tất cả Script",
+    "selectedCategory": "Danh mục đã chọn",
+    "loading": "Đang tải danh mục...",
+    "title": "Danh mục Script",
+    "description": "Tổ chức script thành các thư mục con.",
+    "actions": {
+      "newCategory": "Danh mục mới",
+      "rename": "Đổi tên",
+      "addSubcategory": "Thêm danh mục con"
+    },
+    "empty": {
+      "categories": "Không tìm thấy danh mục. Tạo một danh mục để bắt đầu.",
+      "scripts": "Không tìm thấy script."
+    },
+    "highlightDescription": "Script được gắn thẻ dưới {{category}} và các danh mục con",
+    "selectDescription": "Chọn một danh mục để làm nổi bật các script của danh mục đó.",
+    "idLabel": "ID: {{id}}",
+    "renameDialog": {
+      "title": "Đổi tên Danh mục",
+      "description": "Cập nhật tiêu đề danh mục."
+    },
+    "newDialog": {
+      "title": "Danh mục mới",
+      "subcategoryTitle": "Thêm danh mục con",
+      "description": "Tạo danh mục cấp cao nhất mới.",
+      "subcategoryDescription": "Đặt tên cho danh mục con mới."
+    },
+    "deleteDialog": {
+      "title": "Xóa Danh mục",
+      "description": "Thao tác này sẽ xóa danh mục và các danh mục con. Script sẽ vẫn được giữ lại nhưng chuyển thành chưa phân loại."
+    },
+    "status": {
+      "active": "Hoạt động",
+      "draft": "Bản nháp",
+      "archived": "Đã lưu trữ"
+    }
+  },
+  "scriptEditPage": {
+    "errors": {
+      "fetch": "Không thể tải script",
+      "generic": "Đã xảy ra lỗi",
+      "save": "Không thể lưu script",
+      "duplicate": "Không thể nhân bản script"
+    },
+    "toast": {
+      "created": "Đã tạo script",
+      "saved": "Đã lưu script"
+    },
+    "loading": "Đang tải script...",
+    "actions": {
+      "backToScripts": "Quay lại Script",
+      "executionHistory": "Lịch sử Chạy",
+      "duplicate": "Nhân bản",
+      "create": "Tạo Script",
+      "saveChanges": "Lưu Thay đổi"
+    },
+    "breadcrumb": {
+      "scripts": "Script",
+      "new": "Script Mới",
+      "edit": "Sửa Script"
+    },
+    "title": {
+      "new": "Script Mới",
+      "edit": "Sửa tập lệnh"
+    }
+  },
+  "scriptExecutionModal": {
+    "errors": {
+      "selectDevice": "Vui lòng chọn ít nhất một thiết bị",
+      "executionFailed": "Thực thi thất bại"
+    },
+    "toasts": {
+      "runsWhenOnline": "Chạy khi thiết bị trực tuyến"
+    },
+    "title": "Thực thi tập lệnh",
+    "fields": {
+      "language": "Ngôn ngữ",
+      "category": "Danh mục",
+      "targetOs": "HĐH mục tiêu",
+      "runAs": "Chạy với quyền"
+    },
+    "runAs": {
+      "system": "Hệ thống",
+      "user": "Người dùng đã đăng nhập",
+      "systemDescription": "Chạy trong ngữ cảnh dịch vụ agent.",
+      "userDescription": "Chạy trong ngữ cảnh người dùng đang đăng nhập khi trình hỗ trợ người dùng được kết nối."
+    },
+    "sections": {
+      "selectDevices": "Chọn thiết bị"
+    },
+    "actions": {
+      "selectAllOnline": "Chọn tất cả thiết bị trực tuyến",
+      "clear": "Xóa ({{count}})",
+      "advancedFilters": "Bộ lọc nâng cao",
+      "executing": "Đang thực thi...",
+      "started": "Đã bắt đầu!",
+      "queued": "Đã xếp hàng",
+      "reviewResult": "Xem lại kết quả",
+      "confirmExecute": "Xác nhận thực thi",
+      "execute": "Thực thi"
+    },
+    "searchPlaceholder": "Tìm theo tên máy...",
+    "filters": {
+      "allSites": "Tất cả chi nhánh",
+      "allStatus": "Tất cả trạng thái"
+    },
+    "status": {
+      "maintenance": "Bảo trì"
+    },
+    "matchCount": "{{count}} kết quả khớp",
+    "empty": {
+      "noCompatibleDevices": "Không tìm thấy thiết bị tương thích. Tập lệnh này yêu cầu {{os}}.",
+      "offlineFiltered_one": "Không có thiết bị {{status}} nào khớp. {{count}} thiết bị tương thích bị ẩn bởi bộ lọc trạng thái — hiển thị tất cả thiết bị để bao gồm thiết bị đó.",
+      "offlineFiltered_other": "Không có thiết bị {{status}} nào khớp. {{count}} thiết bị tương thích bị ẩn bởi bộ lọc trạng thái — hiển thị tất cả thiết bị để bao gồm các thiết bị đó.",
+      "showAllDevices": "Hiển thị tất cả thiết bị"
+    },
+    "orSeparator": " hoặc ",
+    "progress": {
+      "submitting": "Đang gửi đến {{count}} thiết bị...",
+      "submitted": "Đã gửi đến {{count}} thiết bị",
+      "admitted": "{{admitted}} / {{count}} thiết bị được đưa vào hàng đợi",
+      "submittingTarget": "Đang gửi"
+    },
+    "admission": {
+      "allAdmitted": "Tất cả thiết bị đã chọn đã được chấp nhận và đưa vào hàng đợi.",
+      "partiallyAdmitted": "Một số thiết bị đã được chấp nhận và đưa vào hàng đợi. Xem lại các mục tiêu còn lại.",
+      "rejected": "Không có thiết bị nào được chấp nhận. Xem lại lý do bên dưới.",
+      "queued": "Đã xếp hàng",
+      "reasons": {
+        "not_found_or_inaccessible": "Không tìm thấy thiết bị hoặc không thể truy cập",
+        "site_access_denied": "Bạn không có quyền truy cập vào chi nhánh của thiết bị này",
+        "script_org_mismatch": "Tập lệnh này thuộc về tổ chức khác với thiết bị",
+        "os_incompatible": "Tập lệnh không tương thích với hệ điều hành của thiết bị này",
+        "device_decommissioned": "Thiết bị đã ngừng hoạt động",
+        "maintenance_suppressed": "Đã bỏ qua: thiết bị đang trong khung thời gian bảo trì"
+      }
+    },
+    "confirm": {
+      "title": "Xác nhận thực thi",
+      "description": "Chạy “{{name}}” trên {{count}} thiết bị với tư cách {{runAs}}. Các tập lệnh được đưa vào hàng đợi và bắt đầu thực thi ngay lập tức.",
+      "descriptionOffline": "Chạy “{{name}}” trên {{count}} thiết bị với tư cách {{runAs}}. Các tập lệnh hiện đang được xếp hàng: thiết bị trực tuyến bắt đầu ngay lập tức, và {{offline}} thiết bị ngoại tuyến sẽ chạy khi kết nối lại."
+    },
+    "selectedCount": "Đã chọn {{count}} thiết bị",
+    "executeBlocked": "Không thể thực thi: thiết bị đã chọn không thể chạy tập lệnh này ở đây (có thể thuộc tổ chức khác với tổ chức hiển thị, hoặc không còn khả dụng).",
+    "languages": {
+      "powershell": "PowerShell",
+      "bash": "Bash",
+      "python": "Python",
+      "cmd": "CMD"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "targetMode": {
+      "label": "Chạy trên",
+      "devices": "Thiết bị",
+      "groups": "Nhóm thiết bị"
+    },
+    "groups": {
+      "title": "Chọn nhóm thiết bị",
+      "searchPlaceholder": "Tìm kiếm nhóm",
+      "selectedCount": "Đã chọn {{count}} nhóm",
+      "dynamic": "Động",
+      "deviceCount": "{{count}} thiết bị",
+      "refusedReason": "Không khả dụng làm mục tiêu chạy: các quy tắc của nhóm này khớp với các trường mà thiết bị tự báo cáo ({{fields}}).",
+      "loading": "Đang tải nhóm thiết bị...",
+      "loadFailed": "Không thể tải nhóm thiết bị.",
+      "retry": "Thử lại",
+      "empty": "Không tìm thấy nhóm thiết bị nào.",
+      "tooManyGroups": "Một lần chạy có thể nhắm mục tiêu tối đa {{max}} nhóm.",
+      "countingMembers": "Đang đếm thành viên...",
+      "countFailed": "Không thể đếm số thành viên của các nhóm đã chọn. Máy chủ sẽ kiểm tra giới hạn khi bạn chạy.",
+      "summaryUnique": "{{count}} thiết bị duy nhất trong các nhóm đã chọn",
+      "summaryCompatible": "{{count}} thiết bị có thể chạy tập lệnh này (khớp hệ điều hành)",
+      "summaryOffline": "{{count}} trong số đó ngoại tuyến và sẽ chạy khi thiết bị trực tuyến",
+      "membershipNote": "Thành viên nhóm động được tính theo lần đánh giá gần nhất và sẽ được đọc lại khi quá trình chạy bắt đầu.",
+      "overCap": "Các nhóm này chứa {{count}} thiết bị duy nhất, vượt quá giới hạn {{max}} mỗi lần chạy. Hãy bỏ chọn một nhóm hoặc chia nhỏ lần chạy.",
+      "submitting": "Đang gửi đến {{count}} nhóm...",
+      "warningsTitle": "Ghi chú từ máy chủ",
+      "confirmDescription": "Chạy “{{name}}” trên {{groups}} nhóm thiết bị với tư cách {{runAs}}. Các tập lệnh được đưa vào hàng đợi và bắt đầu thực thi ngay lập tức.",
+      "confirmDescriptionOffline": "Chạy “{{name}}” trên {{groups}} nhóm thiết bị với tư cách {{runAs}}. Các tập lệnh hiện đang được xếp hàng: thiết bị trực tuyến bắt đầu ngay lập tức, và {{offline}} thiết bị ngoại tuyến sẽ chạy khi kết nối lại.",
+      "confirmMembers": "{{count}} thiết bị duy nhất đang có trong các nhóm này; thành viên sẽ được đọc lại khi bạn xác nhận.",
+      "confirmMembersUnknown": "Chưa rõ số lượng thiết bị; thành viên sẽ được đọc khi bạn xác nhận.",
+      "errors": {
+        "selectGroup": "Vui lòng chọn ít nhất một nhóm thiết bị",
+        "tooManyTargets": "Các nhóm này phân giải thành {{count}} thiết bị, vượt quá giới hạn {{max}} mỗi lần chạy. Hãy bỏ chọn một nhóm hoặc chia nhỏ lần chạy.",
+        "perGroup": "Số thiết bị mỗi nhóm: {{groups}}.",
+        "groupNotFound": "{{count}} nhóm đã chọn không còn tồn tại hoặc không thể truy cập. Tải lại danh sách và thử lại.",
+        "noTargets": "Các nhóm đã chọn không chứa thiết bị nào mà lần chạy này có thể nhắm tới; không có gì được chạy."
+      }
+    }
+  },
+  "secretParameters": {
+    "requiresSystemContext": "Tập lệnh này sử dụng biến bí mật, chỉ được gửi tới các lần chạy ở ngữ cảnh hệ thống không có mục tiêu phiên. Các thiết bị sẽ báo lỗi \"not executed\" (chưa thực thi) khi chạy với quyền người dùng, hoặc khi nhắm mục tiêu vào một phiên cụ thể."
+  },
+  "scriptExecutionsPage": {
+    "errors": {
+      "fetchScript": "Không thể tải tập lệnh",
+      "generic": "Đã xảy ra lỗi",
+      "fetchExecutions": "Không thể tải các lần thực thi",
+      "execute": "Không thể thực thi tập lệnh"
+    },
+    "loading": "Đang tải lịch sử thực thi...",
+    "actions": {
+      "backToScripts": "Quay lại danh sách tập lệnh",
+      "backToScript": "Quay lại tập lệnh",
+      "runScript": "Chạy tập lệnh"
+    },
+    "breadcrumb": {
+      "scripts": "Tập lệnh",
+      "script": "Tập lệnh",
+      "executions": "Thực thi"
+    },
+    "title": "Lịch sử thực thi",
+    "fields": {
+      "language": "Ngôn ngữ",
+      "category": "Danh mục",
+      "targetOs": "HĐH mục tiêu"
+    },
+    "languages": {
+      "powershell": "PowerShell",
+      "bash": "Bash",
+      "python": "Python",
+      "cmd": "CMD"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "status": {
+      "active": "Đang hoạt động",
+      "draft": "Bản nháp",
+      "archived": "Đã lưu trữ"
+    }
+  },
+  "scriptForm": {
+    "editor": {
+      "loadError": "Không thể tải trình soạn thảo mã. Hãy thử làm mới trang.",
+      "refreshPage": "Làm mới trang",
+      "loading": "Đang tải trình soạn thảo..."
+    },
+    "unsavedConfirm": "Bạn có các thay đổi chưa được lưu. Rời khỏi trang này?",
+    "actions": {
+      "saveScript": "Lưu tập lệnh",
+      "removeParameter": "Xóa tham số",
+      "addParameter": "Thêm tham số",
+      "removeMapping": "Xóa liên kết",
+      "addExitCode": "Thêm mã thoát"
+    },
+    "availability": {
+      "title": "Khả dụng cho",
+      "description": "Thay đổi tổ chức nào có thể xem và chạy tập lệnh này. “Tất cả tổ chức của tôi” áp dụng cho toàn bộ đối tác.",
+      "partner": "Tất cả tổ chức của tôi",
+      "organization": "Một tổ chức cụ thể",
+      "selectOrganization": "Chọn một tổ chức",
+      "requiresFullPartnerAccess": "Yêu cầu quyền truy cập đầy đủ của tổ chức đối tác. Hãy hỏi quản trị viên đối tác có quyền truy cập vào tất cả các tổ chức.",
+      "partnerWideReadOnly": "Tập lệnh này áp dụng cho tất cả các tổ chức của bạn. Việc chỉnh sửa yêu cầu quyền truy cập đầy đủ của tổ chức đối tác."
+    },
+    "fields": {
+      "name": "Tên tập lệnh",
+      "category": "Danh mục",
+      "language": "Ngôn ngữ",
+      "targetOs": "HĐH đích",
+      "defaultValue": "Giá trị mặc định",
+      "options": "Tùy chọn",
+      "timeoutSeconds": "Thời gian chờ (giây)",
+      "runAs": "Chạy dưới quyền",
+      "exitCode": "Mã thoát",
+      "severity": "Mức độ nghiêm trọng",
+      "source": "Nguồn",
+      "fallbackValue": "Giá trị dự phòng"
+    },
+    "placeholders": {
+      "name": "Xóa tệp tạm",
+      "description": "Mô tả tập lệnh này làm gì...",
+      "parameterName": "paramName",
+      "defaultValue": "Mặc định",
+      "options": "tùy_chọn_1, tùy_chọn_2, tùy_chọn_3",
+      "exitCode": "ví dụ: 1"
+    },
+    "sections": {
+      "content": "Nội dung tập lệnh",
+      "parameters": "Tham số",
+      "executionSettings": "Cài đặt thực thi",
+      "exitCodeSeverity": "Mức độ nghiêm trọng của mã thoát"
+    },
+    "ai": {
+      "toggleTitle": "Bật/Tắt Breeze AI (⌘⇧I)",
+      "button": "Breeze AI"
+    },
+    "parameters": {
+      "emptyPrefix": "Chưa có tham số nào. Tham số cho phép người dùng cung cấp giá trị khi chạy — tham chiếu chúng trong tập lệnh của bạn dưới dạng",
+      "emptyMiddle": "(PowerShell/Bash) hoặc",
+      "emptySuffix": "(Python).",
+      "sourceAriaLabel": "Nguồn cho tham số {{index}}"
+    },
+    "execution": {
+      "timeoutHint": "Tập lệnh sẽ bị dừng sau khoảng thời gian này. Mặc định 300s (5 phút) phù hợp với hầu hết tác vụ. Tối đa 3600s (1 giờ).",
+      "elevatedHint": "Sử dụng sudo trên macOS/Linux, runas trên Windows."
+    },
+    "exitCodeSeverity": {
+      "emptyPrefix": "Ánh xạ các mã thoát cụ thể với mức độ cảnh báo. Khi một lần chạy tự động (theo lịch trình, tự động hóa, chính sách hoặc do cảnh báo kích hoạt) trả về một trong các mã này, cảnh báo sẽ được tạo ở mức độ đã cấu hình; các lần chạy thủ công không bao giờ tạo cảnh báo. Lần chạy sau kết thúc sạch sẽ sẽ giải quyết cảnh báo đó. Chọn",
+      "suppressAlert": "Ẩn cảnh báo",
+      "emptySuffix": "để đánh dấu mã là thông tin (không có cảnh báo). Mã khác 0 không nằm trong danh sách sẽ sử dụng mức độ thấp hơn gần nhất trong danh sách, hoặc trung bình.",
+      "suppressHint": "Ẩn cảnh báo — mã thoát được coi là thông tin, không có sự cố nào được tạo."
+    },
+    "keyboardSave": "{{shortcut}} để lưu",
+    "languages": {
+      "powershell": "PowerShell",
+      "bash": "Bash",
+      "python": "Python",
+      "cmd": "CMD (Batch)"
+    },
+    "runAs": {
+      "system": {
+        "label": "Hệ thống",
+        "description": "Chạy dưới tài khoản hệ thống/root"
+      },
+      "user": {
+        "label": "Người dùng hiện tại",
+        "description": "Chạy dưới tài khoản người dùng đang đăng nhập"
+      },
+      "elevated": {
+        "label": "Nâng quyền",
+        "description": "Chạy với quyền quản trị viên"
+      }
+    },
+    "parameterTypes": {
+      "string": "Văn bản",
+      "number": "Số",
+      "boolean": "Boolean",
+      "select": "Chọn"
+    },
+    "severity": {
+      "critical": "Nghiêm trọng",
+      "high": "Cao",
+      "medium": "Trung bình",
+      "low": "Thấp",
+      "info": "Thông tin",
+      "__suppress__": "Ẩn cảnh báo"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "variables": {
+      "button": "Biến",
+      "insertTitle": "Chèn biến",
+      "empty": "Chưa có biến nào.",
+      "secretUnavailable": "Bí mật — liên kết thông qua tham số với nguồn \"Từ biến bí mật\".",
+      "unknown": "Không có biến nào cho {{keys}} — các thiết bị đích sẽ thất bại cho đến khi bạn tạo biến đó."
+    },
+    "parameterSources": {
+      "runtime": "Hỏi khi chạy",
+      "tenantVariable": "Từ biến",
+      "deviceCustomField": "Từ trường tùy chỉnh của thiết bị",
+      "builtin": "Từ thuộc tính thiết bị",
+      "tenantSecret": "Từ biến bí mật (biến môi trường)"
+    },
+    "parameterBinding": {
+      "variableLabel": "Khóa biến",
+      "variablePlaceholder": "ví dụ: vendor_token",
+      "fieldLabel": "Khóa trường tùy chỉnh",
+      "fieldPlaceholder": "ví dụ: asset_tag",
+      "fieldHelp": "Nhập Khóa trường hiển thị trong Cài đặt → Trường tùy chỉnh (phân biệt chữ hoa chữ thường). Đọc: giá trị được phân giải sẽ được chuyển đến tập lệnh dưới dạng biến môi trường BREEZE_PARAM_<KEY> (tên tham số ở dạng chữ hoa cách nhau bằng dấu gạch dưới) và dưới dạng trình giữ chỗ {{paramName}} — không có lời nhắc nào hiển thị. Ghi: in ::breeze:custom-fields:: {\"key\": \"value\"} ra stdout đối với trường đã bật \"Cho phép tập lệnh ghi trường này\". Xem phần \"Đọc và ghi trường tùy chỉnh\" bên dưới trình soạn thảo để biết ví dụ.",
+      "fieldHelpAriaLabel": "Giới thiệu về liên kết trường tùy chỉnh của thiết bị",
+      "builtinLabel": "Thuộc tính",
+      "chooseTitle": "Chọn biến",
+      "secretRejected": "\"{{key}}\" là bí mật — việc lưu sẽ bị từ chối. Hãy chọn một biến không phải là bí mật.",
+      "notSecret": "\"{{key}}\" không phải là bí mật. Hãy chọn biến bí mật, hoặc chuyển nguồn sang \"Từ biến\".",
+      "notSecretRow": "Không phải bí mật — sử dụng \"Từ biến\"",
+      "secretHint": "Chỉ được truyền dưới dạng biến môi trường {{env}} — không bao giờ được ghi vào tập lệnh. Yêu cầu thực thi ở ngữ cảnh hệ thống và tác nhân hỗ trợ truyền bí mật an toàn.",
+      "hint": "Được phân giải cho mọi thiết bị đích khi tập lệnh chạy — không ai bị hỏi."
+    },
+    "securityReview": {
+      "title": "Kiểm tra bảo mật",
+      "blockedHint_one": "Tập lệnh này khớp với 1 mẫu mà tác nhân từ chối chạy nếu không có sự xác nhận.",
+      "blockedHint_other": "Tập lệnh này khớp với {{count}} mẫu mà tác nhân từ chối chạy nếu không có sự xác nhận. Hãy xác nhận từng mẫu bạn muốn.",
+      "clearedHint": "Mọi mẫu khớp đã được xác nhận.",
+      "willBlock": "Chưa xác nhận — tác nhân sẽ từ chối chạy tập lệnh này.",
+      "footnote": "Việc xác nhận chỉ áp dụng cho tập lệnh này và chỉ bao gồm các mẫu được liệt kê ở đây. Nếu sau đó bạn thêm một thao tác rủi ro khác, thao tác đó sẽ bị chặn cho đến khi bạn xác nhận."
+    },
+    "customFieldHelp": {
+      "title": "Đọc và ghi trường tùy chỉnh",
+      "readLabel": "Đọc:",
+      "read": "liên kết tham số với trường tùy chỉnh (nguồn \"Từ trường tùy chỉnh của thiết bị\"). Giá trị đến dưới dạng biến môi trường",
+      "readPlaceholders": "và dưới dạng trình giữ chỗ",
+      "writeLabel": "Ghi:",
+      "write": "in một dòng ra stdout theo định dạng",
+      "writeGate": "Trường phải bật \"Cho phép tập lệnh ghi trường này\" trong Cài đặt → Trường tùy chỉnh. Các giá trị được xác thực theo kiểu trường; các khóa bị từ chối được liệt kê trong chi tiết chạy.",
+      "secretCaveat": "Giá trị được ghi cũng xuất hiện trong đầu ra đã lưu của tập lệnh — không bao giờ ghi bí mật theo cách này. Thay vào đó hãy sử dụng biến bí mật.",
+      "insertExample": "Chèn ví dụ",
+      "docsLink": "Tài liệu trường tùy chỉnh"
+    }
+  },
+  "scriptList": {
+    "never": "Không bao giờ",
+    "relativeTime": {
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "daysAgo": "{{count}} ngày trước"
+    },
+    "searchPlaceholder": "Tìm kiếm tập lệnh...",
+    "filters": {
+      "allCategories": "Tất cả danh mục",
+      "allLanguages": "Tất cả ngôn ngữ",
+      "allOs": "Tất cả HĐH"
+    },
+    "languages": {
+      "powershell": "PowerShell",
+      "bash": "Bash",
+      "python": "Python",
+      "cmd": "CMD"
+    },
+    "os": {
+      "windows": "Windows",
+      "macos": "macOS",
+      "linux": "Linux"
+    },
+    "summary": "{{shown}} / {{total}}",
+    "headers": {
+      "language": "Ngôn ngữ",
+      "category": "Danh mục",
+      "os": "HĐH",
+      "lastRun": "Chạy lần cuối"
+    },
+    "empty": "Không tìm thấy tập lệnh nào. Hãy thử điều chỉnh tìm kiếm hoặc bộ lọc.",
+    "actions": {
+      "runTitle": "Chạy tập lệnh",
+      "editTitle": "Sửa tập lệnh",
+      "duplicateTitle": "Nhân bản tập lệnh",
+      "deleteTitle": "Xóa tập lệnh"
+    },
+    "pagination": {
+      "showing": "Hiển thị từ {{start}} đến {{end}} trong tổng số {{total}}",
+      "page": "Trang {{page}} / {{total}}"
+    },
+    "status": {
+      "active": "Đang hoạt động",
+      "draft": "Bản nháp",
+      "archived": "Đã lưu trữ"
+    }
+  },
+  "scriptParametersForm": {
+    "validation": {
+      "required": "Tham số \"{{name}}\" là bắt buộc",
+      "number": "Tham số \"{{name}}\" phải là một số hợp lệ"
+    },
+    "title": "Tham số",
+    "selectPlaceholder": "Chọn...",
+    "allSupplied": "Mọi tham số đều được cung cấp tự động — không có gì cần điền.",
+    "suppliedBy": {
+      "tenantVariable": "Được cung cấp tự động từ biến {{key}}",
+      "deviceCustomField": "Được cung cấp tự động từ trường tùy chỉnh thiết bị {{key}}",
+      "builtin": "Được cung cấp tự động từ {{key}}",
+      "tenantSecret": "Được cung cấp bảo mật từ biến bí mật {{key}} dưới dạng biến môi trường"
+    }
+  },
+  "scriptTagManager": {
+    "errors": {
+      "fetch": "Không thể tải tập lệnh",
+      "generic": "Đã xảy ra lỗi",
+      "add": "Không thể thêm thẻ",
+      "delete": "Không thể xóa thẻ",
+      "assign": "Không thể gán thẻ"
+    },
+    "loading": "Đang tải thẻ...",
+    "title": "Thẻ tập lệnh",
+    "summary": "{{tagCount}} thẻ trên {{scriptCount}} tập lệnh",
+    "description": "Quản lý nhãn tái sử dụng",
+    "sections": {
+      "allTags": "Tất cả thẻ",
+      "addNew": "Thêm thẻ mới",
+      "bulkAssign": "Gán hàng loạt thẻ"
+    },
+    "empty": {
+      "tags": "Không tìm thấy thẻ nào. Tạo một thẻ bên dưới.",
+      "scripts": "Không tìm thấy tập lệnh nào."
+    },
+    "usedOn": "Được sử dụng trên {{count}} tập lệnh",
+    "actions": {
+      "deleteTag": "Xóa thẻ",
+      "applyTags": "Áp dụng thẻ cho các tập lệnh đã chọn"
+    },
+    "placeholders": {
+      "tagName": "Tên thẻ"
+    },
+    "bulkDescription": "Chọn tập lệnh, sau đó chọn thẻ để áp dụng.",
+    "deleteDialog": {
+      "title": "Xóa thẻ",
+      "confirmPrefix": "Xóa",
+      "confirmSuffix": "thẻ? Thao tác này sẽ xóa thẻ khỏi tất cả tập lệnh."
+    }
+  },
+  "scriptTemplateGallery": {
+    "errors": {
+      "fetch": "Không thể tải mẫu",
+      "load": "Không thể tải mẫu"
+    },
+    "title": "Thư viện mẫu",
+    "description": "Duyệt các mẫu tập lệnh có thể tái sử dụng.",
+    "searchPlaceholder": "Tìm kiếm mẫu",
+    "languages": {
+      "powershell": "PowerShell",
+      "bash": "Bash",
+      "python": "Python",
+      "cmd": "CMD"
+    },
+    "empty": "Không tìm thấy mẫu nào khớp với tiêu chí của bạn.",
+    "downloadCount": "{{count}} lượt tải xuống",
+    "actions": {
+      "useTemplate": "Sử dụng mẫu"
+    }
+  },
+  "scriptVersionHistory": {
+    "errors": {
+      "fetch": "Không thể tải phiên bản tập lệnh",
+      "generic": "Đã xảy ra lỗi",
+      "rollback": "Không thể hoàn tác phiên bản tập lệnh",
+      "rollbackFailed": "Hoàn tác thất bại"
+    },
+    "currentVersion": "Phiên bản hiện tại",
+    "loading": "Đang tải lịch sử phiên bản...",
+    "title": "Lịch sử phiên bản",
+    "description": "Theo dõi các bản sửa đổi tập lệnh và so sánh thay đổi.",
+    "activeVersion": "Phiên bản đang hoạt động:",
+    "empty": "Không có lịch sử phiên bản.",
+    "actions": {
+      "rollback": "Hoàn tác",
+      "rollingBack": "Đang hoàn tác...",
+      "confirmRollback": "Xác nhận hoàn tác"
+    },
+    "compare": {
+      "title": "So sánh phiên bản",
+      "onlyOne": "Chỉ có một phiên bản. Thực hiện thay đổi để xem khác biệt.",
+      "selectTwo": "Chọn hai phiên bản để xem khác biệt."
+    },
+    "rollbackDialog": {
+      "title": "Hoàn tác tập lệnh",
+      "confirmPrefix": "Hoàn tác về phiên bản",
+      "confirmSuffix": "Thao tác này sẽ đặt phiên bản này thành bản sửa đổi hoạt động."
+    }
+  },
+  "scriptsPage": {
+    "errors": {
+      "fetch": "Không thể tải tập lệnh",
+      "generic": "Đã xảy ra lỗi",
+      "execute": "Không thể thực thi tập lệnh",
+      "delete": "Không thể xóa tập lệnh",
+      "deleteTryAgain": "Không thể xóa tập lệnh. Vui lòng thử lại.",
+      "alreadyInLibrary": "\"{{name}}\" đã có trong thư viện của bạn",
+      "import": "Không thể nhập tập lệnh",
+      "duplicate": "Không thể nhân bản tập lệnh"
+    },
+    "toast": {
+      "deleting": "Đang xóa \"{{name}}\"...",
+      "deleteCancelled": "Đã hủy xóa tập lệnh",
+      "deleted": "Đã xóa \"{{name}}\""
+    },
+    "loading": "Đang tải tập lệnh...",
+    "title": "Thư viện tập lệnh",
+    "description": "Quản lý và thực thi tập lệnh trên các thiết bị của bạn.",
+    "actions": {
+      "importFromLibrary": "Nhập từ Thư viện",
+      "newScript": "Tập lệnh mới",
+      "createScript": "Tạo tập lệnh",
+      "deleting": "Đang xóa..."
+    },
+    "empty": {
+      "title": "Chưa có tập lệnh nào",
+      "description": "Tạo tập lệnh đầu tiên để tự động hóa tác vụ trên hệ thống thiết bị."
+    },
+    "deleteDialog": {
+      "title": "Xóa tập lệnh",
+      "confirmPrefix": "Bạn có chắc chắn muốn xóa",
+      "confirmSuffix": "Thao tác này không thể hoàn tác."
+    },
+    "library": {
+      "target": "Nhập vào",
+      "allOrgs": "Tất cả tổ chức (toàn đối tác)",
+      "chooseOrg": "Chọn một tổ chức",
+      "partnerPermission": "Bạn không thể nhập tập lệnh cho tất cả tổ chức. Vui lòng chọn một tổ chức cụ thể.",
+      "importSuccess": "Đã nhập “{{name}}”",
+      "title": "Thư viện tập lệnh hệ thống",
+      "description": "Nhập tập lệnh vào tổ chức của bạn",
+      "searchPlaceholder": "Tìm kiếm tập lệnh hệ thống...",
+      "empty": "Không có tập lệnh hệ thống nào",
+      "noMatches": "Không có tập lệnh nào khớp với tìm kiếm của bạn",
+      "imported": "Đã nhập",
+      "import": "Nhập",
+      "availableCount": "{{count}} tập lệnh có sẵn"
+    }
+  },
+  "bundle": {
+    "exportButton": "Xuất",
+    "importButton": "Nhập gói",
+    "exportTitle": "Xuất gói tập lệnh",
+    "exportDescription": "Chọn tập lệnh để tải xuống dưới dạng gói JSON di động.",
+    "selectAll": "Chọn tất cả",
+    "clearSelection": "Bỏ chọn tất cả",
+    "exportSelected": "Xuất {{count}} đã chọn",
+    "exportEmpty": "Không có tập lệnh nào để xuất.",
+    "exportFailed": "Không thể xuất tập lệnh",
+    "importTitle": "Nhập gói tập lệnh",
+    "importDescription": "Tải lên một gói (.json) hoặc tệp tập lệnh rời (.ps1, .sh, .py, .bat).",
+    "systemWarning": "Các tập lệnh được nhập có thể chạy với tư cách SYSTEM trên thiết bị được quản lý. Chỉ nhập gói từ nguồn bạn tin cậy.",
+    "chooseFiles": "Chọn tệp",
+    "chooseFolder": "Chọn thư mục",
+    "parseErrors": "Không thể đọc một số tệp",
+    "previewFailed": "Không thể xem trước gói",
+    "importFailed": "Không thể nhập gói",
+    "nameColumn": "Tên",
+    "previewTitle": "Trạng thái",
+    "statusNew": "Mới",
+    "statusConflict": "Trùng tên",
+    "statusConflictPartnerWide": "Đã tồn tại trên toàn đối tác",
+    "partnerWideConflictHint": "Một tập lệnh chia sẻ trên toàn đối tác đang dùng tên này. Nó ở chế độ chỉ đọc — Bỏ qua hoặc Đổi tên.",
+    "modeLabel": "Khi tập lệnh có cùng tên đã tồn tại",
+    "modeSkip": "Bỏ qua",
+    "modeRename": "Nhập với tên mới",
+    "modeNewVersion": "Thêm làm phiên bản mới của tập lệnh hiện có",
+    "tagLegacy": "Gắn thẻ là nhập cũ",
+    "tagLegacyHint": "Thêm thẻ legacy-import để Fleet Design có thể kiểm kê mục đích của các tập lệnh này.",
+    "partnerWide": "Làm cho khả dụng với mọi tổ chức (toàn đối tác)",
+    "importCommit_one": "Nhập {{count}} tập lệnh",
+    "importCommit_other": "Nhập {{count}} tập lệnh",
+    "resultSummary": "Đã nhập {{imported}}, đã đổi tên {{renamed}}, đã tạo phiên bản {{versioned}}, đã bỏ qua {{skipped}}, thất bại {{failed}}",
+    "scriptCount": "{{count}} tập lệnh trong gói",
+    "statusInvalid": "Không hợp lệ",
+    "exportLimit": "Bạn có thể xuất tối đa {{max}} tập lệnh mỗi gói.",
+    "importDoneTitle": "Nhập hoàn tất",
+    "importDoneNothing": "Không có gì được nhập",
+    "importDoneOpen": "Mở tập lệnh",
+    "resultActionImported": "Đã nhập",
+    "resultActionRenamed": "Đã đổi tên từ {{name}}",
+    "resultActionVersioned": "Đã thêm làm phiên bản mới",
+    "resultOpen": "Mở"
+  },
+  "testRunner": {
+    "title": "Chạy thử",
+    "deviceSelectLabel": "Thiết bị thử nghiệm",
+    "devicePlaceholder": "Chọn thiết bị thử nghiệm…",
+    "noDevices": "Không có thiết bị tương thích",
+    "devicesLoadFailed": "Không thể tải thiết bị",
+    "deviceStatus": {
+      "offline": "ngoại tuyến",
+      "maintenance": "đang bảo trì"
+    },
+    "run": "Chạy Thử",
+    "saveAndRun": "Lưu & Chạy Thử",
+    "saveFirst": "Lưu tập lệnh một lần để bật tính năng chạy thử.",
+    "requiredParams": "Tham số bắt buộc không có giá trị mặc định ({{params}}) — hãy dùng hộp thoại Chạy Tập Lệnh thay thế.",
+    "offlineWarning": "Thiết bị được chọn đang ngoại tuyến — quá trình chạy sẽ đợi cho đến khi kết nối lại.",
+    "exitCode": "thoát {{code}}",
+    "viewHistory": "Xem lịch sử",
+    "runAgain": "Chạy lại",
+    "viewOnDevice": "Xem trên thiết bị",
+    "status": {
+      "pending": "Đang xếp hàng",
+      "running": "Đang chạy",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "timeout": "Hết thời gian",
+      "queued": "Đang xếp hàng",
+      "cancelled": "Đã hủy",
+      "cancelling": "Đang dừng…"
+    },
+    "errors": {
+      "execute": "Không thể bắt đầu chạy thử",
+      "save": "Lưu thất bại — sửa các lỗi trên và thử lại.",
+      "notStarted": "Quá trình chạy chưa bắt đầu (thiết bị có thể đang bảo trì).",
+      "pollDeadline": "Vẫn chưa có kết quả — hãy kiểm tra lịch sử thực thi để xem kết quả.",
+      "pollFailed": "Không thể đọc kết quả chạy — có thể nó đã bị xóa hoặc quyền truy cập của bạn đã thay đổi."
+    }
+  },
+  "provenance": {
+    "origin": "Nguồn gốc",
+    "originHuman": "Con người",
+    "originAiProposal": "Đề xuất bởi AI",
+    "originImported": "Đã nhập",
+    "originSystem": "Có sẵn",
+    "reviewed": "Đã xem xét",
+    "editedSinceReview": "Đã chỉnh sửa kể từ khi xem xét",
+    "notReviewed": "Chưa xem xét",
+    "notReviewedDetail": "Do AI soạn thảo và được con người phê duyệt, nhưng chưa thực hiện đánh giá mô hình trên phiên bản này.",
+    "provenanceTitle": "Nguồn gốc xuất xứ",
+    "reviewSummary": "Tóm tắt đánh giá",
+    "approvedBy": "Được phê duyệt bởi",
+    "evidenceErased": "Bằng chứng đánh giá đã bị xóa",
+    "allOrigins": "Tất cả nguồn gốc"
+  },
+  "scriptProposalDetail": {
+    "loading": "Đang tải…",
+    "loadError": "Không thể tải đề xuất này.",
+    "evidenceErased": "Bằng chứng đánh giá của đề xuất này đã bị xóa (tổ chức nguồn đã được hợp nhất hoặc thời gian lưu trữ dữ liệu đã kết thúc). Quá trình thực thi tập lệnh do nó tạo ra vẫn hiển thị trong lịch sử thiết bị.",
+    "statusLabel": "Trạng thái",
+    "riskTierLabel": "Cấp độ rủi ro",
+    "reviewSummaryLabel": "Tóm tắt của người đánh giá",
+    "riskLow": "Thấp",
+    "riskMedium": "Trung bình",
+    "riskHigh": "Cao",
+    "riskCritical": "Nghiêm trọng"
+  }
+}

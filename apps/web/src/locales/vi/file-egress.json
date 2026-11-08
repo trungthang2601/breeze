@@ -1,0 +1,98 @@
+{
+  "fileEgressPage": {
+    "title": "Thoát tệp (DLP)",
+    "subtitle": "Giám sát tệp rời khỏi thiết bị — sao chép vào USB hoặc chia sẻ mạng, và tải lên qua ứng dụng hoặc trình duyệt.",
+    "tabs": {
+      "policies": "Chính sách",
+      "activity": "Hoạt động"
+    }
+  },
+  "policiesList": {
+    "new": "Chính sách mới",
+    "empty": "Chưa có chính sách thoát tệp nào. Tạo một chính sách để bắt đầu giám sát.",
+    "allOrgs": "Tất cả tổ chức",
+    "partnerWideTitle": "Chính sách toàn đối tác — áp dụng cho tất cả tổ chức của bạn",
+    "loadError": "Không thể tải chính sách.",
+    "status": {
+      "enabled": "Đã bật",
+      "disabled": "Đã tắt"
+    },
+    "columns": {
+      "name": "Tên",
+      "scope": "Phạm vi",
+      "surfaces": "Bề mặt",
+      "status": "Trạng thái"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Mạng",
+      "uploads": "Tải lên"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Chính sách thoát tệp mới",
+    "editTitle": "Sửa chính sách thoát tệp",
+    "name": "Tên",
+    "enabled": "Đã bật giám sát",
+    "enabledHint": "Khi tắt, các agent được gán chính sách này sẽ không giám sát.",
+    "surfacesLegend": "Bề mặt cần theo dõi",
+    "watchRemovable": "USB / ổ đĩa di động",
+    "watchNetworkShares": "Chia sẻ mạng",
+    "watchUploads": "Tải lên qua ứng dụng / trình duyệt",
+    "watchUploadsHint": "Phát hiện tiến trình đọc tệp rồi tải lên (Messenger, Zalo, trình duyệt). Đây là heuristic tương quan — hiển thị tên tệp, ứng dụng và đích đến, không phải là bằng chứng về nội dung chính xác đã gửi.",
+    "uploadWatchlist": "Danh sách theo dõi tiến trình tải lên",
+    "uploadWatchlistHint": "Tên tiến trình cần theo dõi khi tải lên. Để trống để dùng mặc định (trình duyệt và ứng dụng chat phổ biến).",
+    "uploadWatchlistPlaceholder": "vd. Zalo.exe",
+    "ignoreGlobs": "Mẫu bỏ qua",
+    "ignoreGlobsHint": "Đường dẫn hoặc glob cần bỏ qua, vd. *.tmp hoặc tên thư mục tạm.",
+    "ignoreGlobsPlaceholder": "vd. *.tmp",
+    "minFileSize": "Kích thước tệp tối thiểu (bytes)",
+    "minFileSizeHint": "Bỏ qua tệp nhỏ hơn mức này. 0 = báo cáo tất cả.",
+    "scope": "Phạm vi",
+    "allOrganizations": "Tất cả tổ chức",
+    "partnerWide": "toàn đối tác",
+    "thisOrganization": "Tổ chức này",
+    "selectOrganization": "Chọn một tổ chức…",
+    "add": "Thêm",
+    "remove": "Xóa",
+    "save": "Lưu chính sách",
+    "cancel": "Hủy",
+    "delete": "Xóa",
+    "deleteConfirm": "Xóa chính sách này? Hành động này không thể hoàn tác.",
+    "saved": "Đã lưu chính sách.",
+    "deleted": "Đã xóa chính sách.",
+    "errors": {
+      "nameRequired": "Bắt buộc nhập tên.",
+      "orgRequired": "Chọn một tổ chức cho chính sách thuộc sở hữu của tổ chức.",
+      "save": "Không thể lưu chính sách.",
+      "delete": "Không thể xóa chính sách."
+    }
+  },
+  "eventsTable": {
+    "empty": "Không có sự kiện thoát nào trong khoảng này.",
+    "loadError": "Không thể tải sự kiện.",
+    "columns": {
+      "time": "Thời gian",
+      "device": "Thiết bị",
+      "type": "Loại",
+      "file": "Tệp",
+      "destination": "Đích đến",
+      "process": "Tiến trình"
+    },
+    "types": {
+      "removable": "USB / di động",
+      "network_share": "Chia sẻ mạng",
+      "app_upload": "Tải lên ứng dụng"
+    },
+    "filters": {
+      "type": "Loại",
+      "allTypes": "Tất cả loại",
+      "from": "Từ",
+      "to": "Đến"
+    },
+    "prev": "Trang trước",
+    "next": "Trang sau",
+    "showing": "Hiển thị {{from}}–{{to}} trong tổng số {{total}}",
+    "none": "—"
+  }
+}

@@ -1,0 +1,177 @@
+{
+  "page": {
+    "title": "Thiết kế hệ thống",
+    "description": "Bản thiết kế do AI tạo cho hệ thống thiết bị của tổ chức này: công dụng của từng thiết bị, điểm cần theo dõi và những thay đổi.",
+    "orgLabel": "Tổ chức",
+    "selectOrgPlaceholder": "Không có tổ chức nào",
+    "siteLabel": "Chi nhánh (tùy chọn)",
+    "allSites": "Tất cả chi nhánh",
+    "startButton": "Bắt đầu Thiết kế hệ thống",
+    "startError": "Không thể bắt đầu quá trình Thiết kế hệ thống.",
+    "startSuccess": "Đã bắt đầu chạy Thiết kế hệ thống.",
+    "running": "Đang chạy Thiết kế hệ thống…",
+    "empty": "Chưa có thiết kế hệ thống nào cho tổ chức này.",
+    "loadError": "Không thể tải các thiết kế hệ thống.",
+    "detailLoadError": "Không thể tải thiết kế hệ thống này.",
+    "loadingDesign": "Đang tải thiết kế…",
+    "downloadPdf": "Tải xuống PDF",
+    "downloadFailed": "Không thể tải xuống tệp PDF.",
+    "reviewApply": "Xem lại & Áp dụng",
+    "listColumns": {
+      "generated": "Đã tạo",
+      "functions": "Chức năng",
+      "watches": "Mục theo dõi",
+      "rules": "Quy tắc",
+      "applied": "Đã áp dụng"
+    },
+    "startSkipped": {
+      "modeOff": "Tác nhân thiết kế đang bị tắt đối với tổ chức này.",
+      "killSwitchOff": "Tác nhân AI đang bị tắt trên toàn hệ thống.",
+      "agentDisabled": "Tác nhân thiết kế đã bị vô hiệu hóa đối với tổ chức này.",
+      "noEffectiveAgent": "Chưa có tác nhân thiết kế nào được cấu hình cho tổ chức này.",
+      "orgBudgetExceeded": "Ngân sách AI của tổ chức này đã cạn kiệt trong kỳ này.",
+      "agentDailyBudgetExceeded": "Ngân sách hàng ngày của tác nhân thiết kế đã cạn kiệt.",
+      "maxConcurrentDesignRuns": "Quá trình Thiết kế hệ thống đang được thực hiện cho tổ chức này.",
+      "designRate": "Tổ chức này đã đạt giới hạn chạy Thiết kế hệ thống hiện tại.",
+      "duplicate": "Đã có yêu cầu chạy Thiết kế hệ thống tương tự.",
+      "generic": "Không thể bắt đầu quá trình ({{reason}}).",
+      "noDesignerAgent": "Chưa có tác nhân Thiết kế hệ thống nào cho đối tác của tổ chức này."
+    },
+    "fileAsDocument": "Lưu thành tài liệu",
+    "fileAsDocumentSuccess": "Đã lưu thiết kế vào thư viện tài liệu.",
+    "fileAsDocumentError": "Không thể lưu thiết kế thành tài liệu.",
+    "designerSetup": {
+      "status": {
+        "missing": "Chưa có tác nhân Thiết kế hệ thống nào.",
+        "off": "Tác nhân Thiết kế hệ thống đang bị tắt.",
+        "disabled": "Tác nhân Thiết kế hệ thống đã bị vô hiệu hóa.",
+        "killSwitchOff": "Tác nhân AI đang bị tắt trên toàn hệ thống."
+      },
+      "enableHint": "Bật tại đây. Tác nhân chỉ đọc hệ thống của bạn và viết thiết kế; không bao giờ thay đổi thiết bị.",
+      "askPartnerAdmin": "Yêu cầu quản trị viên đối tác bật tác nhân Thiết kế hệ thống tại Cài đặt → Tác nhân AI.",
+      "killSwitchHint": "Đây là cài đặt toàn hệ thống; không có gì trên trang này có thể thay đổi điều đó.",
+      "enableButton": "Bật Thiết kế hệ thống",
+      "enableSuccess": "Đã bật Thiết kế hệ thống.",
+      "enableError": "Không thể bật Thiết kế hệ thống.",
+      "errors": {
+        "partnerScopeRequired": "Chỉ quản trị viên đối tác mới có thể bật tác nhân Thiết kế hệ thống.",
+        "partnerAdminRequired": "Chỉ quản trị viên đối tác mới có thể bật tác nhân Thiết kế hệ thống.",
+        "killSwitchOff": "Tác nhân AI đang bị tắt trên toàn hệ thống.",
+        "agentKindExists": "Tác nhân thiết kế đã tồn tại. Làm mới và thử lại.",
+        "actPrerequisitesNotMet": "Tác nhân thiết kế cần có người nhận trước khi có thể chạy. Thêm một người tại Cài đặt → Tác nhân AI.",
+        "invalidRecipients": "Tài khoản của bạn không thể được đặt làm người nhận của tác nhân thiết kế. Thêm một người tại Cài đặt → Tác nhân AI."
+      }
+    }
+  },
+  "sections": {
+    "found": "Những gì đã tìm thấy",
+    "functions": "Công dụng của từng thiết bị",
+    "monitoring": "Nội dung cần theo dõi và lý do",
+    "retired": "Nội dung không được chuyển tiếp",
+    "automation": "Tự động hóa",
+    "legacy": "Kho kịch bản cũ",
+    "baseline": "Cơ sở và tiền đề",
+    "unsure": "Những gì nhà thiết kế còn chưa chắc chắn"
+  },
+  "items": {
+    "none": "Không có gì ở đây.",
+    "applied": "Đã áp dụng",
+    "findingCount": "{{title}} — {{count}} thiết bị",
+    "functionMeta": "{{count}} thiết bị · độ tin cậy {{pct}}%",
+    "roleCorrectionLabel": "{{from}} → {{to}}"
+  },
+  "automation": {
+    "showContent": "Hiển thị nội dung kịch bản"
+  },
+  "legacy": {
+    "columns": {
+      "script": "Kịch bản",
+      "bucket": "Nhóm",
+      "coveredBy": "Được bao phủ bởi",
+      "intent": "Mục đích",
+      "notes": "Ghi chú"
+    },
+    "bucket": {
+      "obsolete": "Đã lỗi thời",
+      "covered": "Đã bao phủ",
+      "needed": "Cần thiết"
+    }
+  },
+  "drawer": {
+    "title": "Áp dụng Thiết kế hệ thống",
+    "loadingPreview": "Đang kiểm tra tác vụ này…",
+    "nothingSelected": "Chọn ít nhất một mục để áp dụng.",
+    "creates": "Tạo ra",
+    "createsScripts": "Tạo các kịch bản",
+    "scriptRenamed": "đã có kịch bản mang tên này — kịch bản mới sẽ có hậu tố là số",
+    "scriptsNote": "Được tạo trong thư viện kịch bản của tổ chức này, được gắn thẻ fleet-design. Không có gì chạy cho đến khi có người thực thi; tính năng hoàn tác sẽ gỡ thẻ và giữ nguyên kịch bản.",
+    "watchCount_one": "{{count}} mục theo dõi",
+    "watchCount_other": "{{count}} mục theo dõi",
+    "ruleCount_one": "{{count}} quy tắc",
+    "ruleCount_other": "{{count}} quy tắc",
+    "retires": "Ngừng sử dụng",
+    "displaces": "Thay thế",
+    "displacesCount": "{{count}} thiết bị",
+    "acceptDisplacement": "Chấp nhận thay thế",
+    "roleCorrections": "Điều chỉnh vai trò",
+    "billingWarning": "Thay đổi vai trò có thể ảnh hưởng đến việc thanh toán.",
+    "alreadyApplied": "Đã áp dụng",
+    "blockers": "Điểm nghẽn",
+    "cancel": "Hủy",
+    "confirm": "Xác nhận",
+    "applyingCloseBlocked": "Đang áp dụng — vui lòng đợi quá trình này hoàn tất.",
+    "rollingBackCloseBlocked": "Đang hoàn tác — vui lòng đợi quá trình này hoàn tất."
+  },
+  "result": {
+    "applied": "Đã áp dụng {{count}} mục.",
+    "skipped": "Đã bỏ qua {{count}} mục đã được áp dụng.",
+    "partial": "Áp dụng một phần — lỗi tại bước {{step}}: {{reason}}",
+    "rollback": "Hoàn tác những gì đã áp dụng",
+    "rollbackDone": "Đã hoàn tác {{count}} mục.",
+    "rollbackRefused": "Không thể hoàn tác một số mục:",
+    "close": "Đóng"
+  },
+  "errors": {
+    "genericPreview": "Không thể xem trước Thiết kế hệ thống này.",
+    "genericApply": "Không thể áp dụng Thiết kế hệ thống này.",
+    "genericRollback": "Không thể hoàn tác Thiết kế hệ thống này.",
+    "blocked": "Chưa thể áp dụng thiết kế này — hãy giải quyết các điểm nghẽn và thử lại.",
+    "site_restricted": "Tài khoản bị giới hạn chi nhánh không thể áp dụng hoặc hoàn tác Thiết kế hệ thống.",
+    "no_designer_agent": "Chưa có tác nhân thiết kế nào được cấu hình cho tổ chức này.",
+    "not_found": "Không tìm thấy Thiết kế hệ thống này.",
+    "scripts_write_required": "Việc tạo kịch bản yêu cầu quyền ghi Kịch bản. Bỏ chọn các kịch bản được đề xuất hoặc liên hệ quản trị viên."
+  },
+  "drift": {
+    "banner": "Sự lệch chuẩn kể từ khi thiết kế được áp dụng vào {{date}}: thiếu {{missing}}, thừa {{extra}}, thay đổi {{changed}}.",
+    "deviceCount_one": "{{count}} thiết bị",
+    "deviceCount_other": "{{count}} thiết bị",
+    "rows": {
+      "missing": "Thiếu",
+      "extra": "Thừa",
+      "changed": "Đã thay đổi"
+    },
+    "columns": {
+      "drift": "Sự lệch chuẩn",
+      "kind": "Loại",
+      "item": "Mục",
+      "scope": "Chức năng / chính sách",
+      "detail": "Chi tiết"
+    }
+  },
+  "evidence": {
+    "notMeasured": "Chưa đo lường",
+    "org": "Tổ chức",
+    "devices": "Thiết bị",
+    "software": "Kho phần mềm",
+    "services": "Dịch vụ hệ thống",
+    "network": "Bằng chứng mạng",
+    "posture": "Trạng thái bảo mật",
+    "health": "Tình trạng đội máy",
+    "configuration": "Cấu hình",
+    "automation": "Bằng chứng tự động hóa",
+    "logs": "Nhật ký sự kiện",
+    "counts": "Số lượng hoạt động",
+    "precursors": "Chỉ báo cảnh báo sớm",
+    "drift": "Độ lệch so với thiết kế đã duyệt"
+  }
+}

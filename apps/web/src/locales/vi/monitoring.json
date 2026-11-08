@@ -1,0 +1,682 @@
+{
+  "managed": {
+    "readOnly": "Quản lý bởi bộ giám sát",
+    "description": "Bản ghi này được tạo từ bộ giám sát và không thể chỉnh sửa trực tiếp. Hãy quản lý từ bộ giám sát.",
+    "open": "Mở bộ giám sát",
+    "badge": "Do bộ giám sát quản lý",
+    "badgeHint": "Quản lý bởi bộ giám sát — hãy chỉnh sửa từ bộ giám sát.",
+    "monitorLabel": "Bộ giám sát"
+  },
+  "list": {
+    "views": {
+      "ariaLabel": "Góc nhìn bộ giám sát",
+      "all": "Tất cả bộ giám sát",
+      "needsConversion": "Cần chuyển đổi"
+    },
+    "title": "Bộ giám sát",
+    "description": "Theo dõi điều kiện, phản hồi trên thiết bị, thông báo và leo thang khi sự việc tiếp diễn.",
+    "new": "Bộ giám sát mới",
+    "empty": "Chưa có bộ giám sát nào.",
+    "columns": {
+      "name": "Tên",
+      "kind": "Loại",
+      "severity": "Mức độ",
+      "deployedTo": "Đã triển khai đến",
+      "enabled": "Đã bật",
+      "owner": "Chủ sở hữu"
+    },
+    "allOrgs": "Tất cả tổ chức",
+    "policiesCount_one": "{{count}} chính sách",
+    "policiesCount_other": "{{count}} chính sách",
+    "notDeployed": "Chưa triển khai",
+    "toggleEnabled": "Đã bật: {{name}}",
+    "errors": {
+      "fetch": "Không thể tải bộ giám sát",
+      "delete": "Không thể xóa bộ giám sát",
+      "toggle": "Không thể cập nhật bộ giám sát"
+    },
+    "deleteConfirm": "Xóa bộ giám sát {{name}}? Quy tắc cảnh báo và tự động hóa phản hồi của bộ này cũng sẽ bị xóa.",
+    "builtIn": "Có sẵn",
+    "builtInHint": "Được cung cấp bởi Breeze. Chỉnh sửa ngưỡng, vô hiệu hóa hoặc xóa — bộ này sẽ không quay lại.",
+    "recommended": {
+      "title": "Được đề xuất",
+      "description": "Gắn các bộ giám sát có sẵn vào chính sách."
+    }
+  },
+  "editor": {
+    "attachedToPolicy": "Đã tạo và gắn bộ giám sát vào chính sách",
+    "titleNew": "Bộ giám sát mới",
+    "titleEdit": "Sửa bộ giám sát",
+    "breadcrumb": {
+      "monitors": "Bộ giám sát",
+      "new": "Bộ giám sát mới"
+    },
+    "sections": {
+      "watch": "Nội dung theo dõi",
+      "noise": "Mức độ & nhiễu",
+      "respond": "Phản hồi",
+      "notify": "Thông báo",
+      "escalate": "Leo thang cho con người",
+      "deployed": "Đã triển khai đến"
+    },
+    "tabs": {
+      "settings": "Cài đặt",
+      "activity": "Hoạt động"
+    },
+    "fields": {
+      "match": "Khớp",
+      "name": "Tên",
+      "description": "Mô tả",
+      "kind": "Loại",
+      "severity": "Mức độ",
+      "cooldownMinutes": "Thời gian chờ (phút)",
+      "autoResolve": "Tự động giải quyết khi điều kiện bình thường lại",
+      "deliveryMode": "Giao hàng",
+      "channels": "Kênh",
+      "escalationPolicy": "Chính sách leo thang",
+      "recurrenceThreshold": "Leo thang sau",
+      "recurrenceWindowDays": "sự cố trong vòng (ngày)",
+      "pauseResponses": "Tạm dừng phản hồi tự động cho đến khi có người đặt lại",
+      "aiAgent": "Tác nhân AI (bật phản hồi phân loại AI)",
+      "psaBoard": "Bảng PSA cho phiếu cảnh báo"
+    },
+    "deliveryModes": {
+      "inherit": "Sử dụng quy tắc định tuyến",
+      "channels": "Quy tắc định tuyến cộng với các kênh này",
+      "none": "Không thông báo"
+    },
+    "responsesHint": "Phản hồi chạy trên thiết bị vi phạm, theo thứ tự.",
+    "recurrenceHint": "Tính vào sự cố vi phạm: sự cố mới chỉ bắt đầu sau khi điều kiện hồi phục.",
+    "ownerScope": {
+      "legend": "Chủ sở hữu",
+      "partner": "Tất cả tổ chức (toàn đối tác)",
+      "organization": "Chỉ tổ chức này"
+    },
+    "actions": {
+      "save": "Lưu bộ giám sát",
+      "saving": "Đang lưu…",
+      "create": "Tạo bộ giám sát",
+      "test": "Kiểm thử trên thiết bị",
+      "deploy": "Triển khai đến…",
+      "delete": "Xóa",
+      "backToMonitors": "Quay lại Bộ giám sát"
+    },
+    "errors": {
+      "load": "Không thể tải bộ giám sát",
+      "save": "Không thể lưu bộ giám sát",
+      "delete": "Không thể xóa bộ giám sát",
+      "test": "Kiểm thử thất bại",
+      "generic": "Đã xảy ra lỗi",
+      "invalidCondition": "Thiếu giá trị điều kiện hoặc nằm ngoài phạm vi. Chưa có gì được lưu.",
+      "invalidResponses": "Thiếu cài đặt phản hồi hoặc nằm ngoài phạm vi. Chưa có gì được lưu.",
+      "restartServiceRequiresName": "Khởi động lại dịch vụ yêu cầu tên dịch vụ."
+    },
+    "saved": "Đã lưu bộ giám sát",
+    "deleted": "Đã xóa bộ giám sát",
+    "detached": "Đã gỡ bộ giám sát",
+    "loading": "Đang tải bộ giám sát…",
+    "noAttachments": "Chưa triển khai đến chính sách nào.",
+    "testResult": {
+      "triggered": "Đã đạt điều kiện trên {{device}}",
+      "notTriggered": "Chưa đạt điều kiện trên {{device}}"
+    },
+    "testDialog": {
+      "title": "Kiểm thử trên thiết bị",
+      "selectDevice": "Thiết bị",
+      "run": "Chạy kiểm thử",
+      "saveToTest": "Lưu để kiểm thử các thay đổi của bạn"
+    },
+    "deliveryPreview": {
+      "selectOrg": "Chọn một tổ chức để xem trước việc gửi.",
+      "failed": "Không thể xem trước việc gửi.",
+      "loading": "Đang giải quyết việc gửi…",
+      "disabled": "{{name}} (đã tắt)",
+      "unavailable": "Kênh không khả dụng",
+      "destination": "{{severity}} → {{channels}}",
+      "partnerRule": "Quy tắc đối tác: {{name}}",
+      "orgRule": "Quy tắc tổ chức: {{name}}",
+      "partnerDefault": "Mặc định đối tác: {{name}}",
+      "orgDefault": "Mặc định tổ chức: {{name}}",
+      "noRow": "Chưa cấu hình hàng gửi.",
+      "monitorOverride": "Ghi đè bộ giám sát",
+      "escalation": "Leo thang qua {{name}}",
+      "withoutSite": "Chưa chọn chi nhánh; các hàng định tuyến theo chi nhánh sẽ bị loại trừ.",
+      "testRules": "Kiểm thử tập quy tắc này",
+      "kind": "Loại bộ giám sát",
+      "noKind": "Không có loại bộ giám sát",
+      "site": "Chi nhánh",
+      "noSite": "Không có chi nhánh",
+      "sitesFailed": "Không thể tải chi nhánh.",
+      "manage": "Quản lý gửi",
+      "draft": "Xem trước sử dụng các giá trị trình chỉnh sửa hiện tại.",
+      "skipped": "Đã bỏ qua {{id}}: {{reason}}",
+      "skipReasons": {
+        "disabled": "đã tắt",
+        "unavailable": "không khả dụng"
+      }
+    },
+    "composite": {
+      "children": "Điều kiện con",
+      "add": "Thêm điều kiện",
+      "matchLabel": "Khớp"
+    },
+    "restart": {
+      "label": "Khởi động lại dịch vụ trên thiết bị",
+      "maxAttempts": "Số lần khởi động lại tối đa",
+      "cooldownSeconds": "Thời gian chờ khởi động lại (giây)"
+    },
+    "networkCheckAsset": {
+      "label": "Tài sản",
+      "unbound": "Không liên kết tài sản",
+      "failed": "Không thể tải tài sản",
+      "orgRequired": "Chọn quyền sở hữu tổ chức để liên kết tài sản.",
+      "pingName": "Ping {{label}}"
+    },
+    "psaBoardDefault": "Sử dụng bảng của kết nối mặc định",
+    "psaBoardHelp": "Phiếu cảnh báo cho màn hình này được tạo trên bảng này thay vì bảng mặc định của kết nối.",
+    "psaBoardReadOnly": "Phiếu cảnh báo chuyển đến bảng PSA #{{id}}",
+    "psaBoardUnavailable": "Không thể tải bảng PSA, vì vậy tính năng ghi đè bảng tạm thời không khả dụng."
+  },
+  "kinds": {
+    "composite": "Tổng hợp (tất cả hoặc bất kỳ phần nào)",
+    "cpu": "Mức sử dụng CPU",
+    "memory": "Mức sử dụng RAM",
+    "disk": "Mức sử dụng ổ đĩa",
+    "offline": "Thiết bị ngoại tuyến",
+    "event_log": "Nhật ký sự kiện",
+    "patch_compliance": "Tuân thủ bản vá",
+    "service": "Dịch vụ đã dừng",
+    "process": "Tiến trình đã dừng",
+    "process_resource": "Tài nguyên tiến trình",
+    "cert_expiry": "Chứng chỉ mTLS của agent sắp hết hạn",
+    "bandwidth": "Băng thông",
+    "disk_io": "I/O ổ đĩa",
+    "network_errors": "Lỗi mạng",
+    "antivirus": "Antivirus",
+    "software_presence": "Sự hiện diện của phần mềm",
+    "backup_continuity": "Tính liên tục của bản sao lưu",
+    "script": "Kiểm tra tập lệnh",
+    "network_check": "Kiểm tra mạng",
+    "hardware_health": "Tình trạng phần cứng",
+    "time_sync": "Đồng bộ hóa thời gian",
+    "container_image_currency": "Tính cập nhật của hình ảnh container"
+  },
+  "fields": {
+    "operator": "So sánh",
+    "value": "Giá trị",
+    "durationMinutes": "Trong ít nhất (phút)",
+    "category": "Danh mục",
+    "level": "Mức độ",
+    "sourcePattern": "Nguồn khớp",
+    "messagePattern": "Thông báo khớp",
+    "countThreshold": "Số lần xuất hiện",
+    "windowMinutes": "Trong vòng (phút)",
+    "serviceName": "Tên dịch vụ",
+    "processName": "Tên tiến trình",
+    "consecutiveFailures": "Lỗi liên tiếp",
+    "resource": "Tài nguyên",
+    "withinDays": "Hết hạn trong vòng (ngày)",
+    "direction": "Hướng",
+    "errorType": "Hướng lỗi",
+    "interfaceName": "Giao diện (tùy chọn)",
+    "check": "Kiểm tra",
+    "staleAfterDays": "Cũ sau (ngày)",
+    "minThreatCount": "Số mối đe dọa tối thiểu",
+    "softwareName": "Tên phần mềm",
+    "vendor": "Nhà vendor (tùy chọn)",
+    "presence": "Sự hiện diện",
+    "version": "Phiên bản",
+    "backupCheck": "Kiểm tra",
+    "maxAgeHours": "Tuổi thọ tối đa (giờ)",
+    "failureCount": "Số lần lỗi",
+    "script": "Tập lệnh",
+    "scriptSelectPlaceholder": "Chọn một tập lệnh…",
+    "scriptLoadError": "Không thể tải tập lệnh",
+    "intervalMinutes": "Chạy sau mỗi (phút)",
+    "timeoutSeconds": "Thời gian chờ (giây)",
+    "breachOnNonZeroExit": "Cảnh báo khi mã thoát khác không",
+    "checkType": "Loại kiểm tra",
+    "target": "Mục tiêu",
+    "port": "Cổng",
+    "expectStatus": "Mã trạng thái mong đợi",
+    "pollingIntervalSeconds": "Kiểm tra mỗi (giây)",
+    "match": "Khớp",
+    "pingCount": "Yêu cầu Echo",
+    "expectBanner": "Banner mong đợi",
+    "httpMethod": "Phương thức HTTP",
+    "expectedBody": "Phản hồi phải chứa",
+    "followRedirects": "Theo dõi chuyển hướng",
+    "verifySsl": "Xác minh chứng chỉ TLS",
+    "recordType": "Loại bản ghi",
+    "expectedValue": "Giá trị mong đợi",
+    "nameserver": "Máy chủ tên (Nameserver)",
+    "degradedIsFailure": "CoI trạng thái xuống cấp là lỗi",
+    "maxResponseMs": "Lỗi khi chậm hơn (ms)",
+    "eventLogCollectionNoSource": "Các sự kiện Ứng dụng Thông tin và Cảnh báo chỉ được thu thập từ {{providers}}. Sự kiện từ các nguồn khác chỉ khớp với quy tắc này ở cấp độ Lỗi hoặc Nghiêm trọng, trừ khi chính sách cấu hình Nhật ký sự kiện liệt kê chúng (Chính sách cấu hình → Nhật ký sự kiện → Nhà cung cấp ứng dụng).",
+    "eventLogCollectionSourceNotCollected": "Agent không thu thập các sự kiện Ứng dụng Thông tin hoặc Cảnh báo từ \"{{source}}\", trừ khi chính sách cấu hình Nhật ký sự kiện liệt kê chúng (Chính sách cấu hình → Nhật ký sự kiện → Nhà cung cấp ứng dụng). Nếu không, quy tắc này chỉ khớp với các sự kiện Lỗi hoặc Nghiêm trọng của nguồn đó. Nhà cung cấp tích hợp: {{providers}}."
+  },
+  "operators": {
+    "gt": "lớn hơn",
+    "gte": "ít nhất",
+    "lt": "nhỏ hơn",
+    "lte": "tối đa",
+    "eq": "bằng",
+    "neq": "khác"
+  },
+  "severities": {
+    "critical": "Nghiêm trọng",
+    "high": "Cao",
+    "medium": "Trung bình",
+    "low": "Thấp",
+    "info": "Thông tin"
+  },
+  "eventCategories": {
+    "security": "Bảo mật",
+    "hardware": "Phần cứng",
+    "application": "Ứng dụng",
+    "system": "Hệ thống"
+  },
+  "eventLevels": {
+    "info": "Thông tin",
+    "warning": "Cảnh báo",
+    "error": "Lỗi",
+    "critical": "Nghiêm trọng"
+  },
+  "resources": {
+    "cpu": "CPU",
+    "memory": "RAM"
+  },
+  "directions": {
+    "in": "Vào",
+    "out": "Ra",
+    "read": "Đọc",
+    "write": "Ghi",
+    "total": "Tổng số"
+  },
+  "compositeMatch": {
+    "all": "Tất cả điều kiện",
+    "any": "Bất kỳ điều kiện nào"
+  },
+  "antivirusChecks": {
+    "not_protected": "Không được bảo vệ",
+    "definitions_stale": "Định nghĩa cũ",
+    "realtime_disabled": "Đã tắt bảo vệ thời gian thực",
+    "threats_present": "Có mối đe dọa"
+  },
+  "presences": {
+    "installed": "Đã cài đặt",
+    "not_installed": "Chưa cài đặt",
+    "version_below": "Phiên bản dưới"
+  },
+  "backupChecks": {
+    "no_successful_backup": "Không có bản sao lưu thành công",
+    "consecutive_failures": "Lỗi liên tiếp",
+    "completed_with_errors": "Hoàn tất kèm lỗi tệp"
+  },
+  "checkTypes": {
+    "icmp_ping": "Ping ICMP",
+    "tcp_port": "Cổng TCP",
+    "http_check": "Kiểm tra HTTP",
+    "dns_check": "Kiểm tra DNS"
+  },
+  "deploy": {
+    "title": "Triển khai màn hình theo dõi",
+    "existingPolicy": "Gắn vào chính sách cấu hình hiện có",
+    "newPolicy": "Tạo chính sách cho",
+    "levels": {
+      "organization": "tổ chức này",
+      "site": "một chi nhánh",
+      "device_group": "một nhóm thiết bị"
+    },
+    "selectPolicy": "Chính sách cấu hình",
+    "attachToPolicy": "Gắn vào chính sách…",
+    "selectTarget": "Đối tượng",
+    "noOrgSelected": "Chọn tổ chức để triển khai.",
+    "policyName": "Tên chính sách",
+    "attach": "Gắn",
+    "attached": "Đã gắn màn hình theo dõi",
+    "cancel": "Hủy",
+    "detachConfirm": "Gỡ khỏi {{policy}}?",
+    "errors": {
+      "loadGroups": "Không thể tải nhóm thiết bị.",
+      "attach": "Gắn màn hình theo dõi thất bại",
+      "detach": "Gỡ màn hình theo dõi thất bại",
+      "linkedFeature": "Màn hình theo dõi của chính sách này đến từ một chính sách tính năng chia sẻ. Hãy sửa chính sách đó hoặc chọn chính sách khác."
+    },
+    "partnerWideGroups": "Tất cả tổ chức (toàn đối tác)",
+    "organizationGroups": "Nhóm tổ chức"
+  },
+  "policyTab": {
+    "title": "Màn hình theo dõi",
+    "description": "Màn hình theo dõi được gắn vào chính sách này. Các hàng bị vô hiệu hóa sẽ tắt màn hình theo dõi cho phạm vi của chính sách này; các ghi đè thay đổi ngưỡng cho màn hình đó.",
+    "attachExisting": "Gắn cái có sẵn",
+    "createNew": "Tạo màn hình theo dõi",
+    "empty": "Không có màn hình theo dõi nào được gắn.",
+    "columns": {
+      "monitor": "Màn hình theo dõi",
+      "kind": "Loại",
+      "enabled": "Đã bật",
+      "overrides": "Ghi đè",
+      "source": "Nguồn"
+    },
+    "inherited": "Kế thừa từ cấp trên",
+    "overrideEditor": {
+      "title": "Ghi đè cho chính sách này",
+      "clear": "Xóa ghi đè"
+    },
+    "save": "Lưu",
+    "errors": {
+      "save": "Lưu màn hình theo dõi thất bại"
+    }
+  },
+  "legacy": {
+    "title": "Quy tắc cảnh báo cũ",
+    "description": "Quy tắc cảnh báo độc lập không được quản lý bởi màn hình theo dõi. Chuyển đổi chúng để nhận phản hồi, phân phối và leo thang tại một nơi.",
+    "empty": "Không có quy tắc cảnh báo cũ nào cần chuyển đổi.",
+    "columns": {
+      "name": "Tên",
+      "template": "Mẫu",
+      "target": "Đối tượng",
+      "owner": "Chủ sở hữu",
+      "active": "Đang hoạt động"
+    },
+    "convert": "Chuyển thành màn hình theo dõi",
+    "converted": "Đã chuyển đổi",
+    "notConvertible": "Điều kiện của quy tắc này không thể biểu diễn dưới dạng một màn hình theo dõi đơn lẻ.",
+    "systemManaged": "Quy tắc do hệ thống quản lý. Breeze tự kích hoạt cảnh báo này, vì vậy không có gì để chuyển đổi.",
+    "errors": {
+      "fetch": "Tải quy tắc cảnh báo thất bại",
+      "convert": "Chuyển đổi quy tắc thất bại"
+    }
+  },
+  "builtInRules": {
+    "title": "Cảnh báo có sẵn",
+    "description": "Cảnh báo do Breeze tự kích hoạt. Tắt một cảnh báo để dừng cảnh báo đó đối với tổ chức của nó; các cảnh báo đã mở sẽ vẫn mở cho đến khi bạn giải quyết chúng.",
+    "columns": {
+      "name": "Tên",
+      "organization": "Tổ chức",
+      "active": "Đang hoạt động"
+    },
+    "kinds": {
+      "policyViolation": "Vi phạm chính sách: {{subject}}",
+      "configCompliance": "Tuân thủ cấu hình: {{subject}}"
+    },
+    "toggle": "Bật hoặc tắt {{name}}",
+    "switchedOn": "Đã bật {{name}}",
+    "switchedOff": "Đã tắt {{name}}",
+    "errors": {
+      "fetch": "Tải cảnh báo có sẵn thất bại",
+      "toggle": "Cập nhật cảnh báo có sẵn thất bại"
+    }
+  },
+  "devices": {
+    "title": "Thiết bị",
+    "columns": {
+      "device": "Thiết bị",
+      "enabled": "Đã bật",
+      "overrides": "Ghi đè",
+      "source": "Chính sách nguồn"
+    },
+    "empty": "Chưa có thiết bị nào được bao phủ bởi màn hình theo dõi này.",
+    "errors": {
+      "fetch": "Tải thiết bị thất bại"
+    }
+  },
+  "activity": {
+    "title": "Hoạt động",
+    "columns": {
+      "device": "Thiết bị",
+      "state": "Trạng thái",
+      "openSince": "Mở từ",
+      "episodesInWindow": "Sự cố trong khoảng thời gian",
+      "escalated": "Đã leo thang",
+      "responses": "Phản hồi"
+    },
+    "state": {
+      "ok": "Bình thường",
+      "breach": "Vi phạm",
+      "unknown": "Không rõ"
+    },
+    "responses": {
+      "active": "Đang hoạt động",
+      "paused": "Đã tạm dừng phản hồi cho đến khi đặt lại"
+    },
+    "reset": {
+      "button": "Đặt lại leo thang",
+      "confirm": "Đặt lại mức leo thang cho {{device}}? Thao tác này sẽ xóa bộ đếm lặp lại và tiếp tục phản hồi tự động. Thao tác này không đóng sự cố đang mở hoặc giải quyết cảnh báo.",
+      "success": "Đã đặt lại leo thang",
+      "error": "Đặt lại leo thang thất bại"
+    },
+    "empty": {
+      "title": "Chưa có hoạt động",
+      "body": "Màn hình theo dõi này chưa đánh giá thiết bị nào."
+    },
+    "episodes": {
+      "title": "Sự cố",
+      "endReason": {
+        "recovered": "Đã phục hồi",
+        "monitorDetached": "Đã gỡ màn hình theo dõi"
+      },
+      "outcome": {
+        "queued": "Đang chờ xử lý",
+        "completed": "Đã hoàn thành",
+        "failed": "Thất bại",
+        "skippedPaused": "Đã bỏ qua (đã tạm dừng phản hồi)",
+        "skippedNoResponse": "Đã bỏ qua (chưa cấu hình phản hồi)"
+      }
+    }
+  },
+  "conversion": {
+    "banner": {
+      "rowsCount_one": "{{count}} quy tắc cũ",
+      "rowsCount_other": "{{count}} quy tắc cũ",
+      "policiesCount_one": "{{count}} chính sách",
+      "policiesCount_other": "{{count}} chính sách",
+      "text": "{{rows}} trong số {{policies}} chưa được chuyển đổi thành màn hình theo dõi.",
+      "review": "Xem lại",
+      "convertEverything": "Chuyển đổi tất cả…",
+      "confirmTitle": "Chuyển đổi mọi quy tắc cũ, bộ theo dõi và tự động hóa kích hoạt bằng cảnh báo trên tất cả các chính sách của bạn?",
+      "confirmBody": "{{rows}} trong {{policies}} trên toàn bộ đối tác. Các hàng đã chuyển đổi sẽ ngừng hoạt động tại chỗ. Các hàng không thể chuyển đổi vẫn còn lại để xem lại hoặc ngừng hoạt động thủ công ngay bây giờ; bản phát hành trong tương lai sẽ chuyển đổi phần còn lại và ngừng hoạt động những phần không thể chuyển đổi.",
+      "confirmRun": "Chuyển đổi tất cả",
+      "convertedAll": "Đã chuyển đổi {{rows}} trong số {{policies}}; không thể chuyển đổi {{unconvertible}}.",
+      "errors": {
+        "convertAll": "Chuyển đổi tất cả thất bại"
+      }
+    },
+    "pendingPolicies": {
+      "title": "Chính sách có quy tắc cũ",
+      "loading": "Đang tải chính sách…",
+      "empty": "Không có chính sách nào chứa quy tắc cảnh báo nội tuyến, bộ theo dõi hoặc tự động hóa kích hoạt bằng cảnh báo.",
+      "error": "Không thể tải các chính sách có quy tắc cũ. Làm mới để thử lại."
+    },
+    "title": "Cần chuyển đổi",
+    "description": "Các quy tắc cảnh báo nội tuyến, theo dõi dịch vụ/tiến trình và tự động hóa kích hoạt bằng cảnh báo trên chính sách này chưa được chuyển đổi thành các bộ giám sát. Việc chuyển đổi sẽ thay thế dòng nguồn tại chỗ; không có gì bị xóa.",
+    "checking": "Đang kiểm tra thiết bị…",
+    "devicesChecked_one": "Đã kiểm tra {{count}} thiết bị có hành vi giống hệt.",
+    "devicesChecked_other": "Đã kiểm tra {{count}} thiết bị có hành vi giống hệt.",
+    "blocked": {
+      "parent_unconverted": "Hãy chuyển đổi chính sách gốc trước — các quy tắc nội tuyến của nó quyết định những gì chính sách này kế thừa.",
+      "prerequisite_missing": "Bản sửa lỗi điều kiện tiên quyết chưa được triển khai trên máy chủ này. Việc chuyển đổi bị vô hiệu hóa cho đến khi được triển khai."
+    },
+    "refusedTitle_one": "Từ chối chuyển đổi: {{count}} thiết bị sẽ thay đổi hành vi.",
+    "refusedTitle_other": "Từ chối chuyển đổi: {{count}} thiết bị sẽ thay đổi hành vi.",
+    "convert": "Chuyển đổi",
+    "convertAll_one": "Chuyển đổi {{count}} mục có thể",
+    "convertAll_other": "Chuyển đổi tất cả {{count}} mục có thể",
+    "retire": "Hủy bỏ",
+    "converted": "Đã chuyển đổi {{rows}} dòng cũ thành {{monitors}} bộ giám sát.",
+    "retired": "Đã hủy bỏ {{name}}.",
+    "undone_one": "Đã hoàn tác {{count}} chuyển đổi.",
+    "undone_other": "Đã hoàn tác {{count}} chuyển đổi.",
+    "openAlerts_one": "{{count}} cảnh báo đang mở chuyển sang bộ giám sát",
+    "openAlerts_other": "{{count}} cảnh báo đang mở chuyển sang bộ giám sát",
+    "sourceTables": {
+      "config_policy_alert_rules": "Quy tắc cảnh báo nội tuyến",
+      "config_policy_monitoring_watches": "Theo dõi dịch vụ/tiến trình",
+      "alert_templates": "Mẫu cảnh báo",
+      "automations": "Tự động hóa kích hoạt bằng cảnh báo",
+      "config_policy_automations": "Tự động hóa chính sách",
+      "network_monitors": "Kiểm tra mạng"
+    },
+    "outcomes": {
+      "convertible": "Có thể chuyển đổi",
+      "unconvertible": "Không thể chuyển đổi"
+    },
+    "roles": {
+      "primary": "Bộ giám sát",
+      "resource_cpu": "Bộ giám sát CPU",
+      "resource_memory": "Bộ giám sát Bộ nhớ",
+      "response": "Phản hồi"
+    },
+    "reasons": {
+      "unknown": "Không thể chuyển đổi ({{code}}).",
+      "nested_group": "Quy tắc lồng các nhóm điều kiện; bộ giám sát tổng hợp là một nhóm phẳng.",
+      "no_condition": "Mẫu không có điều kiện đánh giá được và chưa từng kích hoạt.",
+      "escalation_policy_axis": "Chính sách leo thang thuộc sở hữu của tổ chức nhưng chính sách áp dụng cho toàn đối tác.",
+      "custom": "Các điều kiện tùy chỉnh không có loại bộ giám sát.",
+      "process_count": "Các điều kiện số lượng tiến trình không có loại bộ giám sát."
+    },
+    "errors": {
+      "preview": "Không thể tải bản xem trước chuyển đổi",
+      "convert": "Chuyển đổi thất bại",
+      "retire": "Hủy bỏ thất bại",
+      "revert": "Hoàn tác chuyển đổi thất bại"
+    },
+    "ledger": {
+      "title": "Lịch sử chuyển đổi",
+      "undo": "Hoàn tác",
+      "more": "Tải thêm",
+      "empty": "Không có lịch sử chuyển đổi.",
+      "system": "Hệ thống",
+      "unknownUser": "Người dùng không xác định",
+      "reverted": "Đã hoàn tác",
+      "deadline": "Không thể hoàn tác sau khi việc loại bỏ hệ thống cảnh báo cũ xóa thời gian chạy nguồn."
+    },
+    "errorCodes": {
+      "preview_stale": "Chính sách đã thay đổi kể từ bản xem trước này. Vui lòng xem trước lại trước khi chuyển đổi.",
+      "conversion_contended": "Các thay đổi khác đã diễn ra cùng lúc, vì vậy quá trình chuyển đổi chưa hoàn tất. Không có gì thay đổi. Vui lòng thử lại.",
+      "preview_failed": "Không thể tạo bản xem trước. Vui lòng thử lại sau.",
+      "equivalence_delta": "Các bộ giám sát được chuyển đổi sẽ không hoạt động giống như các quy tắc cũ trên mọi thiết bị. Vui lòng xem lại bản xem trước trước khi chuyển đổi.",
+      "CONVERSION_PREREQUISITE_MISSING": "Bản cập nhật nền tảng bắt buộc chưa được triển khai, do đó không thể chuyển đổi mục này.",
+      "blocked": "Chuyển đổi này bị chặn. Hãy chuyển đổi chính sách gốc trước, sau đó thử lại.",
+      "already_converted": "Các quy tắc này đã được chuyển đổi. Làm mới để xem trạng thái hiện tại.",
+      "partner_wide_denied": "Cần có quyền truy cập toàn đối tác để chuyển đổi các chính sách toàn đối tác.",
+      "policy_not_found": "Không tìm thấy chính sách. Có thể nó đã bị xóa.",
+      "source_not_found": "Không tìm thấy quy tắc cũ. Có thể nó đã được chuyển đổi hoặc bị xóa.",
+      "conversion_not_found": "Không tìm thấy chuyển đổi đó.",
+      "conversion_revert_unavailable": "Không thể hoàn tác chuyển đổi này nữa.",
+      "invalid_reason": "Lý do hủy bỏ đó không hợp lệ.",
+      "unknown": "Chuyển đổi thất bại. Vui lòng thử lại."
+    },
+    "retirement": {
+      "summary_one": "{{count}} quy tắc cũ không thể chuyển đổi thành bộ giám sát — vui lòng xem lại.",
+      "summary_other": "{{count}} quy tắc cũ không thể chuyển đổi thành bộ giám sát — vui lòng xem lại.",
+      "review": "Xem lại",
+      "dismiss": "Bỏ qua",
+      "openAlertsNote": "Các quy tắc này không còn kích hoạt. Cảnh báo đang mở của chúng vẫn mở cho đến khi ai đó giải quyết; hãy tạo lại điều kiện dưới dạng bộ giám sát nếu vẫn cần.",
+      "reasons": {
+        "custom_condition": "điều kiện tùy chỉnh",
+        "nested_group": "nhóm điều kiện lồng nhau",
+        "no_condition": "không có điều kiện đánh giá được",
+        "equivalence_delta": "chuyển đổi sẽ thay đổi nội dung kích hoạt trên một số thiết bị",
+        "escalation_policy_axis": "chính sách leo thang thuộc về một tổ chức đơn lẻ",
+        "parent_unconverted": "chính sách gốc chưa được chuyển đổi",
+        "policy_inactive": "chính sách không hoạt động hoặc đã lưu trữ",
+        "prerequisite_missing": "thiếu bản sửa lỗi điều kiện tiên quyết trên máy chủ này",
+        "metric_without_kind": "số liệu không có loại bộ giám sát",
+        "child_kind_not_composable": "điều kiện không thể là một phần của bộ giám sát tổng hợp",
+        "too_many_conditions": "quá nhiều điều kiện",
+        "too_many_responses": "sẽ cần nhiều hơn mười phản hồi",
+        "auto_resolve_conditions": "không thể giữ lại các điều kiện độ phân giải tùy chỉnh",
+        "target_unconvertible": "không thể chuyển đổi mục tiêu phản hồi",
+        "already_managed": "đã được quản lý bởi bộ giám sát",
+        "no_org": "kiểm tra không thuộc về tổ chức nào",
+        "asset_missing": "tài sản được phát hiện liên kết không còn tồn tại",
+        "condition_invalid": "cài đặt kiểm tra không tạo thành điều kiện bộ giám sát hợp lệ",
+        "no_active_rules": "kiểm tra không có quy tắc cảnh báo hoạt động nào",
+        "multiple_network_rules": "kiểm tra có nhiều hơn một quy tắc cảnh báo hoạt động",
+        "network_predicate_unsupported": "điều kiện cảnh báo không có tương đương trong bộ giám sát",
+        "network_threshold_out_of_range": "ngưỡng lỗi vượt quá giới hạn (tối đa 100 lỗi liên tiếp)",
+        "site_binding_unrepresentable": "kiểm tra gắn liền với chi nhánh không được liên kết với tài sản được phát hiện",
+        "config_override_unrepresentable": "không thể giữ lại mục tiêu tùy chỉnh hoặc ghi đè thời gian chờ",
+        "built_in": "quy tắc hệ thống tích hợp; tự động tiếp tục cảnh báo",
+        "no_rules": "mẫu không có quy tắc nào để chuyển đổi",
+        "target_or_owner": "mục tiêu hoặc chủ sở hữu của quy tắc khác với mẫu",
+        "blocked": "chuyển đổi bị chặn",
+        "disabled_response_automation": "tự động hóa phản hồi bị vô hiệu hóa",
+        "alert_workflow_kept": "quy trình cảnh báo được giữ nguyên",
+        "unknown": "từ chối chuyển đổi; vui lòng xem lại nguồn"
+      }
+    }
+  },
+  "device": {
+    "title": "Bộ giám sát hiệu quả",
+    "empty": "Không có bộ giám sát nào áp dụng cho thiết bị này.",
+    "error": "Không thể tải bộ giám sát hiệu quả.",
+    "monitor": "Bộ giám sát",
+    "kind": "Loại",
+    "policy": "Chính sách nguồn",
+    "state": "Trạng thái",
+    "episode": "Sự cố đang mở",
+    "escalation": "Leo thang"
+  },
+  "monitors": {
+    "fields": {
+      "hardware_health": {
+        "componentTypes": "Thành phần",
+        "minHealth": "Tình trạng tối thiểu",
+        "includePredictiveFailure": "Bao gồm dự đoán lỗi",
+        "consecutiveSnapshots": "Ảnh chụp nhanh liên tiếp",
+        "componentTypeOptions": {
+          "controller": "Bộ điều khiển",
+          "virtual_disk": "Ổ đĩa ảo",
+          "physical_disk": "Ổ đĩa vật lý",
+          "cache_battery": "Pin đệm",
+          "enclosure": "Vỏ máy",
+          "collector": "Công cụ giám sát"
+        },
+        "minHealthOptions": {
+          "warning": "Cảnh báo",
+          "critical": "Nghiêm trọng"
+        }
+      },
+      "time_sync": {
+        "findings": "Phát hiện",
+        "consecutiveSnapshots": "Các ảnh chụp liên tiếp",
+        "findingOptions": {
+          "pdc_no_external_source": "PDC gốc của forest không có nguồn bên ngoài",
+          "source_local_clock": "Đang dùng đồng hồ cục bộ",
+          "dc_vm_host_sync": "DC đang đồng bộ với máy chủ ảo hóa",
+          "ntp_server_unresolvable": "Tên máy chủ NTP không hợp lệ hoặc chưa phân giải",
+          "ntp_peer_unreachable": "Không thể kết nối với NTP peer",
+          "domain_source_unavailable": "Không có nguồn thời gian miền",
+          "member_not_on_hierarchy": "Không sử dụng phân cấp miền",
+          "sync_disabled": "Đồng bộ hóa thời gian bị vô hiệu hóa",
+          "sync_stale": "Không có lần đồng bộ thành công gần đây",
+          "correction_refused": "Yêu cầu điều chỉnh thời gian bị từ chối",
+          "timezone_mismatch": "Múi giờ khác với dự kiến",
+          "policy_not_applied": "Chính sách thời gian chưa được áp dụng",
+          "policy_conflict_gpo": "Group Policy quản lý cài đặt thời gian"
+        }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Số ngày tối thiểu chậm hơn"
+      }
+    }
+  },
+  "httpMethods": {
+    "GET": "GET (lấy dữ liệu)",
+    "HEAD": "HEAD (chỉ phần đầu)",
+    "POST": "POST (gửi dữ liệu)",
+    "PUT": "PUT (thay thế)",
+    "OPTIONS": "OPTIONS (khả năng)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (địa chỉ IPv4)",
+    "AAAA": "AAAA (địa chỉ IPv6)",
+    "MX": "MX (máy chủ thư)",
+    "CNAME": "CNAME (bí danh)",
+    "TXT": "TXT (văn bản)",
+    "NS": "NS (máy chủ tên miền)"
+  }
+}

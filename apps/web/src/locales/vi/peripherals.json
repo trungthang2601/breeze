@@ -1,0 +1,121 @@
+{
+  "peripheralPage": {
+    "title": "Kiểm soát thiết bị ngoại vi",
+    "tabs": {
+      "policies": "Chính sách",
+      "activity": "Nhật ký hoạt động"
+    }
+  },
+  "peripheralActivityLog": {
+    "errors": {
+      "fetch": "Không thể tải hoạt động",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "allEvents": "Tất cả sự kiện",
+    "events": {
+      "connected": "Đã kết nối",
+      "disconnected": "Đã ngắt kết nối",
+      "blocked": "Đã chặn",
+      "mounted_read_only": "Chỉ đọc",
+      "policy_override": "Ghi đè chính sách"
+    },
+    "peripheralType": "Loại thiết bị ngoại vi",
+    "vendor": "Nhà供应",
+    "empty": "Không tìm thấy hoạt động thiết bị ngoại vi nào.",
+    "columns": {
+      "occurredAt": "Thời gian xảy ra",
+      "eventType": "Loại sự kiện",
+      "product": "Sản phẩm",
+      "serialNumber": "Số sê-ri",
+      "device": "Thiết bị",
+      "policy": "Chính sách"
+    },
+    "pagination": "Hiển thị {{from}}–{{to}} trong tổng số {{total}}",
+    "prev": "Trang trước",
+    "eventFilterLabel": "Loại sự kiện"
+  },
+  "peripheralPoliciesList": {
+    "errors": {
+      "fetch": "Không thể tải chính sách",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "allClasses": "Tất cả lớp",
+    "classes": {
+      "storage": "Lưu trữ",
+      "all_usb": "Tất cả USB",
+      "bluetooth": "Bluetooth",
+      "thunderbolt": "Thunderbolt"
+    },
+    "allActions": "Tất cả hành động",
+    "actions": {
+      "allow": "Cho phép",
+      "block": "Chặn",
+      "read_only": "Chỉ đọc",
+      "alert": "Cảnh báo"
+    },
+    "allStatus": "Tất cả trạng thái",
+    "createPolicy": "Tạo chính sách",
+    "empty": "Không tìm thấy chính sách thiết bị ngoại vi nào. Hãy tạo một chính sách để bắt đầu.",
+    "columns": {
+      "deviceClass": "Lớp thiết bị",
+      "action": "Hành động",
+      "exceptions": "Ngoại lệ",
+      "created": "Đã tạo"
+    },
+    "partnerWideTitle": "Chính sách toàn đối tác — được áp dụng cho thiết bị ở mọi tổ chức",
+    "allOrgs": "Toàn đối tác",
+    "classFilterLabel": "Lớp thiết bị",
+    "actionFilterLabel": "Hành động",
+    "statusFilterLabel": "Trạng thái"
+  },
+  "peripheralPolicyForm": {
+    "errors": {
+      "save": "Không thể lưu chính sách",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "editTitle": "Sửa chính sách thiết bị ngoại vi",
+    "createTitle": "Tạo chính sách thiết bị ngoại vi",
+    "scope": "Phạm vi",
+    "allOrganizations": "Tất cả tổ chức",
+    "partnerWide": "(chính sách toàn đối tác)",
+    "thisOrganization": "Chỉ tổ chức này",
+    "appliesTo": "Áp dụng cho",
+    "targets": {
+      "organization": "Tất cả thiết bị",
+      "site": "Các chi nhánh cụ thể ({{total}})",
+      "group": "Các nhóm thiết bị cụ thể ({{total}})",
+      "device": "Các thiết bị cụ thể ({{total}})"
+    },
+    "targetReadOnlyHint": "Không thể thay đổi đối tượng nhắm mục tiêu trong biểu mẫu này. Việc lưu giữ nguyên các mục tiêu hiện tại.",
+    "deviceClass": "Lớp thiết bị",
+    "classes": {
+      "storage": "Lưu trữ",
+      "all_usb": "Tất cả USB",
+      "bluetooth": "Bluetooth",
+      "thunderbolt": "Thunderbolt"
+    },
+    "action": "Hành động",
+    "actions": {
+      "allow": "Cho phép",
+      "block": "Chặn",
+      "read_only": "Chỉ đọc",
+      "alert": "Cảnh báo"
+    },
+    "exceptions": "Ngoại lệ",
+    "addException": "Thêm ngoại lệ",
+    "noExceptions": "Chưa cấu hình ngoại lệ nào.",
+    "exceptionNumber": "Ngoại lệ {{number}}",
+    "vendor": "Nhà cung cấp",
+    "product": "Sản phẩm",
+    "serialNumber": "Số sê-ri",
+    "allow": "Cho phép:",
+    "reason": "Lý do",
+    "expiresAt": "Hết hạn (giờ địa phương của bạn)",
+    "updatePolicy": "Cập nhật chính sách",
+    "createPolicy": "Tạo chính sách",
+    "saved": {
+      "created": "Đã tạo chính sách",
+      "updated": "Đã cập nhật chính sách"
+    }
+  }
+}

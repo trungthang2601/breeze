@@ -1,0 +1,876 @@
+{
+  "orgRecord": {
+    "documentTitle": "Tổ chức",
+    "header": {
+      "type": {
+        "customer": "Khách hàng",
+        "internal": "Nội bộ"
+      },
+      "primaryContact": "Người liên hệ chính",
+      "noPrimaryContact": "Không có người liên hệ chính",
+      "noOrgPrimaryContact": "Không có người liên hệ chính cấp tổ chức",
+      "sitePrimaryContact": "Chính cho {{siteName}}:",
+      "moreSitePrimaries": "+{{count}} thêm",
+      "setOrgPrimaryLink": "Đặt liên hệ chính cấp tổ chức",
+      "addContactLink": "Thêm liên hệ",
+      "billingAddress": "Địa chỉ thanh toán",
+      "noBillingAddress": "Không có địa chỉ thanh toán",
+      "billingSettingsLink": "Thêm trong cài đặt Thanh toán",
+      "sites_one": "{{count}} chi nhánh",
+      "sites_other": "{{count}} chi nhánh",
+      "workingHere": "Đang làm việc tại đây",
+      "workingHereLabel": "Đang làm việc tại {{orgName}}",
+      "scopeLine": "Đang làm việc tại {{currentOrg}} · bản ghi này là {{orgName}}",
+      "created": "Khách hàng từ {{date}}"
+    },
+    "actions": {
+      "workHere": "Làm việc trong tổ chức này",
+      "workHereToast": "Đã chuyển sang {{orgName}}",
+      "settings": "Cài đặt",
+      "more": "Thêm hành động",
+      "archive": "Lưu trữ",
+      "merge": "Hợp nhất",
+      "restore": "Khôi phục",
+      "retry": "Thử lại",
+      "sendMessage": "Gửi tin nhắn"
+    },
+    "tabs": {
+      "overview": "Tổng quan",
+      "contacts": "Người liên hệ",
+      "sites": "Chi nhánh",
+      "devices": "Thiết bị",
+      "tickets": "Phiếu hỗ trợ",
+      "billing": "Hợp đồng & Thanh toán",
+      "service": "Dịch vụ",
+      "documents": "Tài liệu",
+      "trust": "Trung tâm Tin cậy",
+      "activity": "Hoạt động"
+    },
+    "comingSoon": {
+      "title": "Sắp ra mắt",
+      "description": "Tab này sẽ có trong bản cập nhật tiếp theo của bản ghi tổ chức."
+    },
+    "devices": {
+      "loadError": "Không thể tải thiết bị cho tổ chức này.",
+      "searchPlaceholder": "Tìm kiếm thiết bị",
+      "searchLabel": "Tìm kiếm thiết bị theo tên máy",
+      "statusFilterLabel": "Lọc theo trạng thái",
+      "siteFilterLabel": "Lọc theo chi nhánh",
+      "noneEnrolled": "Chưa có thiết bị nào được đăng ký vào {{orgName}}",
+      "addDevice": "Thêm thiết bị",
+      "noMatches": "Không có thiết bị phù hợp",
+      "clearFilters": "Xóa bộ lọc",
+      "capNotice": "Hiển thị {{limit}} thiết bị đầu tiên",
+      "openInDevices": "Mở trong phần Thiết bị",
+      "allStatuses": "Tất cả trạng thái",
+      "allSites": "Tất cả chi nhánh",
+      "status": {
+        "online": "Trực tuyến",
+        "offline": "Ngoại tuyến",
+        "maintenance": "Bảo trì",
+        "decommissioned": "Đã xóa",
+        "quarantined": "Đã cách ly",
+        "updating": "Đang cập nhật",
+        "pending": "Đang chờ"
+      }
+    },
+    "overview": {
+      "tiles": {
+        "devices": "Thiết bị",
+        "alerts": "Cảnh báo đang mở",
+        "tickets": "Phiếu đang mở",
+        "contracts": "Hợp đồng đang hoạt động",
+        "contractsSub": "Gia hạn tiếp theo {{date}}",
+        "contractsNoRenewal": "Không có lịch gia hạn sắp tới",
+        "invoicesSub": "Đến hạn tiếp theo {{date}}",
+        "invoicesOverdue_one": "{{count}} quá hạn",
+        "invoicesOverdue_other": "{{count}} quá hạn",
+        "invoicesNothingDue": "Không có hạn",
+        "contacts": "Người liên hệ",
+        "portalUsers": "Người dùng cổng thông tin",
+        "sites": "Chi nhánh",
+        "lastActivity": "Hoạt động lần cuối"
+      },
+      "activity": {
+        "title": "Hoạt động gần đây",
+        "empty": "Chưa có hoạt động nào được ghi nhận.",
+        "failed": "Không thể tải hoạt động gần đây.",
+        "viewAll": "Xem tất cả hoạt động"
+      },
+      "criticalAlerts": {
+        "title": "Mở cảnh báo nghiêm trọng",
+        "empty": "Không có cảnh báo nghiêm trọng nào đang mở.",
+        "failed": "Không thể kiểm tra cảnh báo nghiêm trọng đang mở.",
+        "viewAll": "Xem tất cả cảnh báo"
+      },
+      "lastActivity": "Hoạt động lần cuối {{date}}",
+      "noSummary": "Số liệu tổng hợp hiện không khả dụng.",
+      "archivedNotice": "Dữ liệu tổng quan không được hiển thị cho các tổ chức đã lưu trữ.",
+      "fleet": {
+        "title": "Tình trạng thiết bị",
+        "total": "Tổng số",
+        "allOnline": "Tất cả trực tuyến",
+        "noDevices": "Không có thiết bị",
+        "critical": "Nghiêm trọng",
+        "high": "Cao",
+        "otherAlerts": "Khác",
+        "noAlerts": "Không có cảnh báo mở",
+        "awaitingCustomer": "Đang chờ khách hàng",
+        "noTickets": "Không có phiếu mở"
+      },
+      "account": {
+        "title": "Tài khoản",
+        "invoices": "Hóa đơn chưa thanh toán"
+      }
+    },
+    "archived": {
+      "banner": "Tổ chức này đã được lưu trữ và chỉ có thể đọc. Hãy khôi phục để thực hiện thay đổi.",
+      "restoreError": "Không thể khôi phục tổ chức này."
+    },
+    "lifecycle": {
+      "inaccessible": "Tổ chức này ở trạng thái {{status}}, nên dữ liệu trực tiếp không khả dụng. Bạn vẫn có thể thấy trong danh sách tổ chức.",
+      "unknownTitle": "Tổ chức không hoạt động",
+      "inaccessibleHistoryOnly": "Tổ chức này không hoạt động nên dữ liệu trực tiếp không khả dụng. Lịch sử báo cáo vẫn có thể xem bên dưới.",
+      "genericStatusLabel": "không hoạt động",
+      "backToList": "Quay lại danh sách tổ chức"
+    },
+    "reportHistory": {
+      "title": "Lịch sử báo cáo",
+      "loading": "Đang tải lịch sử báo cáo…",
+      "readOnlyNote": "Chỉ đọc: tổ chức này ở trạng thái {{status}}. Không thể tạo, lên lịch hoặc tải xuống báo cáo.",
+      "forbidden": "Bạn không có quyền truy cập lịch sử báo cáo của tổ chức này.",
+      "error": "Không thể tải lịch sử báo cáo.",
+      "empty": "Không tìm thấy báo cáo hoặc lần chạy báo cáo nào.",
+      "definitionsTitle": "Định nghĩa báo cáo",
+      "definitionsEmpty": "Không có định nghĩa báo cáo nào.",
+      "runsTitle": "Lần chạy gần đây",
+      "runsEmpty": "Không có lần chạy báo cáo nào.",
+      "lastGenerated": "Đã tạo lần cuối {{date}}",
+      "neverGenerated": "Chưa từng tạo",
+      "rowCount_one": "{{count}} hàng",
+      "rowCount_other": "{{count}} hàng"
+    },
+    "unavailable": {
+      "title": "Không khả dụng trong không gian làm việc này",
+      "description": "Bản ghi tổ chức là góc nhìn cấp đối tác. Tài khoản của bạn được giới hạn trong một tổ chức duy nhất, vì vậy không có gì để chuyển đổi ở đây.",
+      "action": "Đi tới tổng quan"
+    },
+    "notFound": {
+      "title": "Không tìm thấy tổ chức",
+      "description": "Tổ chức này không tồn tại hoặc bạn không còn quyền truy cập.",
+      "action": "Quay lại danh sách tổ chức"
+    },
+    "error": {
+      "title": "Không thể tải tổ chức này",
+      "description": "Đã xảy ra lỗi khi lấy dữ liệu. Kiểm tra kết nối và thử lại."
+    },
+    "loading": "Đang tải tổ chức…",
+    "tickets": {
+      "tabs": {
+        "open": "Mở",
+        "all": "Tất cả",
+        "closed": "Đã đóng"
+      },
+      "newTicket": "Phiếu hỗ trợ mới",
+      "loadFailed": "Không thể tải phiếu hỗ trợ.",
+      "forbidden": "Bạn không có quyền xem phiếu hỗ trợ.",
+      "truncated": "Đang hiển thị {{shown}} trên tổng số {{total}} phiếu hỗ trợ."
+    },
+    "billing": {
+      "sections": {
+        "contracts": "Hợp đồng",
+        "invoices": "Hóa đơn",
+        "quotes": "Báo giá",
+        "agreements": "Thỏa thuận"
+      }
+    },
+    "trust": {
+      "declarations": {
+        "description": "Các thực hành mà Breeze không thể đo lường, do đội ngũ của bạn nêu rõ. Mỗi tuyên bố có thời hạn 365 ngày và được dán nhãn là đã tuyên bố trên trang công khai, không bao giờ được dán nhãn là đã xác minh.",
+        "loadFailed": "Không thể tải các biện pháp kiểm soát đã tuyên bố.",
+        "notDeclared": "Chưa tuyên bố",
+        "current": "Hiện tại",
+        "expired": "Đã hết hạn",
+        "declaredBy": "Được tuyên bố bởi {{partner}} vào {{date}} · hết hạn vào {{expires}}",
+        "expiredOn": "Tuyên bố đã hết hạn vào {{date}}",
+        "expiresIn_one": "Hết hạn sau {{count}} ngày",
+        "expiresIn_other": "Hết hạn sau {{count}} ngày",
+        "onPublicPage": "Trên trang công khai",
+        "republishNeeded": "Thay đổi sẽ xuất hiện sau khi bạn xuất bản lại",
+        "declare": "Tuyên bố",
+        "redeclare": "Tuyên bố lại",
+        "withdraw": "Thu hồi",
+        "dialogTitle": "Tuyên bố: {{control}}",
+        "statementLabel": "Nội dung tuyên bố",
+        "statementHelp": "Những gì đội ngũ của bạn thực hiện, bằng ngôn từ đơn giản (10–1000 ký tự). Nội dung này xuất hiện trên trang công khai đúng như đã viết.",
+        "evidenceLabel": "Tài liệu minh chứng (tùy chọn)",
+        "evidenceNone": "Không có tài liệu minh chứng",
+        "evidenceHelp": "Chỉ hiển thị trên trang công khai nếu tài liệu này cũng được liên kết với trang độ tin cậy.",
+        "confirm": "Tôi xác nhận tuyên bố này là chính xác và tôi có thẩm quyền đưa ra tuyên bố này thay mặt cho {{partner}}.",
+        "submit": "Lưu tuyên bố",
+        "cancel": "Hủy",
+        "saved": "Đã lưu tuyên bố. Xuất bản lại để hiển thị trên trang công khai.",
+        "saveFailed": "Không thể lưu tuyên bố.",
+        "withdrawTitle": "Thu hồi tuyên bố này?",
+        "withdrawMessage": "{{control}} sẽ bị xóa khỏi trang công khai ở lần làm mới tiếp theo.",
+        "withdrawConfirm": "Thu hồi",
+        "withdrawn": "Đã thu hồi tuyên bố.",
+        "withdrawFailed": "Không thể thu hồi tuyên bố.",
+        "evidenceUnavailable": "Tài liệu minh chứng đó không còn khả dụng. Hãy chọn tài liệu hiện hành.",
+        "mfaRequired": "Việc tuyên bố kiểm soát yêu cầu xác thực đa yếu tố. Bật MFA trong cài đặt bảo mật hồ sơ của bạn, sau đó thử lại.",
+        "historyTitle": "Các tuyên bố trước đây",
+        "historySuperseded": "Đã thay thế vào {{date}}",
+        "historyWithdrawn": "Đã thu hồi vào {{date}}",
+        "title": "Các biện pháp kiểm soát đã tuyên bố"
+      },
+      "frameworks": {
+        "description": "Chọn các khung bảo mật mà trang công khai ánh xạ các biện pháp kiểm soát của mình tới. Các ánh xạ chỉ mang tính chất tham khảo, không phải là tuyên bố tuân thủ.",
+        "source": {
+          "page": "Được đặt trên trang này.",
+          "template": "Kế thừa từ mẫu của đối tác.",
+          "default": "Sử dụng mặc định có sẵn."
+        },
+        "suggested": "Được đề xuất cho khu vực của bạn",
+        "cisLocked": "Có sẵn sau khi xác nhận cấp phép CIS",
+        "useDefault": "Sử dụng mặc định",
+        "save": "Lưu",
+        "saved": "Đã lưu chế độ xem khung.",
+        "saveFailed": "Không thể lưu chế độ xem khung.",
+        "revisionChanged": "Trang đã thay đổi kể từ khi bạn mở. Tải lại và thử lại.",
+        "title": "Chế độ xem khung"
+      },
+      "subprocessors": {
+        "description": "Bên thứ ba xử lý dữ liệu thay mặt cho khách hàng của bạn. Các công cụ được phát hiện chỉ là gợi ý; không có gì được xuất bản cho đến khi bạn xuất bản trang.",
+        "addDetected": "Thêm từ các công cụ được phát hiện",
+        "addManual": "Thêm thủ công",
+        "noSuggestions": "Không còn công cụ nào được phát hiện để thêm.",
+        "empty": "Chưa có bên xử lý dữ liệu phụ nào được liệt kê.",
+        "name": "Tên",
+        "purpose": "Mục đích",
+        "location": "Vị trí",
+        "website": "Trang web",
+        "websiteInvalid": "Sử dụng địa chỉ https://.",
+        "moveUp": "Di chuyển lên",
+        "moveDown": "Di chuyển xuống",
+        "remove": "Xóa",
+        "save": "Lưu bên xử lý dữ liệu phụ",
+        "saved": "Đã lưu bên xử lý dữ liệu phụ",
+        "saveFailed": "Không thể lưu bên xử lý dữ liệu phụ",
+        "loadFailed": "Không thể tải bên xử lý dữ liệu phụ.",
+        "suggestionsFailed": "Không thể tải các công cụ được phát hiện. Đóng và mở lại để thử lại.",
+        "duplicate": "Cùng một công cụ được phát hiện xuất hiện nhiều hơn một lần.",
+        "limit": "Đã đạt tối đa {{max}} bên xử lý dữ liệu phụ.",
+        "title": "Bên xử lý dữ liệu phụ"
+      },
+      "faq": {
+        "description": "Câu trả lời cho các câu hỏi mà người mua và kiểm toán viên thường hỏi nhất. Hiển thị trên trang sau khi bạn xuất bản.",
+        "add": "Thêm câu hỏi",
+        "question": "Câu hỏi",
+        "questionShort": "Câu hỏi cần có ít nhất {{min}} ký tự.",
+        "answer": "Câu trả lời",
+        "answerTooLong": "Câu trả lời này quá dài; hãy rút ngắn lại.",
+        "moveUp": "Di chuyển lên",
+        "moveDown": "Di chuyển xuống",
+        "remove": "Xóa",
+        "save": "Lưu FAQ",
+        "saved": "Đã lưu FAQ",
+        "saveFailed": "Không thể lưu FAQ",
+        "loadFailed": "Không thể tải FAQ.",
+        "empty": "Chưa có câu hỏi nào.",
+        "limit": "Đã đạt tối đa {{max}} câu hỏi.",
+        "title": "Câu hỏi thường gặp"
+      },
+      "history": {
+        "toggle": "Hiển thị các biện pháp kiểm soát đạt được theo thời gian",
+        "description": "Thêm biểu đồ 90 ngày về số lượng biện pháp kiểm soát đạt được. Mỗi thay đổi được ghi lại khi Breeze đánh giá lại trang.",
+        "saved": "Đã lưu cài đặt lịch sử",
+        "saveFailed": "Không thể lưu cài đặt lịch sử",
+        "source": {
+          "page": "Được đặt trên tổ chức này",
+          "template": "Từ mẫu của đối tác",
+          "default": "Mặc định"
+        },
+        "title": "Các biện pháp kiểm soát đạt được theo thời gian"
+      },
+      "access": {
+        "description": "Khách truy cập trang công khai có thể yêu cầu các tài liệu được đánh dấu \"Có sẵn theo yêu cầu\". Họ xác nhận địa chỉ email trước; sau đó bạn phê duyệt hoặc từ chối từng yêu cầu. Người yêu cầu được phê duyệt sẽ nhận được liên kết tải xuống có hiệu lực trong 7 ngày.",
+        "unpublishedBanner": "Yêu cầu được mở sau khi trang được xuất bản.",
+        "noGatedHint": "Chưa có tài liệu nào được cung cấp theo yêu cầu. Đặt tài liệu được liên kết thành \"Có sẵn theo yêu cầu\" để chấp nhận yêu cầu.",
+        "ndaLabel": "Điều khoản bảo mật (tùy chọn)",
+        "ndaHelp": "Người yêu cầu phải chấp nhận các điều khoản này trước khi có thể gửi yêu cầu. Các điều khoản này hiển thị dưới dạng văn bản thuần túy và được ghi lại cùng với mỗi yêu cầu. Các thay đổi sẽ có hiệu lực trên trang công khai khi bạn xuất bản.",
+        "ndaCount": "{{count}} / {{max}} ký tự",
+        "ticketLabel": "Tạo phiếu hỗ trợ cho mỗi yêu cầu được xác nhận",
+        "save": "Lưu cài đặt truy cập",
+        "saved": "Đã lưu cài đặt truy cập.",
+        "saveFailed": "Không thể lưu cài đặt truy cập.",
+        "requestsHeading": "Yêu cầu",
+        "filterLabel": "Hiển thị",
+        "filterAll": "Tất cả yêu cầu",
+        "empty": "Chưa có yêu cầu nào.",
+        "loadFailed": "Không thể tải các yêu cầu.",
+        "ndaAccepted": "Đã chấp nhận NDA",
+        "downloads": "Lượt tải: {{count}}",
+        "expired": "Đã hết hạn",
+        "status": {
+          "pending_verification": "Đang chờ xác nhận email",
+          "pending_approval": "Đang chờ quyết định của bạn",
+          "approved": "Đã duyệt",
+          "denied": "Từ chối",
+          "revoked": "Đã thu hồi"
+        },
+        "columns": {
+          "status": "Trạng thái",
+          "requester": "Người yêu cầu",
+          "company": "Công ty",
+          "purpose": "Mục đích",
+          "requested": "Đã yêu cầu",
+          "expires": "Hết hạn",
+          "actions": "Thao tác"
+        },
+        "approve": "Duyệt",
+        "approved": "Đã duyệt yêu cầu. Đã gửi email liên kết tải xuống cho người yêu cầu.",
+        "approvedNoEmail": "Đã duyệt quyền truy cập. Chưa cấu hình dịch vụ email nên chưa gửi email cho người yêu cầu.",
+        "approveFailed": "Không thể duyệt yêu cầu.",
+        "deny": "Từ chối",
+        "denyTitle": "Từ chối yêu cầu này?",
+        "denyMessage": "{{name}} ({{company}}) sẽ được thông báo rằng yêu cầu đã bị từ chối, kèm theo ghi chú của bạn nếu có.",
+        "denyNoteLabel": "Ghi chú cho người yêu cầu (tùy chọn)",
+        "denyConfirm": "Từ chối yêu cầu",
+        "denied": "Đã từ chối yêu cầu.",
+        "denyFailed": "Không thể từ chối yêu cầu.",
+        "revoke": "Thu hồi",
+        "revokeTitle": "Thu hồi quyền truy cập?",
+        "revokeMessage": "Liên kết tải xuống gửi cho {{name}} sẽ ngừng hoạt động ngay lập tức.",
+        "revokeConfirm": "Thu hồi quyền truy cập",
+        "revoked": "Đã thu hồi quyền truy cập.",
+        "revokeFailed": "Không thể thu hồi quyền truy cập.",
+        "resend": "Gửi lại liên kết",
+        "resent": "Đã gửi email liên kết tải xuống mới. Liên kết trước đó sẽ không còn hoạt động.",
+        "resentNoEmail": "Đã tạo liên kết tải xuống mới. Chưa cấu hình dịch vụ email nên chưa gửi email. Liên kết trước đó không còn hoạt động.",
+        "resendFailed": "Không thể gửi lại liên kết.",
+        "errors": {
+          "mfaRequired": "Việc duyệt hoặc gửi lại yêu cầu cần có xác thực đa yếu tố. Hãy bật MFA trong cài đặt bảo mật hồ sơ của bạn rồi thử lại.",
+          "invalidState": "Yêu cầu này đã thay đổi kể từ khi bạn tải. Hãy tải lại danh sách.",
+          "noGatedDocuments": "Trang được công bố không cung cấp tài liệu theo yêu cầu. Hãy đặt một tài liệu thành \"Có sẵn theo yêu cầu\" và công bố.",
+          "pageNotPublished": "Công bố trang độ tin cậy trước khi duyệt yêu cầu.",
+          "grantExpired": "Quyền này đã hết hạn. Yêu cầu người gửi tạo yêu cầu mới."
+        },
+        "title": "Yêu cầu truy cập tài liệu"
+      },
+      "inheritance": {
+        "sources": {
+          "page": "Đặt cho tổ chức này",
+          "template": "Mẫu đối tác",
+          "default": "Mặc định của Breeze"
+        },
+        "reset": "Đặt lại về kế thừa",
+        "intro": {
+          "template": "Sử dụng phần giới thiệu mẫu đối tác",
+          "none": "Không có giới thiệu",
+          "custom": "Tùy chỉnh",
+          "inheritedAfterSave": "Trang này hiện có phần giới thiệu riêng. Lưu để chuyển về phần giới thiệu kế thừa.",
+          "inheritedEmpty": "Không có gì được kế thừa, nên trang không hiển thị phần giới thiệu."
+        },
+        "template": {
+          "heading": "Mặc định Trung tâm Tin cậy",
+          "description": "Mặc định cho mọi trang tin cậy của khách hàng. Cài đặt do tổ chức tự chọn luôn được ưu tiên. Các trang được công bố sẽ nhận thay đổi vào lần công bố tiếp theo.",
+          "readOnly": "Chỉ quản trị viên đối tác có quyền truy cập mọi tổ chức mới có thể thay đổi các mặc định này.",
+          "loadFailed": "Không thể tải mặc định Trung tâm Tin cậy.",
+          "inheritOption": "Mặc định của Breeze ({{value}})",
+          "on": "Bật",
+          "off": "Tắt",
+          "introLabel": "Giới thiệu mặc định",
+          "introHint": "Để trống nếu không muốn có giới thiệu.",
+          "hiddenLabel": "Điều khiển bị ẩn theo mặc định",
+          "hiddenDefault": "Mặc định của Breeze (hiện mọi điều khiển)",
+          "hiddenCustom": "Ẩn các điều khiển tôi chọn",
+          "frameworksLabel": "Chế độ xem khung",
+          "frameworksCustom": "Hiển thị các khung tôi chọn",
+          "showHistoryLabel": "Hiển thị lịch sử 90 ngày",
+          "showHistoryDescription": "Biểu đồ thể hiện số lượng điều khiển đạt được trong 90 ngày qua.",
+          "save": "Lưu mặc định",
+          "saved": "Đã lưu mặc định Trung tâm Tin cậy",
+          "saveFailed": "Không thể lưu mặc định Trung tâm Tin cậy",
+          "mfaRequired": "Việc thay đổi các mặc định này cần có xác thực đa yếu tố. Hãy bật MFA trong cài đặt bảo mật hồ sơ của bạn rồi thử lại.",
+          "revisionMismatch": "Ai đó đã thay đổi các mặc định này. Tải lại để xem thay đổi của họ.",
+          "conflictNotice": "Ai đó đã lưu các mặc định này trong lúc bạn đang chỉnh sửa. Tải lại bản của họ để bắt đầu từ phiên bản đó, hoặc tiếp tục chỉnh sửa: lưu lại sẽ tiếp tục thất bại cho đến khi bạn tải lại.",
+          "reloadTheirs": "Tải bản của họ",
+          "keepEditing": "Tiếp tục sửa"
+        },
+        "title": "Cài đặt kế thừa"
+      },
+      "title": "Trung tâm Tin cậy",
+      "subtitle": "Trang công khai hiển thị tư thế bảo mật của tổ chức này, được tạo từ dữ liệu từ xa trực tiếp của Breeze.",
+      "loading": "Đang tải Trung tâm Tin cậy…",
+      "loadFailed": "Không thể tải trang Trung tâm Tin cậy.",
+      "retry": "Thử lại",
+      "status": {
+        "unpublished": "Chưa công bố",
+        "published": "Đã công bố {{date}}",
+        "publicUrl": "Trang công khai",
+        "copy": "Sao chép liên kết",
+        "copied": "Đã sao chép liên kết",
+        "copyFailed": "Không thể sao chép liên kết.",
+        "lastEvaluated": "Đánh giá điều khiển lần cuối {{date}}",
+        "gate": {
+          "probation_default_deny": "Tài khoản của bạn vẫn đang trong thời gian dùng thử. Tính năng công bố sẽ mở khi tài khoản của bạn được tín nhiệm.",
+          "probation_enrollment_cap": "Tài khoản của bạn đã đạt giới hạn trong thời gian dùng thử. Tính năng công bố sẽ mở khi tài khoản của bạn được tín nhiệm.",
+          "restricted": "Tài khoản của bạn bị hạn chế nên tính năng công bố đã bị tắt.",
+          "partner_unresolved": "Chúng tôi không thể xác định tài khoản đối tác cho tổ chức này.",
+          "generic": "Tính năng công bố hiện đang bị tắt đối với tài khoản này."
+        }
+      },
+      "publish": {
+        "button": "Công bố",
+        "republish": "Công bố bản cập nhật",
+        "title": "Công bố trang Trung tâm Tin cậy",
+        "intro": "Thao tác này giúp bất kỳ ai có liên kết đều nhìn thấy trang{{indexable}}. Các điều khiển sẽ được đánh giá lại khi bạn công bố.",
+        "indexableSuffix": ", và các công cụ tìm kiếm có thể lập chỉ mục trang này",
+        "attestationCheckbox": "Khách hàng đã ủy quyền công bố trang này",
+        "authorizedBy": "Ủy quyền bởi (tên, vai trò)",
+        "authorizedByPlaceholder": "Jane Doe, COO",
+        "recorded": "Được ủy quyền bởi {{name}} vào {{date}}",
+        "change": "Thay đổi",
+        "partnerHomeNote": "Đây là trang riêng của đối tác nên không cần sự ủy quyền của khách hàng.",
+        "confirm": "Công bố",
+        "publishing": "Đang công bố…",
+        "cancel": "Hủy",
+        "success": "Đã công bố trang Trung tâm Tin cậy.",
+        "failed": "Không thể công bố trang Trung tâm Tin cậy.",
+        "disabledNoWrite": "Bạn cần có quyền chỉnh sửa tổ chức để công bố.",
+        "disabledSlug": "Sửa địa chỉ trang trước khi công bố."
+      },
+      "unpublish": {
+        "button": "Hủy công bố",
+        "title": "Hủy công bố trang Trung tâm Tin cậy",
+        "message": "Liên kết công khai sẽ ngừng hoạt động ngay lập tức và huy hiệu sẽ chuyển sang màu tối. Bạn có thể công bố lại bất cứ lúc nào.",
+        "confirm": "Hủy xuất bản",
+        "success": "Đã hủy xuất bản trang Trust Center.",
+        "failed": "Không thể hủy xuất bản trang Trust Center."
+      },
+      "preview": {
+        "button": "Xem trước",
+        "failed": "Không thể mở bản xem trước.",
+        "popupBlocked": "Trình duyệt của bạn đã chặn cửa sổ xem trước. Hãy cho phép cửa sổ pop-up cho trang này và thử lại."
+      },
+      "partnerHome": {
+        "label": "Sử dụng làm trang Trust Center của đối tác",
+        "description": "Hiển thị trang này tại địa chỉ đối tác của bạn thay vì địa chỉ của khách hàng. Không cần sự ủy quyền của khách hàng.",
+        "success": "Đã lưu cài đặt trang đối tác.",
+        "failed": "Không thể thay đổi cài đặt trang đối tác."
+      },
+      "slug": {
+        "warningTitle": "Địa chỉ của trang này chưa hợp lệ",
+        "openSettings": "Sửa trong cài đặt tổ chức",
+        "partner_slug": "Slug của đối tác không hợp lệ cho địa chỉ công khai.",
+        "org_slug": "Slug của tổ chức không hợp lệ cho địa chỉ công khai.",
+        "unknown": "Địa chỉ trang có vấn đề ({{problem}})."
+      },
+      "notice": {
+        "cannotPublish": "Chưa thể xuất bản. {{reason}}",
+        "readOnly": "Bạn có thể xem trang này nhưng cần quyền chỉnh sửa tổ chức để thay đổi hoặc xuất bản."
+      },
+      "errors": {
+        "revisionMismatch": "Trang này đã thay đổi kể từ khi bạn tải. Hãy tải lại và thử lại.",
+        "authorizationRequired": "Ghi nhận người ủy quyền xuất bản.",
+        "mfaRequired": "Việc xuất bản yêu cầu xác thực đa yếu tố. Hãy bật MFA trong cài đặt bảo mật hồ sơ của bạn, sau đó thử lại.",
+        "trustProbation": "Việc xuất bản sẽ mở ra khi tài khoản của bạn được tin cậy.",
+        "trustRestricted": "Việc xuất bản sẽ mở ra khi tài khoản của bạn được tin cậy.",
+        "slugInvalid": "Địa chỉ trang không hợp lệ. Hãy sửa slug trong cài đặt tổ chức.",
+        "introTooLong": "Phần giới thiệu quá dài.",
+        "partnerWideRequired": "Chỉ quản trị viên cấp đối tác mới có thể thay đổi trang đối tác.",
+        "partnerHomeInternalOnly": "Chỉ tổ chức của riêng bạn (nội bộ) mới có thể là trang đối tác.",
+        "partnerHomeUnpublishFirst": "Trang này đang hoạt động mà không có ghi nhận ủy quyền của khách hàng. Hãy hủy xuất bản trước khi tắt cài đặt trang đối tác."
+      },
+      "controls": {
+        "republishBanner": "Các thay đổi sẽ áp dụng cho trang công khai khi bạn xuất bản lại.",
+        "saveFailed": "Không thể lưu thay đổi.",
+        "unavailable": "Kết quả kiểm soát hiện không khả dụng.",
+        "assessedCount": "Đã đánh giá {{assessed}} trên tổng số {{eligible}}",
+        "shown": "Hiển thị",
+        "hidden": "Ẩn",
+        "toggles": {
+          "showPercentages": {
+            "label": "Hiển thị tỷ lệ phần trăm",
+            "description": "Hiển thị tỷ lệ phần trăm cho mỗi mục kiểm soát trên trang công khai."
+          },
+          "showDeviceCount": {
+            "label": "Hiển thị số lượng thiết bị",
+            "description": "Hiển thị số lượng thiết bị được bao phủ."
+          },
+          "showManagedBy": {
+            "label": "Hiển thị \"Quản lý bởi\"",
+            "description": "Đặt tên công ty của bạn là nhà cung cấp quản lý."
+          },
+          "searchIndexable": {
+            "label": "Cho phép công cụ tìm kiếm",
+            "description": "Cho phép công cụ tìm kiếm lập chỉ mục trang công khai."
+          }
+        }
+      },
+      "content": {
+        "introLabel": "Giới thiệu",
+        "contactLabel": "Email liên hệ bảo mật",
+        "contactInvalid": "Nhập địa chỉ email hợp lệ.",
+        "websiteLabel": "Trang web",
+        "websiteInvalid": "Nhập đầy đủ địa chỉ https://.",
+        "save": "Lưu nội dung",
+        "saved": "Đã lưu nội dung.",
+        "saveFailed": "Could not save the content."
+      },
+      "documents": {
+        "visibilityLabel": "Ai có thể tải xuống",
+        "visibilityPublic": "Công khai",
+        "visibilityGated": "Có sẵn theo yêu cầu",
+        "reconfirm": "Xác nhận",
+        "reconfirmNeeded": "Xác nhận việc công bố cho mức độ hiển thị mới trước khi lưu.",
+        "disclosureTitleGated": "Cung cấp tài liệu này theo yêu cầu?",
+        "disclosureMessageGated": "\"{{title}}\" sẽ được liệt kê trên trang công khai. Chỉ những người yêu cầu được bạn phê duyệt mới có thể tải xuống.",
+        "disclosureCheckboxGated": "Tôi xác nhận tài liệu này đã được phê duyệt để phát hành cho những người yêu cầu được duyệt",
+        "disclosureConfirmChange": "Xác nhận",
+        "description": "Các tài liệu bạn chọn chia sẻ trên trang công khai. Chỉ những tài liệu bạn chủ động phê duyệt mới được hiển thị.",
+        "upload": "Tải tài liệu lên",
+        "library": "Thư viện tài liệu",
+        "libraryEmpty": "Không còn tài liệu nào khác.",
+        "libraryFailed": "Không thể tải thư viện tài liệu.",
+        "add": "Thêm",
+        "linked": "Trên trang công khai ({{count}} / {{max}})",
+        "linkedEmpty": "Chưa chọn tài liệu nào.",
+        "remove": "Xóa",
+        "moveUp": "Di chuyển lên",
+        "moveDown": "Di chuyển xuống",
+        "superseded": "Đã lỗi thời — hãy liên kết lại phiên bản mới hơn",
+        "save": "Lưu tài liệu",
+        "saved": "Đã lưu tài liệu.",
+        "saveFailed": "Không thể lưu tài liệu.",
+        "unavailable": "Các tài liệu sau không còn khả dụng: {{titles}}. Hãy xóa hoặc liên kết lại chúng.",
+        "disclosureTitle": "Xuất bản tài liệu này?",
+        "disclosureMessage": "\"{{title}}\" sẽ hiển thị cho bất kỳ ai có liên kết trang công khai.",
+        "disclosureCheckbox": "Tôi xác nhận tài liệu này đã được phê duyệt phát hành công khai",
+        "disclosureConfirm": "Thêm tài liệu"
+      },
+      "sections": {
+        "controlsHeading": "Kiểm soát bảo mật",
+        "contentHeading": "Nội dung trang",
+        "documentsHeading": "Tài liệu"
+      },
+      "badge": {
+        "title": "Huy hiệu",
+        "description": "Nhúng huy hiệu trạng thái trực tiếp trên trang web của bạn. Huy hiệu này liên kết đến trang công khai.",
+        "unpublishedNote": "Huy hiệu hiển thị sau khi trang được xuất bản.",
+        "snippet": "HTML huy hiệu",
+        "alt": "Huy hiệu trạng thái bảo mật",
+        "copy": "Sao chép mã",
+        "copied": "Đã sao chép mã",
+        "copyFailed": "Không thể sao chép đoạn mã."
+      },
+      "embed": {
+        "title": "Nhúng vào trang web của bạn",
+        "description": "Hiển thị thẻ trạng thái bảo mật trực tiếp, gọn gàng trên trang web của riêng bạn trong một iframe. Chỉ các trang web được liệt kê ở đây mới được hiển thị; bản thân trang tin cậy đầy đủ không bao giờ có thể được nhúng.",
+        "liveNote": "Các thay đổi sẽ có hiệu lực vào lần tải nội dung nhúng tiếp theo; không cần xuất bản lại.",
+        "unpublishedNote": "Thẻ nhúng hiển thị sau khi trang được xuất bản.",
+        "originLabel": "Địa chỉ trang web (chỉ https, không có đường dẫn)",
+        "add": "Thêm trang web",
+        "remove": "Xóa",
+        "save": "Lưu trang web",
+        "saved": "Đã lưu trang web nhúng",
+        "saveFailed": "Không thể lưu các trang web nhúng.",
+        "invalidOrigin": "Nhập địa chỉ https chính xác không có đường dẫn, ký tự đại diện hoặc địa chỉ IP, ví dụ https://www.example.com",
+        "duplicateOrigin": "Trang web đó đã có trong danh sách.",
+        "maxReached": "Bạn chỉ có thể cho phép tối đa {{max}} trang web.",
+        "preview": "Sẽ được lưu thành",
+        "snippetLabel": "HTML nhúng",
+        "frameTitle": "Thẻ trạng thái bảo mật",
+        "copy": "Sao chép mã",
+        "copied": "Đã sao chép mã",
+        "copyFailed": "Không thể sao chép đoạn mã.",
+        "emptyNote": "Thêm ít nhất một trang web để bật tính năng nhúng.",
+        "mfaRequired": "Thay đổi trang web nhúng yêu cầu xác thực đa yếu tố. Hãy bật MFA trong cài đặt bảo mật hồ sơ của bạn, sau đó thử lại."
+      }
+    },
+    "documents": {
+      "title": "Tài liệu",
+      "subtitle": "Runbook, đường cơ sở, chính sách và bằng chứng bàn giao cho tổ chức này.",
+      "empty": "Chưa có tài liệu nào. Tải lên runbook, đường cơ sở hoặc chính sách đã ký để bắt đầu thư viện.",
+      "emptyPortalHint": "Khách hàng của bạn nhìn thấy các tài liệu được đánh dấu Hiển thị trong cổng thông tin. Đề xuất hoặc thỏa thuận đã ký và đường cơ sở bảo mật là những tài liệu khởi đầu tốt.",
+      "emptyFiltered": "Không có tài liệu nào trong danh mục này.",
+      "loadFailed": "Không thể tải tài liệu.",
+      "upload": "Tải tài liệu lên",
+      "uploading": "Đang tải lên…",
+      "replace": "Thay thế",
+      "download": "Tải xuống",
+      "delete": "Xóa",
+      "deleteConfirm": "Xóa \"{{title}}\"? Thao tác này sẽ xóa tệp và mọi phiên bản trước đó. Không thể hoàn tác hành động này.",
+      "edit": "Sửa",
+      "save": "Lưu",
+      "cancel": "Hủy",
+      "versions": "Lịch sử phiên bản",
+      "showSuperseded": "Hiển thị phiên bản trước",
+      "form": {
+        "title": "Tiêu đề",
+        "description": "Mô tả",
+        "category": "Danh mục",
+        "portalVisible": "Hiển thị trong cổng thông tin khách hàng",
+        "file": "Tệp",
+        "fileHint": "PDF, JPEG, PNG hoặc WebP, tối đa 10 MB.",
+        "replaceHint": "Phiên bản hiện tại được lưu vào lịch sử và tệp mới sẽ trở thành tệp hiện tại."
+      },
+      "filter": {
+        "all": "Tất cả danh mục"
+      },
+      "category": {
+        "baseline": "Cơ sở",
+        "runbook": "Runbook",
+        "policy": "Chính sách",
+        "evidence": "Bằng chứng",
+        "report": "Báo cáo",
+        "export": "Xuất",
+        "other": "Khác"
+      },
+      "column": {
+        "title": "Tiêu đề",
+        "category": "Danh mục",
+        "size": "Kích thước",
+        "uploaded": "Đã tải lên",
+        "portal": "Cổng thông tin",
+        "actions": "Thao tác"
+      },
+      "badge": {
+        "superseded": "Phiên bản trước",
+        "portal": "Trong cổng thông tin"
+      },
+      "errors": {
+        "tooLarge": "Tệp đó lớn hơn 10 MB.",
+        "unsupportedType": "Chỉ có thể lưu trữ tệp PDF, JPEG, PNG và WebP.",
+        "storageUnavailable": "Kho lưu trữ tài liệu hiện không khả dụng. Vui lòng thử lại sau.",
+        "notHead": "Tài liệu này đã bị thay thế. Hãy tải lại và thao tác trên phiên bản hiện tại.",
+        "emptyFile": "Tệp đó trống.",
+        "uploadFailed": "Không thể tải lên tài liệu.",
+        "updateFailed": "Không thể lưu tài liệu.",
+        "deleteFailed": "Không thể xóa tài liệu.",
+        "downloadFailed": "Không thể tải xuống tài liệu."
+      },
+      "toast": {
+        "uploaded": "Đã tải lên tài liệu",
+        "replaced": "Đã tải lên phiên bản mới",
+        "updated": "Đã cập nhật tài liệu",
+        "deleted": "Đã xóa tài liệu"
+      }
+    }
+  },
+  "orgBoard": {
+    "partnerOption": "{{id}}… ({{count}} tổ chức)",
+    "partnerOption_one": "{{id}}… ({{count}} tổ chức)",
+    "partnerScopeHint": "Hiển thị tài khoản của một đối tác; tổng số bên dưới chỉ tính cho đối tác này",
+    "title": "Tổ chức",
+    "description": "Mọi khách hàng, những gì còn thiếu và những gì đang mở.",
+    "loading": "Đang tải tổ chức…",
+    "actions": {
+      "addOrganization": "Thêm tổ chức",
+      "tryAgain": "Thử lại",
+      "clearFilters": "Xóa bộ lọc",
+      "openRecord": "Mở bản ghi",
+      "contact": "Liên hệ {{name}}",
+      "newTicket": "Phiếu hỗ trợ mới",
+      "workHere": "Làm việc trong tổ chức này",
+      "settings": "Cài đặt",
+      "archive": "Lưu trữ tổ chức",
+      "merge": "Gộp vào tổ chức khác",
+      "restore": "Khôi phục",
+      "restoring": "Đang khôi phục…"
+    },
+    "rowMenu": {
+      "label": "Thao tác cho {{name}}"
+    },
+    "search": {
+      "label": "Tìm kiếm tổ chức, liên hệ và email"
+    },
+    "lens": {
+      "label": "Góc nhìn",
+      "setup": "Thiết lập",
+      "account": "Tài khoản",
+      "both": "Cả hai"
+    },
+    "filters": {
+      "label": "Bộ lọc",
+      "all": "Tất cả",
+      "setupIncomplete": "Chưa thiết lập xong",
+      "accountMissing": "Thiếu dữ liệu tài khoản",
+      "openTickets": "Phiếu hỗ trợ đang mở",
+      "trial": "Dùng thử",
+      "archived": "Đã lưu trữ",
+      "unlinked": "Chưa liên kết"
+    },
+    "sort": {
+      "label": "Sắp xếp",
+      "manual": "Thứ tự thủ công",
+      "name": "Từ A đến Z",
+      "tickets": "Phiếu hỗ trợ đang mở"
+    },
+    "columns": {
+      "organization": "Tổ chức",
+      "setup": "Thiết lập",
+      "account": "Dữ liệu tài khoản",
+      "tickets": "Phiếu hỗ trợ đang mở",
+      "actions": "Thao tác hàng",
+      "integrations": "Tích hợp"
+    },
+    "band": {
+      "label": "Độ sẵn sàng của tài khoản",
+      "all": "Tài khoản",
+      "allSub": "{{trial}} dùng thử · {{suspended}} tạm ngưng",
+      "setupIncomplete": "Chưa thiết lập xong",
+      "accountMissing": "Thiếu dữ liệu tài khoản",
+      "openTickets": "Phiếu hỗ trợ đang mở",
+      "openTicketsSub": "{{count}} vi phạm SLA",
+      "pending": "Đang kiểm tra tổ chức…",
+      "partial": "Không thể kiểm tra một số tổ chức.",
+      "unlinked": "Chưa liên kết"
+    },
+    "chips": {
+      "noSite": "Không có chi nhánh",
+      "noDevices": "Không có thiết bị nào được đăng ký",
+      "noCheckIn": "Không có agent nào điểm danh",
+      "staleCheckIn_one": "Agent không điểm danh trong {{count}} ngày",
+      "staleCheckIn_other": "Agent không điểm danh trong {{count}} ngày",
+      "noPolicy": "Chưa gán chính sách",
+      "primaryContact": "Liên hệ chính",
+      "contactEmail": "Email liên hệ",
+      "contactPhone": "Điện thoại liên hệ",
+      "billingContact": "Liên hệ thanh toán",
+      "billingAddress": "Địa chỉ thanh toán",
+      "overdueInvoices_one": "{{count}} hóa đơn quá hạn",
+      "overdueInvoices_other": "{{count}} hóa đơn quá hạn",
+      "invitation_one": "{{count}} lời mời chưa được chấp nhận",
+      "invitation_other": "{{count}} lời mời chưa được chấp nhận",
+      "complete": "Hoàn thành",
+      "notApplicable": "Không áp dụng",
+      "unavailable": "Không khả dụng",
+      "stillNeeded": "Vẫn cần",
+      "link": "{{chip}} cho {{orgName}}",
+      "noActiveContract": "Không có hợp đồng hoạt động",
+      "noBackup": "Chưa cấu hình sao lưu"
+    },
+    "repair": {
+      "sites": "Mở tab Chi nhánh cho {{orgName}}",
+      "devices": "Mở tab Thiết bị cho {{orgName}}",
+      "policies": "Mở chính sách cấu hình",
+      "contacts": "Mở tab Liên hệ cho {{orgName}}",
+      "settings": "Mở cài đặt cho {{orgName}}",
+      "billing": "Mở tab Thanh toán cho {{orgName}}",
+      "backup": "Mở bản sao lưu cho {{orgName}}"
+    },
+    "integrations": {
+      "system": {
+        "psa": "PSA",
+        "dns_filter": "Bộ lọc DNS"
+      },
+      "state": {
+        "linked": "Đã liên kết",
+        "pending": "Đang chờ",
+        "error": "Cần chú ý",
+        "identity": "Chỉ định danh",
+        "not_linked": "Chưa liên kết"
+      },
+      "reason": {
+        "suggested_match": "Gợi ý khớp, chưa xác nhận",
+        "sync_error": "Đồng bộ lần cuối thất bại",
+        "consent_pending": "Đang chờ sự chấp thuận từ Microsoft",
+        "expired": "Kết nối đã hết hạn",
+        "degraded": "Kết nối bị suy giảm",
+        "suspended": "Kết nối bị tạm ngưng",
+        "error": "Kết nối báo lỗi",
+        "never_synced": "Chưa từng đồng bộ",
+        "sync_failed": "Đồng bộ đầu nối thất bại",
+        "disabled": "Kết nối bị vô hiệu hóa",
+        "connector_error": "Đầu nối không hoạt động hoặc lỗi"
+      },
+      "notLinked": "{{system}} chưa liên kết",
+      "nothingLinked": "Chưa liên kết gì",
+      "connectorMuted": "Đầu nối {{system}} chưa kết nối",
+      "badgeLabel": "{{orgName}}: {{system}}, {{state}}",
+      "badgeLabelWithReason": "{{orgName}}: {{system}}, {{state}} ({{reason}})",
+      "connectors": {
+        "repair": {
+          "reauth_required": "{{system}} cần kết nối lại",
+          "disconnected": "{{system}} đã ngắt kết nối",
+          "error": "Đầu nối {{system}} gặp lỗi",
+          "disabled": "Đầu nối {{system}} đã bị vô hiệu hóa"
+        },
+        "openSettings": "Mở cài đặt {{system}}"
+      }
+    },
+    "tickets": {
+      "open": "{{count}} đang mở",
+      "awaiting": "{{count}} đang chờ khách hàng",
+      "sla": "{{count}} vi phạm SLA"
+    },
+    "meta": {
+      "workspace": "Không gian làm việc",
+      "devices_one": "{{count}} thiết bị",
+      "devices_other": "{{count}} thiết bị",
+      "sites_one": "{{count}} chi nhánh",
+      "sites_other": "{{count}} chi nhánh",
+      "archivedBadge": "Đã lưu trữ",
+      "archivingBadge": "Đang lưu trữ…",
+      "keptIndefinitely": "Giữ vô thời hạn",
+      "purgeToday": "Xóa vĩnh viễn hôm nay",
+      "purgeCountdown_one": "Xóa vĩnh viễn sau {{count}} ngày",
+      "purgeCountdown_other": "Xóa vĩnh viễn sau {{count}} ngày"
+    },
+    "reorder": {
+      "handle": "Sắp xếp lại {{name}}",
+      "hint": "Sử dụng phím mũi tên lên và xuống để di chuyển tổ chức này.",
+      "dragToReorder": "Kéo để sắp xếp lại",
+      "moved": "{{name}} đã chuyển đến vị trí {{position}} trong tổng số {{total}}"
+    },
+    "footer": {
+      "summary": "{{accounts}} tài khoản hoạt động · {{devices}} thiết bị",
+      "summaryWithTickets": "{{accounts}} tài khoản hoạt động · {{devices}} thiết bị · {{tickets}} phiếu đang mở",
+      "manualHint": "Thứ tự thủ công: kéo một hàng hoặc dùng phím mũi tên trên tay cầm."
+    },
+    "empty": {
+      "title": "Chưa có tổ chức nào",
+      "description": "Thêm khách hàng đầu tiên để bắt đầu theo dõi thiết lập và dữ liệu tài khoản.",
+      "noMatches": "Không có tổ chức nào khớp với tìm kiếm hoặc bộ lọc của bạn."
+    },
+    "archived": {
+      "loading": "Đang tải các tổ chức đã lưu trữ…",
+      "empty": "Không có tổ chức nào được lưu trữ.",
+      "noMatches": "Không có tổ chức đã lưu trữ nào khớp với tìm kiếm của bạn.",
+      "truncatedNote": "Hiển thị {{count}} tổ chức đã lưu trữ đầu tiên. Tìm kiếm để thu hẹp danh sách.",
+      "fetchError": "Không thể tải các tổ chức đã lưu trữ"
+    },
+    "restore": {
+      "success": "{{name}} đã được khôi phục — trạng thái: {{status}}.",
+      "recreateRequiredNote": "Trước khi sử dụng lại bình thường: {{items}}",
+      "suspendedNote": "Tổ chức này đã bị tạm ngưng trước khi lưu trữ, do đó đã được khôi phục ở trạng thái tạm ngưng — hãy giải quyết việc đó trước khi tiếp tục truy cập bình thường.",
+      "errors": {
+        "restore": "Không thể khôi phục tổ chức",
+        "mfaRequired": "Khôi phục tổ chức yêu cầu xác thực đa yếu tố. Bật MFA trong cài đặt bảo mật hồ sơ của bạn, sau đó thử lại.",
+        "purging": "Tổ chức này đang bị xóa vĩnh viễn và không thể khôi phục được nữa."
+      }
+    },
+    "add": {
+      "title": "Thêm tổ chức",
+      "description": "Tạo tổ chức mới với các thông tin chi tiết dưới đây.",
+      "submit": "Tạo tổ chức",
+      "created": "Đã thêm {{name}}. Hàng của tổ chức này hiển thị những gì cần thiết lập tiếp theo."
+    },
+    "errors": {
+      "fetchOrganizations": "Không thể lấy danh sách tổ chức",
+      "generic": "Đã xảy ra lỗi",
+      "saveOrder": "Không thể lưu thứ tự tổ chức",
+      "saveOrganization": "Không thể lưu tổ chức",
+      "readiness": "Không thể kiểm tra trạng thái sẵn sàng của tài khoản đối với một số tổ chức."
+    }
+  },
+  "shared": {
+    "sortableTh": {
+      "ascending": "Tăng dần",
+      "descending": "Giảm dần",
+      "sortBy": "Sắp xếp theo {{label}}",
+      "sortByWithDirection": "Sắp xếp theo {{label}}, {{direction}}"
+    }
+  }
+}

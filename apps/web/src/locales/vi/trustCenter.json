@@ -1,0 +1,10 @@
+{
+  "export": {
+    "title": "Xuất câu trả lời bảng câu hỏi",
+    "csv": "Tải xuống CSV",
+    "json": "Tải xuống JSON",
+    "unpublishedNote": "Xuất bản trang của bạn để bật tính năng xuất.",
+    "failed": "Không thể tải xuống bản xuất. Thử lại.",
+    "publishedOnlyNote": "Xuất những gì trang công khai của bạn hiển thị."
+  }
+}

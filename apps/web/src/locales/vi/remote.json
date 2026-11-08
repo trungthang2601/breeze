@@ -1,0 +1,879 @@
+{
+  "remoteAccessPage": {
+    "title": "Truy cập Từ xa",
+    "subtitle": "Khởi chạy công cụ từ xa cho các thiết bị trực tuyến.",
+    "terminal": {
+      "title": "Bắt đầu Terminal",
+      "description": "Chọn một thiết bị để kết nối"
+    },
+    "files": {
+      "title": "Truyền tệp",
+      "description": "Truyền tệp đến/từ thiết bị"
+    },
+    "sessions": {
+      "title": "Lịch sử Phiên",
+      "description": "Xem các phiên trước"
+    },
+    "quickSupport": {
+      "title": "Hỗ trợ Nhanh",
+      "description": "Mã một lần để hỗ trợ ad-hoc"
+    }
+  },
+  "connectDesktopButton": {
+    "connectDesktop": "Kết nối Màn hình",
+    "connecting": "Đang kết nối...",
+    "creatingSession": "Đang tạo phiên...",
+    "denied": {
+      "description": "Người dùng đã từ chối kết nối từ xa.",
+      "title": "Kết nối bị từ chối"
+    },
+    "desktopUnavailable": "Màn hình Không khả dụng",
+    "dismiss": "Bỏ qua",
+    "downloadFor": "Tải xuống cho {{platform}}",
+    "ending": {
+      "description": "Phiên trước vẫn đang đóng trên thiết bị. Vui lòng đợi một lát và thử lại.",
+      "title": "Phiên vẫn đang kết thúc"
+    },
+    "errors": {
+      "agentUpgradeRequired": "Màn hình từ xa cần cập nhật agent trên thiết bị này (hỗ trợ thu hồi thuê bao phiên và start fence). Agent tự động cập nhật — việc này thường hoàn tất trong vòng một phút. Terminal và truyền tệp không bị ảnh hưởng.",
+      "deviceNotFoundOrAccessDenied": "Không tìm thấy thiết bị hoặc quyền truy cập bị từ chối",
+      "siteAccessDenied": "Quyền truy cập chi nhánh này bị từ chối",
+      "connectionFailed": "Kết nối thất bại",
+      "createDesktopCode": "Không thể tạo mã kết nối màn hình",
+      "createDesktopSession": "Không thể tạo phiên màn hình",
+      "createVncTunnel": "Không thể tạo đường hầm VNC",
+      "deviceChanged": "Khởi chạy từ xa thất bại: bản ghi thiết bị đã thay đổi. Vui lòng làm mới và thử lại.",
+      "http": "Khởi chạy từ xa thất bại (HTTP {{status}})",
+      "invalidDesktopCode": "Phản hồi mã kết nối màn hình không hợp lệ",
+      "issueVncCode": "Không thể cấp mã kết nối VNC",
+      "securityCheckToast": "Khởi chạy từ xa không khả dụng: kiểm tra bảo mật thất bại. Vui lòng liên hệ quản trị viên.",
+      "securityPolicy": "Khởi chạy từ xa bị chặn bởi chính sách bảo mật",
+      "server": "Khởi chạy từ xa thất bại: lỗi máy chủ. Vui lòng liên hệ quản trị viên.",
+      "vncTunnelFailed": "Không thể mở đường hầm VNC"
+    },
+    "fallback": {
+      "linuxFirstRun": "Trên Linux, hãy đặt tệp tải xuống thành tệp thực thi (chmod +x) và chạy một lần. Thao tác đó sẽ đăng ký trình xem để các phiên tự động mở từ lần sau trở đi.",
+      "linuxFuse": "Nếu thoát mà không mở cửa sổ, chương trình cần FUSE 2: cài đặt libfuse2t64 (Debian 13 / Ubuntu 24.04+) hoặc libfuse2 trên các phiên bản cũ hơn, hoặc chạy bằng --appimage-extract-and-run.",
+      "title": "Trình xem không mở?",
+      "viewerDescription": "Nếu trình xem đã mở, bạn có thể bỏ qua thông báo này. Nếu chưa, hãy tải xuống bên dưới.",
+      "vncDescription": "Mở phiên VNC trong trình duyệt của bạn thay thế."
+    },
+    "launcherSkip": {
+      "configError": "Không thể phân giải công cụ từ xa do đối tác cấu hình (lỗi cấu hình). Quay lại sử dụng màn hình từ xa tích hợp sẵn.",
+      "emptyUrlTemplate": "Công cụ từ xa do đối tác cấu hình chưa được đặt mẫu URL. Quay lại sử dụng màn hình từ xa tích hợp sẵn.",
+      "missingIdentifier": "Thiết bị này thiếu định danh theo thiết bị mà công cụ từ xa do đối tác cấu hình yêu cầu (ví dụ: mã đồng đẳng RustDesk). Quay lại sử dụng màn hình từ xa tích hợp sẵn. Đặt định danh trong Cài đặt Thiết bị → Trường Tùy chỉnh.",
+      "providerDisabled": "Công cụ từ xa do đối tác cấu hình cho thiết bị này hiện đang bị vô hiệu hóa. Quay lại sử dụng màn hình từ xa tích hợp sẵn."
+    },
+    "launching": "Đang khởi chạy...",
+    "launchingViewer": "Đang khởi chạy trình xem...",
+    "loginWindow": {
+      "connectVnc": "Kết nối với VNC Relay",
+      "description": "macOS chặn đầu vào bàn phím và chuột từ xa ở cửa sổ đăng nhập, do đó Màn hình Từ xa chưa được khởi động.",
+      "enableVncRelay": "Bật VNC Relay trong chính sách cấu hình của thiết bị này để đăng nhập tại màn hình đăng nhập, hoặc kết nối lại sau khi người dùng đăng nhập.",
+      "title": "Máy Mac này đang ở màn hình đăng nhập",
+      "unavailableTitle": "Màn hình Từ xa không khả dụng",
+      "useVncRelay": "Sử dụng VNC Relay để đăng nhập tại màn hình đăng nhập."
+    },
+    "openInBrowser": "Mở trong Trình duyệt",
+    "policyDisabled": "Màn hình từ xa bị vô hiệu hóa bởi chính sách",
+    "policyDisabledNamed": "Màn hình từ xa bị vô hiệu hóa bởi chính sách \"{{name}}\"",
+    "revoked": {
+      "title": "Phiên đã bị thu hồi",
+      "setUpMfa": "Thiết lập MFA",
+      "reasons": {
+        "session_ended": "Phiên đã kết thúc trước đó.",
+        "user_inactive": "Tài khoản của bạn không còn hoạt động.",
+        "epoch_baseline_missing": "Không thể xác minh quyền của bạn. Thử kết nối lại.",
+        "permissions_changed": "Quyền của bạn đã thay đổi sau khi phiên này bắt đầu. Kết nối lại để tiếp tục với quyền truy cập hiện tại.",
+        "membership_removed": "Bạn không còn quyền truy cập vào tổ chức hoặc thiết bị này.",
+        "site_scope_lost": "Thiết bị này nằm ngoài phạm vi chi nhánh được chỉ định của bạn.",
+        "mfa_required": "Xác thực đa yếu tố hiện là bắt buộc để truy cập màn hình từ xa.",
+        "hard_deadline": "Phiên này đã đạt đến thời lượng tối đa cho phép.",
+        "default": "Phiên đã bị kết thúc bởi chính sách bảo mật. Kết nối lại để thử lại."
+      }
+    },
+    "startFailed": {
+      "description": "Agent không thể bắt đầu phiên. Thử lại hoặc kiểm tra nhật ký chẩn đoán của thiết bị.",
+      "title": "Màn hình Từ xa khởi động thất bại"
+    },
+    "unavailable": {
+      "default": "Màn hình không khả dụng trên thiết bị này",
+      "headless": "Thiết bị này không có màn hình hiển thị — màn hình từ xa không khả dụng",
+      "helperNotConnected": "Trình trợ giúp màn hình macOS chưa được kết nối. Bật VNC Relay để kết nối qua macOS Screen Sharing.",
+      "manualInstall": "Màn hình đăng nhập chỉ được hỗ trợ cho cài đặt được quản lý",
+      "missingEntitlement": "Màn hình đăng nhập bị chặn cho đến khi quyền Apple yêu cầu được phê duyệt",
+      "missingPermission": "Vẫn thiếu các quyền macOS cần thiết để truy cập màn hình không cần giám sát",
+      "noDisplaySession": "Không có phiên đồ họa hoạt động — vui lòng đăng nhập qua RDP hoặc bảng điều khiển trước",
+      "unsupportedOs": "macOS chặn đầu vào bàn phím và chuột từ xa ở cửa sổ đăng nhập, do đó Màn hình Từ xa không thể điều khiển máy Mac này tại đó. Bật VNC Relay trong chính sách cấu hình của thiết bị để kết nối tại màn hình đăng nhập.",
+      "virtualDisplay": "Không có màn hình khả dụng nào cho máy Mac này. Bật VNC Relay để kết nối qua macOS Screen Sharing.",
+      "waylandUnsupported": "Đây là màn hình Wayland — màn hình từ xa cần agent mới hơn",
+      "x11AuthFailed": "Không thể xác thực với máy chủ hiển thị (X authority)",
+      "x11ConnectFailed": "Không thể kết nối với máy chủ hiển thị trên thiết bị này"
+    },
+    "opensNewWindow": "(mở trong cửa sổ mới)"
+  },
+  "connectVncButton": {
+    "creatingTunnel": "Đang tạo đường hầm...",
+    "errors": {
+      "connectionFailed": "Kết nối thất bại",
+      "createTunnel": "Không thể tạo đường hầm",
+      "createVncTunnel": "Không thể tạo đường hầm VNC",
+      "issueConnectCode": "Không thể cấp mã kết nối VNC",
+      "tunnelFailed": "Đường hầm mở thất bại"
+    },
+    "fallback": {
+      "description": "Mở phiên VNC trong trình duyệt của bạn thay thế.",
+      "title": "Trình xem không mở?"
+    },
+    "launching": "Đang khởi chạy...",
+    "openInBrowser": "Mở trong Trình duyệt",
+    "policyDisabled": "VNC relay bị vô hiệu hóa bởi chính sách",
+    "policyDisabledNamed": "VNC relay bị vô hiệu hóa bởi chính sách \"{{name}}\"",
+    "unavailable": "VNC Không khả dụng",
+    "vncDesktop": "Màn hình VNC",
+    "vncRemote": "VNC Từ xa"
+  },
+  "deleteConfirmDialog": {
+    "deletePermanently": "Xóa Vĩnh viễn",
+    "headingMultiple": "Xóa {{count}} mục?",
+    "headingSingle": "Xóa {{name}}?",
+    "itemCount": "Số lượng Mục",
+    "moveToTrash": "Chuyển vào Thùng rác",
+    "recycleBinNotice": "Thông báo Thùng rác",
+    "totalSize": "Tổng cộng: {{size}}",
+    "itemCount_one": "{{count}} mục",
+    "itemCount_other": "{{count}} mục"
+  },
+  "eventViewer": {
+    "allSources": "Tất cả Nguồn",
+    "auto": "Tự động",
+    "categories": "Danh mục",
+    "clearAll": "Xóa Tất cả",
+    "copyMessage": "Sao chép Tin nhắn",
+    "dateRange": "Khoảng Thời gian",
+    "detailsTitle": "Tiêu đề Chi tiết",
+    "eventCount": "Số lượng Sự kiện",
+    "eventIdPlaceholder": "Trợ giúp ID Sự kiện",
+    "eventLogs": "Nhật ký Sự kiện",
+    "eventsTitle": "Sự kiện {{name}}",
+    "fields": {
+      "category": "Danh mục",
+      "computer": "Máy tính",
+      "dateTime": "Ngày Giờ",
+      "details": "Chi tiết",
+      "eventId": "ID Sự kiện",
+      "keywords": "Từ khóa",
+      "level": "Cấp độ",
+      "logName": "Tên Log",
+      "message": "Nội dung",
+      "processId": "ID Tiến trình",
+      "rawXml": "Xml Thô",
+      "source": "Nguồn",
+      "taskCategory": "Danh mục Tác vụ",
+      "threadId": "ID Luồng"
+    },
+    "filters": "Bộ lọc",
+    "levels": {
+      "critical": "Nghiêm trọng",
+      "error": "Lỗi",
+      "information": "Thông tin",
+      "warning": "Cảnh báo"
+    },
+    "logTitle": "Log {{name}}",
+    "lookupEventId": "Tra cứu ID Sự kiện",
+    "noEvents": "Không có Sự kiện",
+    "noHandler": "Không có Trình xử lý",
+    "noMatches": "Không khớp",
+    "page": "Trang {{current}} / {{total}}",
+    "ranges": {
+      "allTime": "Tất cả thời gian",
+      "last24Hours": "24 giờ qua",
+      "last30Days": "30 ngày qua",
+      "last7Days": "7 ngày qua",
+      "lastHour": "1 giờ qua"
+    },
+    "recordId": "ID Bản ghi: {{id}}",
+    "searchPlaceholder": "Tìm kiếm...",
+    "showing": "Hiển thị {{start}} đến {{end}} của {{total}}",
+    "time": {
+      "daysAgo": "{{count}} ngày trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước"
+    },
+    "eventCount_one": "{{count}} sự kiện",
+    "eventCount_other": "{{count}} sự kiện"
+  },
+  "fileActivityPanel": {
+    "actions": {
+      "copy": "Sao chép",
+      "delete": "Xóa",
+      "download": "Tải xuống",
+      "move": "Di chuyển",
+      "purge": "Dọn dẹp",
+      "restore": "Khôi phục",
+      "upload": "Tải lên"
+    },
+    "clearActivity": "Xóa hoạt động",
+    "clear": "Xóa",
+    "empty": "Trống",
+    "hideActivity": "Ẩn Hoạt động",
+    "operationFailed": "Thao tác Thất bại",
+    "results": {
+      "failed": "Thất bại",
+      "success": "Thành công",
+      "unverified": "Chưa xác thực"
+    },
+    "showActivity": "Hiện Hoạt động",
+    "time": {
+      "daysAgo": "{{count}} ngày trước",
+      "hoursAgo": "{{count}} giờ trước",
+      "justNow": "Vừa xong",
+      "minutesAgo": "{{count}} phút trước"
+    },
+    "title": "Hoạt động Tệp",
+    "unverifiedHint": "Gợi ý Chưa xác thực"
+  },
+  "fileManager": {
+    "activeCount": "{{count}} đang hoạt động",
+    "activity": "Hoạt động",
+    "cancelled": "Đã hủy",
+    "cancelledUploadNote": "Quá trình tải lên đã dừng trong trình duyệt này. Nếu lệnh ghi đã đến thiết bị, tệp có thể vẫn được lưu ở đó.",
+    "copyTo": "Sao chép Đến",
+    "disk": {
+      "title": "Dọn dẹp Ổ đĩa",
+      "openTab": "Mở Dọn dẹp Ổ đĩa",
+      "openHint": "Quét, xem trước và giải phóng dung lượng đĩa từ tab Dọn dẹp Ổ đĩa của thiết bị này."
+    },
+    "dismiss": "Bỏ qua",
+    "dropFiles": "Thả Tệp",
+    "emptyDirectory": "Thư mục Trống",
+    "errors": {
+      "copy": "Không thể sao chép",
+      "delete": "Không thể xóa",
+      "download": "Không thể tải xuống",
+      "downloadTooLarge": "Tệp quá lớn để tải xuống ({{size}}). Trình duyệt tệp hỗ trợ truyền tệp tối đa {{max}}.",
+      "loadDirectory": "Không thể tải thư mục",
+      "move": "Không thể di chuyển",
+      "readFile": "Không thể đọc tệp",
+      "upload": "Không thể tải lên",
+      "uploadTimeout": "Quá thời gian tải lên sau 2 phút. Tệp có thể đã được ghi vào thiết bị — hãy làm mới để xác minh."
+    },
+    "freeOf": "{{free}} trống trong tổng số {{total}}",
+    "goUp": "Lên trên",
+    "home": "Trang chủ",
+    "modified": "Đã sửa đổi",
+    "moveTo": "Di chuyển Đến",
+    "selectedCount": "Số lượng Đã chọn",
+    "size": "Kích thước",
+    "title": "Trình quản lý Tệp",
+    "transfers": "Truyền tệp",
+    "trash": "Thùng rác",
+    "selectedCount_one": "Đã chọn {{count}}",
+    "selectedCount_other": "Đã chọn {{count}}"
+  },
+  "folderPickerDialog": {
+    "errors": {
+      "loadDirectory": "Không thể tải thư mục"
+    },
+    "goUp": "Lên trên",
+    "noSubdirectories": "Không có Thư mục con",
+    "selectFolder": "Chọn Thư mục",
+    "selectedFolder": "Thư mục Đã chọn"
+  },
+  "processManager": {
+    "autoRefresh": "Tự động Làm mới",
+    "columns": {
+      "memory": "Bộ nhớ",
+      "processName": "Tên Tiến trình"
+    },
+    "details": {
+      "commandLine": "Dòng lệnh",
+      "parentPid": "Pid Cha",
+      "priority": "Độ ưu tiên",
+      "startTime": "Thời gian Bắt đầu",
+      "threads": "Luồng"
+    },
+    "errors": {
+      "handlerNotConfigured": "Trình xử lý kết thúc tiến trình chưa được định cấu hình",
+      "killFailed": "Không thể kết thúc tiến trình"
+    },
+    "killConfirm": "Xác nhận Kết thúc",
+    "killProcess": "Kết thúc Tiến trình",
+    "killing": "Đang kết thúc",
+    "loadingDetails": "Đang tải Chi tiết",
+    "noData": "Không có Dữ liệu",
+    "noMatches": "Không khớp",
+    "processMemory": "Bộ nhớ Tiến trình",
+    "processes": "Tiến trình",
+    "searchPlaceholder": "Tìm kiếm...",
+    "showing": "Hiển thị {{shown}} / {{total}} tiến trình",
+    "status": {
+      "idle": "Nhàn rỗi",
+      "running": "Đang chạy",
+      "sleeping": "Đang ngủ",
+      "stopped": "Đã dừng",
+      "zombie": "Zombie"
+    },
+    "title": "Trình quản lý Tiến trình",
+    "totalCpu": "Tổng CPU",
+    "pid": "PID",
+    "cpu": "CPU"
+  },
+  "proxyTunnelPage": {
+    "errors": {
+      "closeFailed": "Không thể đóng đường hầm",
+      "invalidProxyUrl": "Máy chủ trả về địa chỉ proxy không hợp lệ.",
+      "invalidTicket": "Liên kết này không hợp lệ hoặc đã hết hạn.",
+      "obtainTicket": "Không thể lấy vé đường hầm",
+      "popupBlocked": "Trình duyệt của bạn đã chặn tab mới. Hãy cho phép bật lên (pop-up) cho trang này và thử lại.",
+      "prepareConnection": "Không thể chuẩn bị kết nối proxy",
+      "tlsUntrusted": "Thiết bị này cung cấp chứng chỉ không đáng tin cậy hoặc tự ký.",
+      "tunnelFailed": "Không thể mở đường hầm"
+    },
+    "cookieBlocked": {
+      "title": "Trình duyệt này đã chặn phiên proxy được nhúng.",
+      "body": "Mở thiết bị trong tab mới để tiếp tục.",
+      "storageBody": "Trình duyệt chặn bộ nhớ trang trong các trang nhúng vốn cần thiết cho trang thiết bị. Sử dụng tab mới sẽ hoạt động."
+    },
+    "openInNewTab": "Mở trong Tab Mới",
+    "preparingConnection": "Đang chuẩn bị kết nối proxy…",
+    "proxiedService": "Dịch vụ Proxy",
+    "reconnectSelfSigned": "Kết nối lại cho phép chứng chỉ tự ký",
+    "sessionExpired": {
+      "title": "Phiên đã hết hạn",
+      "body": "Phiên proxy của bạn đã hết thời gian chờ.",
+      "reconnect": "Kết nối lại"
+    },
+    "status": {
+      "connected": "Đã kết nối",
+      "connecting": "Đang kết nối...",
+      "disconnected": "Đã ngắt kết nối",
+      "failed": "Thất bại"
+    },
+    "target": "Mục tiêu",
+    "title": "Proxy Mạng",
+    "tunnelDetails": "Chi tiết Đường hầm",
+    "tunnelId": "ID Đường hầm"
+  },
+  "registryEditor": {
+    "copyPath": "Sao chép Đường dẫn",
+    "data": "Dữ liệu",
+    "decimal": "Thập phân",
+    "deleteKey": "Xóa Khóa",
+    "deleteKeyConfirm": "Bạn có chắc chắn muốn xóa khóa \"{{name}}\" và tất cả các khóa con và giá trị của nó không? Hành động này không thể hoàn tác.",
+    "deleteValue": "Xóa Giá trị",
+    "deleteValueConfirm": "Bạn có chắc chắn muốn xóa giá trị \"{{name}}\"? Hành động này không thể hoàn tác.",
+    "device": "Thiết bị: {{id}}",
+    "editValue": "Sửa Giá trị",
+    "enterDecimalValue": "Nhập Giá trị Thập phân",
+    "enterHexBytes": "Nhập Byte Hex",
+    "enterHexValue": "Nhập Giá trị Hex",
+    "enterKeyName": "Nhập Tên Khóa",
+    "enterStringValue": "Nhập Giá trị Chuỗi",
+    "enterStrings": "Nhập Các Chuỗi",
+    "enterValueName": "Nhập Tên Giá trị",
+    "errors": {
+      "createKey": "Không thể tạo khóa registry",
+      "createKeyDetail": "Không thể tạo khóa registry: {{message}}",
+      "deleteKey": "Không thể xóa khóa registry",
+      "deleteKeyDetail": "Không thể xóa khóa registry: {{message}}",
+      "deleteValue": "Không thể xóa giá trị registry",
+      "deleteValueDetail": "Không thể xóa giá trị registry: {{message}}",
+      "invalidFormat": "Định dạng giá trị không hợp lệ",
+      "invalidNumber": "Giá trị số không hợp lệ",
+      "keyNameBackslash": "Tên khóa không được chứa dấu gạch chéo ngược",
+      "keyNameRequired": "Tên khóa là bắt buộc",
+      "keyProvider": "Nhà cung cấp khóa registry chưa được cấu hình",
+      "loadKeys": "Không thể tải các khóa registry",
+      "loadKeysDetail": "Không thể tải các khóa registry: {{message}}",
+      "loadValues": "Không thể tải các giá trị registry",
+      "loadValuesDetail": "Không thể tải các giá trị registry: {{message}}",
+      "saveValue": "Không thể lưu giá trị registry",
+      "saveValueDetail": "Không thể lưu giá trị registry: {{message}}",
+      "valueNameRequired": "Tên giá trị là bắt buộc",
+      "valueProvider": "Nhà cung cấp giá trị registry chưa được cấu hình"
+    },
+    "hexadecimal": "Thập lục phân",
+    "key": "Khóa",
+    "keyName": "Tên Khóa",
+    "newKey": "Khóa Mới",
+    "newValue": "Giá trị Mới",
+    "noMatchingValues": "Không Có Giá Trị Phù Hợp",
+    "noValues": "Không Có Giá Trị",
+    "parentPath": "Đường dẫn Cha",
+    "root": "Gốc",
+    "searchPlaceholder": "Tìm kiếm...",
+    "title": "Trình Chỉnh Sửa Registry",
+    "value": "Giá trị",
+    "valueCount": "Số lượng Giá trị",
+    "valueData": "Dữ liệu Giá trị",
+    "valueName": "Tên Giá trị",
+    "valueNotSet": "Giá trị Chưa Được Đặt",
+    "valueCount_one": "{{count}} giá trị",
+    "valueCount_other": "{{count}} giá trị"
+  },
+  "remoteDeviceLauncherPage": {
+    "action": "Hành động",
+    "backToRemoteAccess": "Quay Lại Truy Cập Từ Xa",
+    "errors": {
+      "loadDevices": "Không thể tải danh sách thiết bị"
+    },
+    "lastSeen": "Hoạt động Lần Cuối",
+    "modes": {
+      "files": {
+        "action": "Mở Tệp",
+        "description": "Chọn một thiết bị trực tuyến để mở trình quản lý tệp từ xa.",
+        "title": "Bắt đầu Truyền Tệp"
+      },
+      "terminal": {
+        "action": "Mở Terminal",
+        "description": "Chọn một thiết bị trực tuyến để mở terminal từ xa.",
+        "title": "Bắt đầu Phiên Terminal"
+      }
+    },
+    "noOnlineDevices": "Không Có Thiết Bị Trực Tuyến",
+    "noSearchMatches": "Không Có Kết Quả Tìm Kiếm",
+    "openDeviceList": "Mở Danh Sách Thiết Bị",
+    "os": "HĐH",
+    "searchPlaceholder": "Tìm kiếm..."
+  },
+  "remoteFilesPage": {
+    "breadcrumbs": {
+      "devices": "Thiết bị",
+      "fileManager": "Trình Quản Lý Tệp"
+    },
+    "deviceNotFoundDescription": "Mô tả Không tìm thấy thiết bị",
+    "deviceNotFoundTitle": "Tiêu đề Không tìm thấy thiết bị",
+    "deviceOfflineDescription": "Thiết bị hiện đang {{status}}. Truy cập tệp từ xa chỉ khả dụng khi thiết bị trực tuyến.",
+    "deviceOfflineTitle": "Tiêu đề Thiết bị Ngoại tuyến",
+    "errorTitle": "Tiêu đề Lỗi",
+    "errors": {
+      "deviceNotFound": "Không tìm thấy thiết bị",
+      "fetchDevice": "Không thể lấy thông tin thiết bị",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "refreshStatus": "Làm mới Trạng thái",
+    "title": "Trình Quản Lý Tệp"
+  },
+  "remoteTerminal": {
+    "connectedBang": "Đã kết nối!",
+    "connectingTo": "Đang kết nối tới {{hostname}}...",
+    "copySelection": "Sao chép Phần đã chọn",
+    "disconnect": "Ngắt kết nối",
+    "errorMessage": "Lỗi: {{message}}",
+    "errors": {
+      "closedUnexpectedly": "Kết nối bị đóng bất ngờ",
+      "connection": "Lỗi kết nối",
+      "createSession": "Không thể tạo phiên",
+      "createTicket": "Không thể tạo vé kết nối",
+      "failed": "Kết nối thất bại",
+      "initialize": "Không thể khởi tạo",
+      "invalidTicket": "Phản hồi vé kết nối không hợp lệ",
+      "webSocket": "Lỗi kết nối WebSocket"
+    },
+    "exitFullscreen": "Thoát toàn màn hình",
+    "fullscreen": "Toàn màn hình",
+    "reconnect": "Kết nối lại",
+    "sessionEnded": "Phiên đã kết thúc",
+    "status": {
+      "connected": "Đã kết nối",
+      "connecting": "Đang kết nối...",
+      "disconnected": "Đã ngắt kết nối",
+      "failed": "Thất bại",
+      "reconnecting": "Đang kết nối lại"
+    },
+    "welcome": "Xin chào"
+  },
+  "remoteTerminalPage": {
+    "deviceNotFoundDescription": "Mô tả Không tìm thấy thiết bị",
+    "deviceNotFoundTitle": "Tiêu đề Không tìm thấy thiết bị",
+    "errorTitle": "Tiêu đề Lỗi",
+    "errors": {
+      "deviceNotFound": "Không tìm thấy thiết bị",
+      "fetchDevice": "Không thể lấy thông tin thiết bị",
+      "generic": "Đã xảy ra lỗi"
+    },
+    "offlineWarning": "Trạng thái thiết bị hiện là {{status}}. Vẫn đang thử kết nối.",
+    "title": "Tiêu đề"
+  },
+  "remoteToolsPage": {
+    "agentRestartingDescription": "Agent của Breeze đang khởi động lại. Thiết bị sẽ tự động kết nối lại...",
+    "agentRestartingTitle": "Agent đang khởi động lại",
+    "errors": {
+      "createRegistryKey": "Không thể tạo khóa registry",
+      "deleteRegistryKey": "Không thể xóa khóa registry",
+      "deleteRegistryValue": "Không thể xóa giá trị registry",
+      "disableTask": "Không thể tắt tác vụ",
+      "enableTask": "Không thể bật tác vụ",
+      "eventDetails": "Không thể tải chi tiết sự kiện",
+      "fetchEventLogs": "Không thể tải nhật ký sự kiện",
+      "fetchProcesses": "Không thể tải tiến trình",
+      "fetchServices": "Không thể tải dịch vụ",
+      "fetchTasks": "Không thể tải tác vụ",
+      "killProcess": "Không thể tắt tiến trình",
+      "processDetails": "Không thể lấy chi tiết tiến trình",
+      "queryEvents": "Không thể truy vấn sự kiện",
+      "registryKeys": "Không thể tải khóa registry",
+      "registryValues": "Không thể tải giá trị registry",
+      "restartService": "Không thể khởi động lại dịch vụ",
+      "runTask": "Không thể chạy tác vụ",
+      "setRegistryValue": "Không thể đặt giá trị registry",
+      "startService": "Không thể khởi động dịch vụ",
+      "stopService": "Không thể dừng dịch vụ",
+      "taskDetails": "Không thể tải chi tiết tác vụ",
+      "taskHistory": "Không thể tải lịch sử tác vụ"
+    },
+    "policyDisabled": "Chính sách cấu hình đã vô hiệu hóa các công cụ hệ thống từ xa.",
+    "policyDisabledNamed": "Chính sách cấu hình \"{{name}}\" đã vô hiệu hóa các công cụ hệ thống từ xa.",
+    "policyDisabledTitle": "Công cụ từ xa bị vô hiệu hóa trên thiết bị này",
+    "tabs": {
+      "eventlog": "Nhật ký sự kiện",
+      "files": "Trình duyệt tệp",
+      "processes": "Tiến trình",
+      "registry": "Registry",
+      "services": "Dịch vụ",
+      "tasks": "Tác vụ định lịch",
+      "terminal": "Terminal"
+    },
+    "title": "Công cụ từ xa"
+  },
+  "scheduledTasks": {
+    "action": {
+      "restart": "Khởi động lại",
+      "start": "Bắt đầu",
+      "stop": "Dừng"
+    },
+    "adjustSearch": "Điều chỉnh tìm kiếm",
+    "arguments": "Tham số",
+    "author": "Tác giả",
+    "deviceId": "ID thiết bị: {{id}}",
+    "inFolder": " trong {{folder}}",
+    "lastResult": "Kết quả cuối",
+    "lastRun": "Lần chạy cuối",
+    "matching": " khớp với \"{{query}}\"",
+    "nextRun": "Lần chạy tiếp",
+    "noActions": "Không có hành động nào được cấu hình",
+    "noConditions": "Không có điều kiện nào được cấu hình",
+    "noDescription": "Không có mô tả",
+    "noHistory": "Không có lịch sử",
+    "noTasksAvailable": "Không có tác vụ định lịch nào",
+    "noTriggers": "Không có trình kích hoạt nào được cấu hình",
+    "noneInFolder": "Không có tác vụ định lịch trong thư mục này",
+    "notLoaded": "Chưa có tác vụ định lịch nào được tải cho thiết bị này",
+    "programScript": "Chương trình/script",
+    "runAs": "Chạy với tư cách",
+    "runNow": "Chạy ngay",
+    "searchPlaceholder": "Tìm kiếm tác vụ...",
+    "startIn": "Bắt đầu trong",
+    "startProgram": "Chạy chương trình",
+    "status": {
+      "disabled": "Đã vô hiệu hóa",
+      "queued": "Đang đợi",
+      "ready": "Sẵn sàng",
+      "running": "Đang chạy",
+      "unknown": "Không xác định"
+    },
+    "tabs": {
+      "actions": "Hành động",
+      "conditions": "Điều kiện",
+      "general": "Chung",
+      "history": "Lịch sử",
+      "settings": "Cài đặt",
+      "triggers": "Trình kích hoạt"
+    },
+    "taskCount": "Số lượng tác vụ",
+    "title": "Tác vụ định lịch",
+    "idleConditions": "Điều kiện khi rảnh",
+    "powerConditions": "Điều kiện nguồn điện",
+    "networkConditions": "Điều kiện mạng",
+    "generalSettings": "Cài đặt chung",
+    "restartOnFailure": "Khởi động lại khi lỗi",
+    "waitForIdle": "Đợi rảnh: {{value}}",
+    "waitTimeout": "Thời gian chờ: {{value}}",
+    "stopOnIdleEnd": "Dừng khi hết rảnh: {{value}}",
+    "restartOnIdle": "Khởi động lại khi rảnh: {{value}}",
+    "startOnAcOnly": "Chỉ chạy khi dùng nguồn điện AC: {{value}}",
+    "stopOnBattery": "Dừng nếu dùng pin: {{value}}",
+    "requiredNetwork": "Bắt buộc: {{name}}",
+    "allowOnDemand": "Cho phép chạy tác vụ theo yêu cầu",
+    "runOnlyIfNetwork": "Chỉ chạy khi có mạng",
+    "executionTimeLimit": "Giới hạn thời gian thực thi: {{value}}",
+    "multipleInstances": "Nếu có nhiều phiên bản: {{value}}",
+    "restartCount": "Số lần khởi động lại: {{count}}",
+    "restartInterval": "Khoảng thời gian khởi động lại: {{value}}",
+    "taskCount_one": "{{count}} tác vụ",
+    "taskCount_other": "{{count}} tác vụ"
+  },
+  "servicesManager": {
+    "account": "Tài khoản",
+    "action": {
+      "restart": "Khởi động lại",
+      "start": "Bắt đầu",
+      "stop": "Dừng"
+    },
+    "actionBlocked": "Hành động bị chặn",
+    "adjustHint": "Điều chỉnh gợi ý",
+    "agentRestartConfirm": "Xác nhận khởi động lại Agent",
+    "agentStopBlocked": "Đã chặn dừng Agent",
+    "allStatus": "Tất cả trạng thái",
+    "cannotStopAgent": "Không thể dừng Agent",
+    "changeStartupType": "Thay đổi kiểu khởi động",
+    "confirmAction": "Xác nhận thao tác",
+    "dependencies": "Phụ thuộc",
+    "dependentServices": "Dịch vụ phụ thuộc",
+    "displayName": "Tên hiển thị",
+    "executablePath": "Đường dẫn tệp thực thi",
+    "loading": "Đang tải",
+    "noDescription": "Không có mô tả",
+    "noServicesAvailable": "Không có dịch vụ nào",
+    "noServicesFound": "Không tìm thấy dịch vụ",
+    "ok": "OK",
+    "page": "Trang {{current}} / {{total}}",
+    "refreshHint": "Thử làm mới để kiểm tra dịch vụ.",
+    "restartService": "Khởi động lại dịch vụ",
+    "searchPlaceholder": "Tìm kiếm",
+    "serviceConfirm": "Bạn có chắc chắn muốn {{action}} dịch vụ {{service}} không?",
+    "showing": "Hiển thị {{start}} - {{end}} trong tổng số {{total}}",
+    "startService": "Khởi động dịch vụ",
+    "startup": "Khởi động",
+    "status": {
+      "running": "Đang chạy",
+      "stopped": "Đã dừng"
+    },
+    "stopService": "Dừng dịch vụ",
+    "summary": "{{shown}} / {{total}} dịch vụ trên {{device}}",
+    "title": "Tiêu đề",
+    "windowsOnlyDescription": "Trình quản lý dịch vụ chỉ khả dụng trên thiết bị Windows. {{device}} đang chạy {{os}}.",
+    "windowsOnlyTitle": "Chỉ dành cho Windows"
+  },
+  "sessionHistory": {
+    "columns": {
+      "data": "Dữ liệu",
+      "duration": "Thời lượng",
+      "started": "Đã bắt đầu"
+    },
+    "filters": {
+      "allTime": "Tất cả thời gian",
+      "allTypes": "Tất cả loại",
+      "allUsers": "Tất cả người dùng",
+      "lastSevenDays": "7 ngày qua",
+      "lastThirtyDays": "30 ngày qua",
+      "today": "Hôm nay",
+      "yesterday": "Hôm qua",
+      "typeFilterLabel": "Loại phiên",
+      "userFilterLabel": "Người dùng",
+      "dateFilterLabel": "Khoảng thời gian"
+    },
+    "noSessions": "Không có phiên nào",
+    "page": "Trang {{current}} / {{total}}",
+    "searchPlaceholder": "Tìm kiếm",
+    "showing": "Hiển thị {{start}} - {{end}} trong tổng số {{total}}",
+    "stats": {
+      "averageDuration": "Thời lượng trung bình",
+      "dataTransferred": "Dữ liệu đã truyền",
+      "totalDuration": "Tổng thời lượng",
+      "totalSessions": "Tổng số phiên"
+    },
+    "status": {
+      "active": "Đang hoạt động",
+      "connecting": "Đang kết nối...",
+      "disconnected": "Đã ngắt kết nối",
+      "failed": "Thất bại",
+      "pending": "Đang chờ",
+      "endedByUser": "Đã kết thúc bởi người dùng",
+      "teardownPending": "Đang kết thúc (đang chờ thiết bị)"
+    },
+    "subtitle": "Nhật ký kiểm toán truy cập từ xa",
+    "title": "Lịch sử phiên",
+    "todayAt": "Hôm nay lúc {{time}}",
+    "types": {
+      "desktop": "Màn hình",
+      "fileTransfer": "Truyền tệp",
+      "terminal": "Terminal"
+    },
+    "viewDetails": "Xem chi tiết",
+    "yesterdayAt": "Hôm qua lúc {{time}}"
+  },
+  "sessionHistoryPage": {
+    "detailsTitle": "Tiêu đề chi tiết",
+    "errors": {
+      "exportFetch": "Không thể tải phiên để xuất"
+    },
+    "fields": {
+      "dataTransferred": "Dữ liệu đã truyền",
+      "deviceId": "ID thiết bị",
+      "duration": "Thời lượng",
+      "ended": "Đã kết thúc",
+      "hostname": "Tên máy",
+      "sessionId": "ID phiên",
+      "started": "Đã bắt đầu",
+      "userId": "ID người dùng",
+      "os": "HĐH",
+      "email": "Email"
+    },
+    "sections": {
+      "recording": "Bản ghi",
+      "sessionInformation": "Thông tin phiên",
+      "timeline": "Dòng thời gian"
+    },
+    "subtitle": "Xem và kiểm toán phiên truy cập từ xa",
+    "endedByUser": "Đã kết thúc bởi người dùng",
+    "teardownPending": "Đang chờ xác nhận từ thiết bị",
+    "title": "Lịch sử phiên",
+    "viewDevice": "Xem thiết bị",
+    "viewRecording": "Xem bản ghi"
+  },
+  "trashView": {
+    "columns": {
+      "deletedAt": "Đã xóa lúc",
+      "deletedBy": "Đã xóa bởi",
+      "originalPath": "Đường dẫn gốc",
+      "size": "Dung lượng"
+    },
+    "deleteConfirm": "Xóa vĩnh viễn {{count}} mục? Thao tác này không thể hoàn tác.",
+    "deletePermanently": "Xóa vĩnh viễn",
+    "deleteSelected": "Xóa vĩnh viễn ({{count}})",
+    "empty": "Trống",
+    "emptyConfirm": "Xác nhận làm trống",
+    "emptyTrash": "Dọn sạch thùng rác",
+    "errors": {
+      "empty": "Không thể làm trống",
+      "load": "Không thể tải",
+      "purge": "Không thể dọn dẹp",
+      "restore": "Không thể khôi phục",
+      "unverified": "Không thể đặt lại trạng thái chưa xác minh"
+    },
+    "itemCount": "Số lượng mục",
+    "loading": "Đang tải",
+    "permanentlyDelete": "Xóa vĩnh viễn",
+    "restoreSelected": "Khôi phục mục đã chọn ({{count}})",
+    "itemCount_one": "{{count}} mục trong thùng rác",
+    "itemCount_other": "{{count}} mục trong thùng rác"
+  },
+  "vncViewer": {
+    "connect": "Kết nối",
+    "credentials": {
+      "macDescription": "Mô tả Mac",
+      "macLoginRequired": "Yêu cầu đăng nhập Mac",
+      "macPassword": "Mật khẩu Mac",
+      "macUsername": "Tên người dùng Mac",
+      "password": "Mật khẩu",
+      "passwordRequired": "Yêu cầu mật khẩu",
+      "vncDescription": "Mô tả VNC"
+    },
+    "disconnect": "Ngắt kết nối",
+    "errors": {
+      "authenticationDetail": "Xác thực thất bại: {{reason}}. Kiểm tra mật khẩu VNC của bạn.",
+      "authenticationFailed": "Xác thực thất bại",
+      "connectionLost": "Mất kết nối bất ngờ",
+      "loadViewer": "Không thể tải trình xem VNC",
+      "securityFailure": "Lỗi bảo mật: {{reason}}",
+      "securityType": "Loại bảo mật không được hỗ trợ: {{reason}}"
+    },
+    "exitFullscreen": "Thoát toàn màn hình",
+    "fullscreen": "Toàn màn hình",
+    "scalingFit": "Co giãn vừa vặn",
+    "scalingNative": "Co giãn gốc",
+    "status": {
+      "connected": "Đã kết nối",
+      "connecting": "Đang kết nối...",
+      "disconnected": "Đã ngắt kết nối",
+      "error": "Lỗi",
+      "passwordRequired": "Yêu cầu mật khẩu"
+    },
+    "syncClipboard": "Đồng bộ khay nhớ tạm",
+    "tunnel": "Đường hầm {{id}}"
+  },
+  "vncViewerPage": {
+    "connecting": "Đang kết nối...",
+    "disconnect": "Ngắt kết nối",
+    "errors": {
+      "connect": "Kết nối thất bại",
+      "invalidTicket": "Phản hồi vé đường hầm không hợp lệ",
+      "obtainTicket": "Không thể lấy vé đường hầm VNC"
+    },
+    "sessionTitle": "Tiêu đề phiên"
+  },
+  "quickSupport": {
+    "title": "Hỗ trợ nhanh",
+    "subtitle": "Tạo mã dùng một lần để hỗ trợ ad-hoc trên thiết bị chưa được đăng ký.",
+    "newSession": "Phiên hỗ trợ mới",
+    "form": {
+      "title": "Bắt đầu phiên hỗ trợ",
+      "attributionOrg": "Gán cho khách hàng (tùy chọn)",
+      "attributionOrgHint": "Chỉ để báo cáo — thao tác này không cấp hoặc thay đổi quyền truy cập vào dữ liệu của khách hàng đó.",
+      "attributionOrgNone": "Chưa gán",
+      "attributionLabel": "Nhãn tham chiếu (tùy chọn)",
+      "attributionLabelPlaceholder": "Phiên này dành cho ai hoặc việc gì?",
+      "submit": "Tạo mã",
+      "submitting": "Đang tạo mã…"
+    },
+    "code": {
+      "heading": "Đọc mã này cho người bạn đang hỗ trợ",
+      "shownOnce": "Sao chép mã này ngay. Breeze chỉ lưu trữ mã băm của mã này, vì vậy một khi bạn rời đi hoặc tải lại trang này, mã sẽ không thể khôi phục — bạn sẽ phải bắt đầu một phiên mới.",
+      "expires": "Hết hạn lúc {{time}}",
+      "instructions": "Gửi liên kết cho họ, sau đó yêu cầu họ chạy ứng dụng đã tải xuống và nhập mã.",
+      "copyCode": "Sao chép mã",
+      "copyLink": "Sao chép liên kết tải xuống",
+      "copiedCode": "Đã sao chép mã vào khay nhớ tạm",
+      "copiedLink": "Đã sao chép liên kết tải xuống vào khay nhớ tạm",
+      "copyFailed": "Không thể sao chép vào khay nhớ tạm"
+    },
+    "detail": {
+      "heading": "Chi tiết phiên",
+      "noCode": "Mã dùng một lần chỉ hiển thị khi phiên này được tạo và không thể lấy lại. Hãy bắt đầu phiên mới nếu người đó cần mã khác.",
+      "attribution": "Tham chiếu",
+      "close": "Đóng chi tiết phiên"
+    },
+    "status": {
+      "heading": "Tiến trình phiên",
+      "pending": "Đang đợi người dùng chạy ứng dụng…",
+      "claimed": "Ứng dụng đang kết nối…",
+      "ready": "Sẵn sàng kết nối",
+      "active": "Phiên đang diễn ra",
+      "ended": "Phiên đã kết thúc",
+      "expired": "Phiên đã hết hạn"
+    },
+    "connect": {
+      "waitingForDevice": "Thiết bị đang đăng ký. Nút kết nối sẽ xuất hiện ngay khi thiết bị trực tuyến."
+    },
+    "end": {
+      "button": "Kết thúc phiên",
+      "success": "Phiên hỗ trợ đã kết thúc",
+      "error": "Không thể kết thúc phiên hỗ trợ",
+      "alreadyEnded": "Phiên hỗ trợ đó đã kết thúc từ trước"
+    },
+    "errors": {
+      "create": "Không thể tạo phiên hỗ trợ",
+      "list": "Không thể tải các phiên hỗ trợ gần đây",
+      "notFound": "Phiên hỗ trợ đó không còn khả dụng."
+    },
+    "list": {
+      "heading": "Phiên hỗ trợ gần đây",
+      "empty": "Chưa có phiên hỗ trợ nào.",
+      "columnCreated": "Đã bắt đầu",
+      "columnEnded": "Đã hoàn tất",
+      "unlabeled": "Phiên chưa gán nhãn",
+      "openSession": "Mở chi tiết phiên"
+    }
+  },
+  "activeSessionsBanner": {
+    "title_one": "Người khác đang có phiên trên thiết bị này",
+    "title_other": "{{count}} người khác đang có phiên trên thiết bị này",
+    "session": "{{name}} — {{type}}, {{duration}}",
+    "unknownUser": "Người dùng ẩn danh",
+    "sessionConnecting": "{{name}} — {{type}}, đang kết nối…",
+    "duration": {
+      "minutes_one": "{{count}} phút",
+      "minutes_other": "{{count}} phút",
+      "hoursMinutes": "{{hours}} h {{minutes}} min",
+      "lessThanMinute": "chưa đến một phút",
+      "hours_one": "{{count}} giờ",
+      "hours_other": "{{count}} giờ"
+    },
+    "announcement_one": "{{names}} đang có phiên trên thiết bị này",
+    "announcement_other": "{{names}} đang có phiên trên thiết bị này",
+    "announcementNone": "Không có ai khác đang có phiên trên thiết bị này"
+  }
+}

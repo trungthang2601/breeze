@@ -243,7 +243,9 @@
     "itITLabel": "Italiano (İtalya)",
     "itITDescription": "İtalyanca (İtalya)",
     "trTRLabel": "Türkçe (Türkiye)",
-    "trTRDescription": "Türkçe (Türkiye)"
+    "trTRDescription": "Türkçe (Türkiye)",
+    "viLabel": "Tiếng Việt",
+    "viDescription": "Vietnamca"
   },
   "partner": {
     "regional": {

@@ -1,0 +1,542 @@
+{
+  "taskState": {
+    "queued": "Đang xếp hàng",
+    "running": "Đang chạy",
+    "waiting": "Đang chờ",
+    "paused": "Đã tạm dừng",
+    "stopping": "Đang dừng",
+    "completed": "Đã hoàn thành",
+    "partial": "Một phần",
+    "handedOff": "Đã bàn giao",
+    "cancelled": "Đã hủy",
+    "failed": "Thất bại",
+    "expired": "Đã hết hạn"
+  },
+  "operatorTaskDetail": {
+    "loading": "Đang tải tác vụ...",
+    "agent": "Được xử lý bởi {{name}}",
+    "requestedBy": "Yêu cầu bởi",
+    "wispFor": "Wisp cho {{name}}",
+    "target": {
+      "label": "Mục tiêu",
+      "none": "Không có thiết bị mục tiêu"
+    },
+    "origin": {
+      "label": "Nguồn gốc",
+      "manual": "Thủ công",
+      "alert": "Cảnh báo",
+      "ticket": "Phiếu hỗ trợ",
+      "schedule": "Lịch trình",
+      "anomaly": "Điểm bất thường",
+      "sweep": "Quét",
+      "chat": "Trò chuyện"
+    },
+    "state": {
+      "label": "Trạng thái"
+    },
+    "phase": {
+      "investigate": "Điều tra",
+      "plan": "Lập kế hoạch",
+      "execute": "Thực thi",
+      "verify": "Xác minh",
+      "document": "Tài liệu"
+    },
+    "waitReason": {
+      "label": "Đang chờ",
+      "approval": "Phê duyệt",
+      "information": "Thông tin",
+      "execution": "Thực thi",
+      "device": "Thiết bị",
+      "maintenanceWindow": "Khung thời gian bảo trì",
+      "verificationWindow": "Khung thời gian xác minh"
+    },
+    "nextAction": {
+      "label": "Hành động tiếp theo",
+      "approveInInbox": "Phê duyệt trong mục Phê duyệt",
+      "answerQuestion": "Trả lời câu hỏi",
+      "waitingForDevice": "Đang đợi thiết bị",
+      "waitingForMaintenanceWindow": "Đang đợi khung thời gian bảo trì",
+      "waitingForVerificationWindow": "Đang đợi khung thời gian xác minh",
+      "waitingForExecution": "Đang đợi thực thi",
+      "queued": "Đã xếp hàng chờ tiếp nhận",
+      "inProgress": "Đang xử lý",
+      "paused": "Đã tạm dừng",
+      "stopping": "Đang dừng",
+      "handedOff": "Đã bàn giao",
+      "none": "Không có gì chờ xử lý"
+    },
+    "deadline": {
+      "label": "Thời hạn",
+      "none": "Không có thời hạn"
+    },
+    "outcome": {
+      "label": "Kết quả",
+      "verifiedResolved": "Đã xác minh đã giải quyết",
+      "investigationComplete": "Đã hoàn tất điều tra",
+      "reportDelivered": "Đã gửi báo cáo",
+      "noActionNeeded": "Không cần hành động",
+      "trialComplete": "Đã hoàn tất dùng thử",
+      "unresolved": "Chưa giải quyết",
+      "unknownEffect": "Hiệu ứng không xác định"
+    },
+    "handoffSummary": {
+      "label": "Tóm tắt bàn giao"
+    },
+    "operations": {
+      "heading": "Thao tác",
+      "empty": "Chưa có thao tác nào.",
+      "attempt": "Lần thử {{n}}"
+    },
+    "dispatchState": {
+      "reserved": "Đã giữ chỗ",
+      "dispatched": "Đã điều phối",
+      "dispatchFailed": "Điều phối thất bại",
+      "cancelled": "Đã hủy",
+      "abandoned": "Đã bỏ dở"
+    },
+    "resultState": {
+      "pending": "Đang chờ",
+      "succeeded": "Thành công",
+      "failed": "Thất bại",
+      "unknown": "Không rõ",
+      "superseded": "Đã thay thế"
+    },
+    "runs": {
+      "heading": "Các lần chạy liên kết",
+      "empty": "Chưa có lần chạy liên kết nào."
+    },
+    "notFound": {
+      "title": "Không tìm thấy tác vụ",
+      "description": "Tác vụ này không tồn tại hoặc bạn không có quyền truy cập."
+    },
+    "errors": {
+      "load": "Không thể tải tác vụ."
+    }
+  },
+  "operatorTaskFeed": {
+    "loading": "Đang tải tác vụ AI…",
+    "loadFailed": "Không thể tải tác vụ AI.",
+    "empty": "Không có tác vụ AI nào cho thiết bị này.",
+    "emptyHint": "Các tác vụ tự động điều tra và giải quyết sự cố trên thiết bị khi bạn bắt đầu một tác vụ AI từ cảnh báo. Tác vụ AI cho thiết bị này sẽ hiển thị ở đây.",
+    "learnMore": "Tìm hiểu về tác vụ AI"
+  },
+  "delegate": {
+    "button": "Bắt đầu tác vụ AI",
+    "dialogTitle": "Bắt đầu tác vụ AI",
+    "dialogMessage": "Hệ thống sẽ điều tra và cố gắng giải quyết việc này bằng công thức bên dưới.",
+    "orgLabel": "Tổ chức",
+    "deviceLabel": "Thiết bị",
+    "serviceNameLabel": "Tên dịch vụ",
+    "serviceNamePlaceholder": "ví dụ: Spooler",
+    "serviceNameError": "Nhập tên dịch vụ để bắt đầu tác vụ AI này.",
+    "workflowLabel": "Công thức",
+    "workflowName": "Khôi phục dịch vụ",
+    "confirmLabel": "Bắt đầu",
+    "queued": "Đã bắt đầu tác vụ AI.",
+    "failed": "Không thể bắt đầu tác vụ AI."
+  },
+  "effectTool": {
+    "googleSetVacation": "Đặt thư trả lời tự động trên Gmail",
+    "googleSetForwarding": "Chuyển tiếp Gmail cho người kế nhiệm",
+    "googleAddMailDelegate": "Cấp quyền cho người kế nhiệm truy cập hộp thư Gmail",
+    "googleRemoveFromGroup": "Xóa khỏi Google groups",
+    "googleRemoveLicense": "Xóa giấy phép Google Workspace",
+    "googleAccountWipeMobileDevice": "Xóa tài khoản công việc khỏi điện thoại đã đăng ký",
+    "googleSignout": "Đăng xuất khỏi các phiên Google",
+    "googleSuspendUser": "Tạm ngưng tài khoản Google",
+    "m365SetAutoReply": "Đặt thư trả lời tự động trên Outlook",
+    "m365RemoveFromGroup": "Xóa khỏi Microsoft 365 groups",
+    "m365RemoveLicense": "Xóa giấy phép Microsoft 365",
+    "m365RetireIntuneDevice": "Thu hồi điện thoại quản lý bởi Intune",
+    "m365RevokeSessions": "Thu hồi phiên đăng nhập Microsoft 365",
+    "m365DisableUser": "Chặn đăng nhập Microsoft 365",
+    "m365CreateUser": "Tạo tài khoản Microsoft 365",
+    "m365AssignLicense": "Gán giấy phép Microsoft 365",
+    "m365AddToGroup": "Thêm vào Microsoft 365 group",
+    "googleMoveOu": "Chuyển đến đơn vị tổ chức",
+    "googleAssignLicense": "Gán giấy phép Google Workspace",
+    "googleAddToGroup": "Thêm vào Google group"
+  },
+  "workspace": {
+    "tabs": {
+      "label": "Phần tác vụ AI",
+      "tasks": "Tác vụ",
+      "library": "Thư viện"
+    },
+    "noOrg": "Chọn một tổ chức để xem các quy trình nào có thể chạy."
+  },
+  "taskList": {
+    "loading": "Đang tải tác vụ...",
+    "loadFailed": "Tải tác vụ thất bại.",
+    "empty": "Chưa có tác vụ AI nào.",
+    "emptyHint": "Các tác vụ bạn bắt đầu từ Thư viện, phiếu hỗ trợ, liên hệ hoặc cảnh báo sẽ hiển thị ở đây.",
+    "loadMore": "Tải thêm",
+    "loadMoreFailed": "Tải thêm tác vụ thất bại."
+  },
+  "recipeLibrary": {
+    "loading": "Đang tải quy trình...",
+    "loadFailed": "Tải thư viện quy trình thất bại.",
+    "empty": "Chưa có quy trình nào khả dụng cho tổ chức này.",
+    "readiness": {
+      "ready": "Sẵn sàng",
+      "setupRequired": "Cần thiết lập",
+      "unavailable": "Không khả dụng"
+    },
+    "setupBlock": {
+      "title": "Cần thiết lập",
+      "description": "Cho đến khi các vấn đề này được khắc phục, các bước phía sau sẽ được thực hiện thủ công."
+    },
+    "manualSteps": {
+      "count_one": "1 bước sẽ được thực hiện thủ công",
+      "count_other": "{{count}} bước sẽ được thực hiện thủ công",
+      "expand": "Xem các bước",
+      "collapse": "Ẩn các bước này",
+      "explainer": "Breeze chưa tự động hóa các bước này. Tác vụ sẽ thêm chúng vào phiếu hỗ trợ dưới dạng mục kiểm tra."
+    },
+    "degraded": {
+      "title": "Những gì sẽ được thực hiện thủ công",
+      "description": "Đối với tổ chức này, các bước này sẽ trở thành mục kiểm tra trên phiếu hỗ trợ của tác vụ thay vì chạy tự động."
+    },
+    "action": {
+      "reconsentM365": "Cấp các quyền Microsoft 365 đã cập nhật trong cài đặt tích hợp của tổ chức này.",
+      "connectGoogle": "Kết nối Google Workspace cho tổ chức này từ phần tích hợp.",
+      "connectM365": "Kết nối Microsoft 365 cho tổ chức này từ phần tích hợp.",
+      "open": "Mở",
+      "allowTools_one": "Cho phép {{count}} công cụ cho {{agent}}",
+      "allowTools_other": "Cho phép {{count}} công cụ cho {{agent}}",
+      "allowToolsScope": "Thao tác này thay đổi {{agent}} ở mọi nơi sử dụng, không chỉ cho quy trình này.",
+      "allowToolsScopeAllOrgs": "Thao tác này thay đổi {{agent}} ở mọi nơi sử dụng, trên mọi tổ chức mà nó phục vụ, không chỉ cho quy trình này.",
+      "allowToolsList": "Các công cụ cần cho phép:",
+      "agentFallback": "tác nhân trợ giúp",
+      "allowToolsSuccess": "Các công cụ được phép cho {{agent}}.",
+      "allowToolsFailed": "Không thể cấp phép cho các công cụ.",
+      "mfaRequired": "Việc thay đổi công cụ của tác nhân yêu cầu phiên đăng nhập bằng xác thực đa yếu tố. Hãy đăng xuất, đăng nhập lại bằng MFA rồi thử lại.",
+      "allowlistFull": "Danh sách công cụ của tác nhân này đã đầy ({{limit}} công cụ). Hãy xóa các công cụ không còn cần thiết trong Cài đặt → Tác nhân AI, rồi thử lại.",
+      "allowToolsScopeUnknown": "Breeze không thể đọc phạm vi của tác nhân này, do đó giả định thay đổi áp dụng cho mọi tổ chức mà nó phục vụ."
+    },
+    "start": {
+      "offboard": "Cho nghỉ việc nhân sự",
+      "notEnabled": "Quy trình này không được bật cho bản triển khai này.",
+      "fromDeviceOrAlert": "Bắt đầu quy trình này từ một thiết bị hoặc cảnh báo.",
+      "onboard": "Tiếp nhận nhân sự mới"
+    },
+    "recipe": {
+      "identityOffboardingName": "Cho nghỉ việc nhân sự",
+      "identityOffboardingSummary": "Xác nhận nhân sự nghỉ việc, chuyển hướng thư điện tử và thu hồi quyền truy cập trên Microsoft 365 và Google Workspace theo thứ tự an toàn với một lần phê duyệt. Công việc thủ công được theo dõi trên phiếu hỗ trợ.",
+      "serviceRecoveryName": "Khôi phục dịch vụ đã dừng",
+      "serviceRecoverySummary": "Kiểm tra dịch vụ Windows đã dừng, khởi động lại với sự phê duyệt và xác minh dịch vụ tiếp tục chạy.",
+      "identityOnboardingName": "Tiếp nhận nhân sự mới",
+      "identityOnboardingSummary": "Tạo tài khoản Microsoft 365 cho nhân sự mới với một lần phê duyệt, sau đó gán giấy phép và nhóm bạn chọn với lần phê duyệt thứ hai. Tài khoản Google Workspace được tạo thủ công từ mục kiểm tra. Mật khẩu tạm thời chỉ hiển thị một lần bởi người phê duyệt."
+    },
+    "refreshFailed": "Không thể làm mới thư viện quy trình; dữ liệu hiển thị có thể đã cũ."
+  },
+  "startRecipe": {
+    "title": "Cho nghỉ việc nhân sự",
+    "close": "Đóng",
+    "person": {
+      "label": "Nhân sự nghỉ việc",
+      "hintLabel": "Tên hoặc email",
+      "hintPlaceholder": "ví dụ: Dana Smith hoặc dana@example.com",
+      "contactChosen": "Liên hệ: {{name}}",
+      "useHint": "Sử dụng tên hoặc email thay thế",
+      "requesterSuggestion": "Người yêu cầu phiếu hỗ trợ: {{name}}. Đây thường là quản lý báo cáo nhân sự khác nghỉ việc.",
+      "useRequester": "Sử dụng làm nhân sự nghỉ việc",
+      "readOnly": "Được bắt đầu từ liên hệ này."
+    },
+    "inheritor": {
+      "label": "Ai kế thừa thư điện tử",
+      "none": "Không ai",
+      "contact": "Một liên hệ",
+      "address": "Một địa chỉ email",
+      "pickContact": "Chọn một liên hệ",
+      "addressPlaceholder": "name@example.com",
+      "contactsFailed": "Tải liên hệ thất bại.",
+      "loadMore": "Tải thêm liên hệ",
+      "self": "Nhân sự nghỉ việc không thể tự kế thừa thư điện tử của chính mình. Hãy chọn người khác hoặc không chọn ai."
+    },
+    "autoReply": {
+      "label": "Tin nhắn trả lời tự động",
+      "defaultWithInheritor": "Cảm ơn email của bạn. {{person}} không còn làm việc tại công ty. Vui lòng liên hệ {{inheritor}} để được hỗ trợ.",
+      "defaultNoInheritor": "Cảm ơn email của bạn. {{person}} không còn làm việc tại công ty và hộp thư này không còn được theo dõi.",
+      "thePerson": "Nhân sự này"
+    },
+    "cutoff": {
+      "label": "Ngày cuối (thời hạn)",
+      "now": "Trống có nghĩa là bắt đầu ngay: các bước được phê duyệt sẽ chạy ngay khi kế hoạch được phê duyệt.",
+      "scheduled": "Các bước được phê duyệt sẽ đợi đến thời điểm này trước khi chạy."
+    },
+    "keepMailbox": {
+      "label": "Giữ lại hộp thư",
+      "help": "Breeze sẽ giữ nguyên giấy phép Microsoft 365 và thêm bước thủ công để chuyển đổi hộp thư thành dạng dùng chung. Việc xóa giấy phép trước sẽ kích hoạt thời gian đếm ngược xóa hộp thư trong 30 ngày."
+    },
+    "effects": {
+      "label": "Việc cần làm",
+      "autoReply": "Đặt trả lời tự động",
+      "autoReplyHelp": "Trả lời thư mới bằng nội dung trên.",
+      "forwarding": "Chuyển tiếp thư",
+      "forwardingHelp": "Chuyển tiếp thư mới cho người kế thừa.",
+      "mailDelegate": "Cấp quyền truy cập hộp thư cho người kế thừa",
+      "mailDelegateHelp": "Cho phép người kế thừa đọc toàn bộ hộp thư. Hãy chọn tính năng này một cách có cân nhắc.",
+      "removeGroups": "Xóa khỏi các nhóm",
+      "removeGroupsHelp": "Xóa nhân sự khỏi các nhóm và danh sách phân phối.",
+      "removeLicenses": "Xóa giấy phép",
+      "removeLicensesHelp": "Giải phóng giấy phép có phí sau khi đã xử lý thư.",
+      "revokeSessions": "Đăng xuất ở mọi nơi",
+      "revokeSessionsHelp": "Kết thúc các phiên đăng nhập đang hoạt động của nhân sự.",
+      "wipeMobile": "Xóa tài khoản công việc khỏi điện thoại",
+      "wipeMobileHelp": "Xóa tài khoản công việc khỏi các điện thoại đã đăng ký. Bản thân thiết bị không bị xóa dữ liệu.",
+      "disableAccount": "Chặn đăng nhập",
+      "disableAccountHelp": "Vô hiệu hóa tài khoản. Bước này thực hiện sau cùng, sau khi đã định tuyến thư."
+    },
+    "devices": {
+      "label": "Thiết bị cần thu hồi hoặc khóa",
+      "help": "Tùy chọn. Breeze không thao tác trên thiết bị trong quy trình này: mỗi thiết bị bạn chọn sẽ trở thành mục kiểm tra cho kỹ thuật viên.",
+      "searchPlaceholder": "Tìm kiếm thiết bị theo tên",
+      "selectedByYou": "Được chọn bởi bạn",
+      "limit": "Bạn có thể chọn tối đa {{max}} thiết bị.",
+      "loading": "Đang tải thiết bị...",
+      "loadFailed": "Tải thiết bị thất bại.",
+      "empty": "Không có thiết bị nào khớp.",
+      "selectedTitle": "Đã chọn: {{count}} / {{max}}",
+      "remove": "Xóa"
+    },
+    "preview": {
+      "button": "Xem trước",
+      "refresh": "Xem trước lại",
+      "stale": "Biểu mẫu đã thay đổi kể từ lần xem trước. Vui lòng xem trước lại trước khi bắt đầu.",
+      "failed": "Không thể tạo bản xem trước.",
+      "title": "Xem trước",
+      "personResolved": "Sẽ cho nghỉ việc: {{name}}",
+      "personUnresolved": "Không có liên hệ đơn lẻ nào khớp. Chọn một liên hệ bên dưới hoặc thay đổi tên.",
+      "personNone": "Không có liên hệ nào khớp với tên hoặc email này.",
+      "candidatesLabel": "Kết quả có thể khớp (chọn một):",
+      "plannedTitle": "Các bước Breeze sẽ chạy",
+      "orderNote": "Nhóm theo dịch vụ, không theo thứ tự. Thứ tự chính xác được cố định sau khi kỹ thuật viên xác nhận danh tính và được hiển thị để phê duyệt trước khi chạy bất kỳ bước nào.",
+      "plannedEmpty": "Không có bước nào chạy tự động.",
+      "degradedTitle": "Các bước sẽ được thực hiện thủ công",
+      "manualTitle": "Các mục kiểm tra mà tác vụ sẽ thêm vào",
+      "ticketNote": "Tác vụ mở phiếu hỗ trợ riêng cho các mục kiểm tra này.",
+      "ticketSourceNote": "Được bắt đầu từ phiếu hỗ trợ: tác vụ mở phiếu hỗ trợ mục kiểm tra riêng và không thay đổi phiếu này."
+    },
+    "submit": "Bắt đầu cho nghỉ việc",
+    "started": "Đã bắt đầu quy trình nghỉ việc.",
+    "failed": "Không thể bắt đầu quy trình nghỉ việc.",
+    "duplicate": "Đã có một quy trình nghỉ việc đang chạy cho người này.",
+    "duplicateLink": "Mở tác vụ đang chạy",
+    "replayed": "Quy trình nghỉ việc này đã được bắt đầu; đang mở.",
+    "onboarding": {
+      "title": "Thêm nhân sự mới",
+      "personLabel": "Nhân sự mới",
+      "displayName": "Họ và tên",
+      "personWillBeCreated": "Người này sẽ được tạo thành một liên hệ khi tác vụ bắt đầu.",
+      "jobTitle": "Chức danh (tùy chọn)",
+      "site": "Chi nhánh (tùy chọn)",
+      "noSite": "Không có chi nhánh",
+      "providersLabel": "Tài khoản cần tạo",
+      "upn": "Tên đăng nhập (UPN)",
+      "checkAvailability": "Kiểm tra tính khả dụng",
+      "upnAvailable": "Khả dụng: không có tài khoản Microsoft 365 nào sử dụng tên đăng nhập này.",
+      "upnTaken": "Đã sử dụng: đã có tài khoản Microsoft 365 sử dụng tên đăng nhập này.",
+      "upnUnchecked": "Không thể kiểm tra tên đăng nhập này. Breeze sẽ không tạo tài khoản với tên chưa được xác minh.",
+      "mailNickname": "Biệt danh thư điện tử",
+      "usageLocation": "Vị trí sử dụng (mã quốc gia hai chữ cái)",
+      "usageLocationHelp": "Quốc gia nơi giấy phép sẽ được sử dụng, ví dụ GB hoặc US. Bắt buộc trước khi Microsoft 365 gán giấy phép.",
+      "skus": "Giấy phép Microsoft 365 (ID SKU)",
+      "skusHelp": "Giấy phép không còn suất trống được giữ lại: tác vụ chuyển thành mục kiểm tra.",
+      "groups": "Nhóm Microsoft 365 (ID nhóm)",
+      "groupsHelp": "Nhóm động và nhóm có quyền quản trị không bao giờ được thêm tự động: tác vụ chuyển thành mục kiểm tra.",
+      "add": "Thêm",
+      "invalidEntry": "Nhập giá trị theo định dạng hiển thị.",
+      "noSeats": "Chưa xác nhận suất trống: trở thành mục kiểm tra",
+      "needsTechnician": "Kỹ thuật viên sẽ thêm thủ công mục này",
+      "googleManual": "Breeze chưa thể tạo tài khoản Google. Tác vụ sẽ thêm một mục kiểm tra với thông tin chi tiết chính xác để bạn tự tạo thủ công, sau đó tiếp tục với giấy phép và nhóm.",
+      "googlePrimaryEmail": "Email chính",
+      "givenName": "Tên",
+      "familyName": "Họ",
+      "orgUnitPath": "Đơn vị tổ chức (tùy chọn)",
+      "orgUnitPathHelp": "Bắt đầu bằng dấu gạch chéo, ví dụ /Staff/Sales.",
+      "googleLicenses": "Giấy phép Google Workspace",
+      "googleProductId": "ID sản phẩm",
+      "googleSkuId": "ID SKU",
+      "googleGroups": "Nhóm Google (địa chỉ)",
+      "modelAfter": "Mẫu theo (tùy chọn)",
+      "modelAfterHelp": "Tác vụ đọc các nhóm và giấy phép của người này rồi yêu cầu bạn xác nhận ở bước đầu tiên. Nhóm quản trị và nhóm động không bao giờ được sao chép: tác vụ thêm các nhóm đó dưới dạng mục kiểm tra.",
+      "manager": "Người quản lý (tùy chọn)",
+      "managerHelp": "Được ghi lại trên liên hệ mới và nêu tên trong phần bàn giao. Breeze không bao giờ thay đổi tài khoản của người quản lý.",
+      "managerPrefilled": "Được điền sẵn từ phiếu hỗ trợ: người yêu cầu được đặt làm người quản lý, không phải người mới.",
+      "nobody": "Không có",
+      "startAt": "Ngày bắt đầu (tùy chọn)",
+      "startNow": "Để trống để cấp phát và bàn giao ngay",
+      "startScheduled": "Tài khoản được tạo ngay; việc bàn giao sẽ đợi đến thời điểm này.",
+      "startBeyondDeadline_one": "Tác vụ này phải hoàn thành trong vòng {{count}} ngày. Chọn ngày bắt đầu trong vòng {{count}} ngày, hoặc bắt đầu quy trình tiếp nhận gần thời điểm đó hơn.",
+      "startBeyondDeadline_other": "Tác vụ này phải hoàn thành trong vòng {{count}} ngày. Chọn ngày bắt đầu trong vòng {{count}} ngày, hoặc bắt đầu quy trình tiếp nhận gần thời điểm đó hơn.",
+      "invalid": "Thiếu một số thông tin chi tiết hoặc sai định dạng:",
+      "previewStage1": "Bước 1 — tạo tài khoản (bạn phê duyệt việc này trước)",
+      "previewStage1Empty": "Không có gì được tạo tự động.",
+      "previewStage2": "Bước 2 — giấy phép, nhóm và đơn vị tổ chức (bạn phê duyệt sau khi tài khoản tồn tại)",
+      "previewProvisional": "Tạm thời: Breeze xác nhận các mục này sau khi tài khoản tồn tại",
+      "flagsTitle": "Kết quả kiểm tra",
+      "previewNote": "Tác vụ mở phiếu hỗ trợ riêng cho các mục kiểm tra.",
+      "submit": "Bắt đầu tiếp nhận",
+      "started": "Đã bắt đầu quy trình tiếp nhận.",
+      "failed": "Không thể bắt đầu quy trình tiếp nhận.",
+      "duplicate": "Đã có một quy trình tiếp nhận đang chạy cho người này.",
+      "replayed": "Quy trình tiếp nhận này đã được bắt đầu; đang mở.",
+      "existingContactLink": "Mở danh sách liên hệ của tổ chức",
+      "upnManual": "Tài khoản Microsoft 365 được tạo thủ công cho tổ chức này, do đó Breeze không kiểm tra hay lên kế hoạch cho tài khoản này.",
+      "sitesFailed": "Tải chi nhánh thất bại.",
+      "startAtIncomplete": "Nhập đầy đủ ngày giờ bắt đầu, hoặc xóa trống trường.",
+      "invalidNoProvider": "Bật ít nhất một tài khoản để tạo.",
+      "flagLabel": {
+        "upnCollision": "Tên đăng nhập đã được sử dụng",
+        "emailCollision": "Địa chỉ Google đã được sử dụng",
+        "m365CollisionCheckFailed": "Kiểm tra tên đăng nhập",
+        "m365SeatsReadFailed": "Kiểm tra suất giấy phép",
+        "googleCollisionCheckFailed": "Kiểm tra địa chỉ Google",
+        "googleConnectionUnavailable": "Kết nối Google Workspace",
+        "other": "Kiểm tra"
+      }
+    }
+  },
+  "taskPanels": {
+    "tabsLabel": "Xem tác vụ",
+    "tabs": {
+      "steps": "Các bước",
+      "plan": "Kế hoạch",
+      "events": "Dòng thời gian",
+      "accounts": "Tài khoản"
+    },
+    "steps": {
+      "empty": "Chưa có bước nào bắt đầu.",
+      "current": "Bước hiện tại",
+      "started": "Đã bắt đầu lúc {{time}}",
+      "settled": "Đã hoàn thành lúc {{time}}",
+      "waitingApproval": "Đang chờ phê duyệt kế hoạch.",
+      "waitingMaintenanceWindow": "Đang chờ cửa sổ bảo trì trước khi chạy thay đổi tiếp theo.",
+      "waitingExecution": "Đang chạy: đang chờ thay đổi hiện tại hoàn tất.",
+      "waitingOther": "Đang chờ: {{reason}}.",
+      "waitingHumanWork": "Đang chờ kỹ thuật viên tích chọn mục kiểm tra trên phiếu hỗ trợ.",
+      "openTicket": "Mở phiếu kiểm tra",
+      "stepKey": {
+        "intake": "Hiểu yêu cầu",
+        "confirmIdentity": "Xác nhận người rời đi",
+        "discover": "Tra cứu tài khoản của họ",
+        "review": "Xem lại kết quả tìm thấy",
+        "effects": "Phê duyệt và thực hiện thay đổi",
+        "manualWork": "Công việc kiểm tra",
+        "verifyOutcome": "Xác minh kết quả",
+        "document": "Ghi lại hồ sơ",
+        "confirmDetails": "Xác nhận thông tin chi tiết của người mới",
+        "createAccounts": "Phê duyệt và tạo tài khoản",
+        "manualCreateGoogle": "Tạo tài khoản Google thủ công",
+        "resolveAccounts": "Tìm tài khoản mới",
+        "provisionEffects": "Phê duyệt và gán giấy phép và nhóm",
+        "waitStart": "Chờ đến ngày bắt đầu",
+        "handoverWork": "Danh sách kiểm tra bàn giao"
+      },
+      "kind": {
+        "reason": "Lý do",
+        "effect": "Thay đổi",
+        "probe": "Kiểm tra",
+        "wait": "Chờ",
+        "humanWork": "Thao tác thủ công",
+        "document": "Ghi nhận"
+      },
+      "state": {
+        "pending": "Chưa bắt đầu",
+        "running": "Đang chạy",
+        "waiting": "Đang chờ",
+        "succeeded": "Hoàn thành",
+        "failed": "Thất bại",
+        "skipped": "Đã bỏ qua"
+      }
+    },
+    "plan": {
+      "unavailable": "Máy chủ này không gửi kế hoạch cho tác vụ này.",
+      "empty": "Chưa có kế hoạch nào được đề xuất.",
+      "revision": "Bản sửa đổi {{n}}",
+      "effectCount_one": "{{count}} thay đổi",
+      "effectCount_other": "{{count}} thay đổi",
+      "approvedAt": "Đã duyệt {{time}}",
+      "proposedAt": "Đã đề xuất {{time}}",
+      "supersededBy": "Đã bị thay thế bởi bản sửa đổi {{n}}. Được lưu ở đây làm bản ghi về những gì đã được phê duyệt rồi sau đó thay thế.",
+      "orderNote": "Các thay đổi chạy tuần tự theo thứ tự đánh số trên các dịch vụ.",
+      "target": "Cho: {{label}}",
+      "principal": "Tài khoản: {{label}}",
+      "noop": "Đã có sẵn: không có gì được gửi.",
+      "state": {
+        "pending": "Đang chờ duyệt",
+        "approved": "Đã duyệt",
+        "rejected": "Đã từ chối",
+        "expired": "Đã hết hạn",
+        "superseded": "Đã thay thế"
+      },
+      "idempotency": {
+        "idempotent": "An toàn để lặp lại",
+        "idempotentByProbe": "Đã kiểm tra trước khi lặp lại",
+        "nonIdempotent": "Không bao giờ tự động lặp lại"
+      },
+      "operation": {
+        "none": "Chưa bắt đầu / không rõ",
+        "pending": "Đang thực hiện",
+        "succeeded": "Thành công",
+        "failed": "Thất bại",
+        "unknown": "Không rõ kết quả",
+        "superseded": "Đã thay thế"
+      },
+      "stageCreation": "Tạo tài khoản",
+      "stageProvision": "Giấy phép, nhóm và đơn vị tổ chức",
+      "followedBy": "Đã được phê duyệt và thực hiện, sau đó tiếp tục với phê duyệt {{n}} cho giai đoạn tiếp theo. Được lưu ở đây làm bản ghi về những gì đã được phê duyệt."
+    },
+    "events": {
+      "empty": "Chưa có sự kiện nào được ghi nhận.",
+      "showAll": "Hiển thị tất cả {{count}} sự kiện",
+      "showRecent": "Chỉ hiển thị {{count}} sự kiện gần nhất",
+      "hiddenOlder_one": "{{count}} sự kiện cũ hơn bị ẩn.",
+      "hiddenOlder_other": "{{count}} sự kiện cũ hơn bị ẩn.",
+      "capped": "Đang hiển thị {{count}} sự kiện gần nhất. Các sự kiện cũ hơn không hiển thị ở đây.",
+      "actor": {
+        "coordinator": "Điều phối viên",
+        "reconciler": "Bộ đối soát",
+        "user": "Cá nhân",
+        "agent": "AI agent",
+        "system": "Hệ thống"
+      },
+      "type": {
+        "taskAdmitted": "Đã tiếp nhận tác vụ",
+        "leaseClaimed": "Đã nhận việc",
+        "stepOpened": "Đã bắt đầu bước",
+        "stepSettled": "Đã hoàn thành bước",
+        "waitEntered": "Đang đợi",
+        "waitResolved": "Đã kết thúc chờ",
+        "targetAttached": "Đã đính kèm mục tiêu",
+        "targetDetached": "Đã gỡ mục tiêu",
+        "targetAccountFrozen": "Đã ghi nhận tài khoản",
+        "operationReserved": "Đã giữ chỗ thay đổi",
+        "operationSettled": "Đã hoàn thành thay đổi",
+        "verificationRecorded": "Đã ghi nhận xác minh",
+        "planRevisionBumped": "Đã đổi bản sửa đổi kế hoạch",
+        "humanWorkUnticked": "Mục kiểm tra đã bỏ chọn",
+        "taskSettled": "Đã hoàn thành tác vụ"
+      }
+    },
+    "accounts": "Đã tạo tài khoản",
+    "planStage": "Phê duyệt {{n}}"
+  },
+  "credential": {
+    "availableTo": "Mật khẩu tạm thời có sẵn cho {{name}} đến {{date}}",
+    "availableToNoDate": "Mật khẩu tạm thời có sẵn cho {{name}}",
+    "askTo": "Yêu cầu {{name}} chia sẻ mật khẩu tạm thời — chỉ họ mới có thể hiển thị nó",
+    "reveal": "Hiển thị mật khẩu trong luồng hoạt động AI (Phê duyệt)",
+    "revealed": "Mật khẩu tạm thời đã được hiển thị",
+    "expired": "Mật khẩu tạm thời đã hết hạn mà chưa được hiển thị",
+    "expiredRecovery": "Đặt lại mật khẩu. Không tạo tài khoản thứ hai.",
+    "unretrievable": "Mật khẩu tạm thời chưa bao giờ được lưu trữ, vì vậy không ai có thể hiển thị nó.",
+    "setByHand": "Mật khẩu được đặt thủ công trong quá trình thiết lập ban đầu",
+    "unknown": "Không rõ trạng thái mật khẩu tạm thời",
+    "theApprover": "người đã phê duyệt việc tạo tài khoản",
+    "whoReveals": "Chỉ người phê duyệt việc tạo tài khoản mới có thể hiển thị mật khẩu tạm thời một lần — chứ không phải kỹ thuật viên bắt đầu tác vụ này. Hãy bàn giao trực tiếp hoặc qua điện thoại.",
+    "noRevealer": "Breeze không tìm thấy ai có thể hiển thị mật khẩu tạm thời này.",
+    "revealNeedsFeedAccess": "Chỉ bạn mới có thể hiển thị nó trong luồng hoạt động AI (Phê duyệt), nhưng vai trò của bạn không thể mở trang đó. Hãy yêu cầu quản trị viên cấp quyền kiểm toán phiên AI."
+  }
+}

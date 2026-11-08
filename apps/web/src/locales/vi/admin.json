@@ -1,0 +1,1372 @@
+{
+  "admin": {
+    "accountDeletionRequestDetail": {
+      "back": "Quay lại yêu cầu xóa",
+      "retry": "Thử lại",
+      "errors": {
+        "network": "Lỗi mạng",
+        "requestFailed": "Yêu cầu thất bại ({{status}})"
+      },
+      "toast": {
+        "emailMismatch": "Email bạn nhập không khớp.",
+        "rejectNoteRequired": "Cần có ghi chú khi từ chối.",
+        "actionFailed": "Thực hiện thất bại ({{status}})",
+        "approved": "Yêu cầu đã được duyệt và đưa vào hàng đợi xử lý.",
+        "rejected": "Đã từ chối yêu cầu. Người dùng đã được thông báo."
+      },
+      "unauthorized": {
+        "title": "Không được phép",
+        "description": "Bạn không có quyền xem xét yêu cầu này."
+      },
+      "notFound": {
+        "title": "Không tìm thấy yêu cầu",
+        "description": "Yêu cầu có thể đã bị xóa hoặc không tồn tại trong tenant của bạn."
+      },
+      "header": {
+        "title": "Yêu cầu xóa tài khoản",
+        "reference": "Mã tham chiếu"
+      },
+      "user": {
+        "title": "Người dùng yêu cầu",
+        "name": "Tên",
+        "email": "Email",
+        "joined": "Đã tham gia",
+        "userId": "ID người dùng"
+      },
+      "request": {
+        "title": "Chi tiết yêu cầu",
+        "status": "Trạng thái",
+        "requested": "Đã yêu cầu",
+        "processBy": "Xử lý bởi",
+        "processed": "Đã xử lý",
+        "reasonFromUser": "Lý do từ người dùng",
+        "noReasonGiven": "Không có lý do",
+        "adminNote": "Ghi chú của quản trị viên"
+      },
+      "status": {
+        "pending": "Đang chờ",
+        "processing": "Đang xử lý",
+        "completed": "Đã hoàn thành",
+        "cancelled": "Đã hủy"
+      },
+      "actions": {
+        "reject": "Từ chối",
+        "approveAndQueue": "Duyệt và đưa vào hàng đợi xử lý"
+      },
+      "processedNotice": {
+        "processing": "Đã duyệt và đưa vào hàng đợi xử lý.",
+        "cancelled": "Đã từ chối. Người dùng đã được thông báo.",
+        "completed": "Đã hoàn thành.",
+        "processed": "Đã xử lý lúc {{time}}."
+      },
+      "confirm": {
+        "approveTitle": "Duyệt xóa?",
+        "rejectTitle": "Từ chối xóa?",
+        "close": "Đóng",
+        "approveDescription": "Việc duyệt sẽ đưa tài khoản này vào hàng đợi xóa. Quá trình xóa thực tế diễn ra ngoại tuyến; bạn không thể hoàn tác thao tác này từ giao diện sau khi yêu cầu được xử lý.",
+        "rejectDescription": "Việc từ chối sẽ hủy yêu cầu. Người dùng sẽ nhận được email chứa ghi chú của bạn giải thích lý do yêu cầu bị từ chối.",
+        "emailLabel": "Nhập email của người dùng để xác nhận",
+        "noteLabel": "Ghi chú",
+        "optionalSuffix": "(tùy chọn)",
+        "approvePlaceholder": "Ngữ cảnh nội bộ tùy chọn cho nhật ký kiểm toán…",
+        "rejectPlaceholder": "Tại sao bạn từ chối? Nội dung này sẽ được gửi email cho người dùng.",
+        "cancel": "Hủy",
+        "approving": "Đang duyệt…",
+        "rejecting": "Đang từ chối…",
+        "approve": "Duyệt",
+        "reject": "Từ chối"
+      }
+    },
+    "accountDeletionRequestsList": {
+      "title": "Yêu cầu xóa tài khoản",
+      "description": "Người dùng trong tenant của bạn đã yêu cầu xóa tài khoản Breeze của họ. Duyệt để đưa vào hàng đợi xử lý, hoặc từ chối kèm ghi chú giải thích.",
+      "filterLabel": "Lọc theo trạng thái",
+      "refresh": "Làm mới",
+      "retry": "Thử lại",
+      "errors": {
+        "network": "Lỗi mạng",
+        "requestFailed": "Yêu cầu thất bại ({{status}})"
+      },
+      "status": {
+        "pending": "Đang chờ",
+        "processing": "Đang xử lý",
+        "cancelled": "Đã hủy",
+        "completed": "Đã hoàn thành"
+      },
+      "unauthorized": {
+        "title": "Không được phép",
+        "prefix": "Bạn không có",
+        "suffix": "quyền cần thiết để xem xét các yêu cầu xóa tài khoản."
+      },
+      "empty": {
+        "title": "Không có yêu cầu {{status}}",
+        "description": "Bạn đã xử lý hết tất cả."
+      },
+      "table": {
+        "user": "Người dùng",
+        "requested": "Đã yêu cầu",
+        "processBy": "Xử lý bởi",
+        "reason": "Lý do",
+        "status": "Trạng thái",
+        "action": "Thao tác"
+      },
+      "noReasonGiven": "Không có lý do",
+      "review": "Xem xét",
+      "pagination": {
+        "showing": "Hiển thị {{from}}–{{to}}",
+        "previous": "Trước",
+        "next": "Tiếp theo"
+      }
+    },
+    "orgConnectedAppsPage": {
+      "title": "Ứng dụng đã kết nối (toàn tổ chức)",
+      "description": {
+        "prefix": "Các ứng dụng AI mà người dùng trong",
+        "yourOrganization": "tổ chức của bạn",
+        "suffix": "đã ủy quyền. Chặn bất kỳ ứng dụng nào để thu hồi ngay lập tức mọi quyền đang hoạt động."
+      },
+      "refresh": "Làm mới",
+      "retry": "Thử lại",
+      "noOrg": "Chọn một tổ chức từ trình chuyển đổi tổ chức để xem các ứng dụng đã kết nối.",
+      "thisOrganization": "tổ chức này",
+      "errors": {
+        "network": "Lỗi mạng",
+        "requestFailed": "Yêu cầu thất bại ({{status}})"
+      },
+      "toast": {
+        "reasonRequired": "Bắt buộc phải nhập lý do.",
+        "blockFailed": "Chặn thất bại ({{status}})",
+        "blocked": "Đã chặn {{name}} đối với tổ chức. Người dùng sẽ đăng xuất trong thời gian tồn tại token (≤15 phút).",
+        "unblockFailed": "Bỏ chặn thất bại ({{status}})",
+        "unblocked": "Đã bỏ chặn {{name}}. Người dùng phải cấp quyền lại trước khi token được cấp phát tiếp."
+      },
+      "unauthorized": {
+        "title": "Không được phép",
+        "prefix": "Bạn không có",
+        "suffix": "quyền cần thiết để quản lý việc chặn ứng dụng kết nối toàn tổ chức."
+      },
+      "empty": {
+        "title": "Chưa có ứng dụng được cấp quyền nào",
+        "description": "Khi một người dùng trong tổ chức này cấp quyền cho ứng dụng MCP, ứng dụng đó sẽ hiển thị ở đây."
+      },
+      "table": {
+        "app": "Ứng dụng",
+        "activeUsers": "Người dùng hoạt động",
+        "lastUsed": "Dùng lần cuối",
+        "status": "Trạng thái",
+        "actions": "Thao tác"
+      },
+      "everUsers": "{{count}} tổng cộng",
+      "blockReasonTitle": "Lý do: {{reason}}",
+      "status": {
+        "blocked": "Đã chặn",
+        "until": "đến {{time}}",
+        "allowed": "Đã cho phép"
+      },
+      "actions": {
+        "unblock": "Bỏ chặn",
+        "blockOrgWide": "Chặn toàn tổ chức"
+      },
+      "blockDialog": {
+        "title": "Chặn {{name}}?",
+        "close": "Đóng",
+        "descriptionPrefix": "Thao tác này chặn",
+        "descriptionMiddle": "đối với mọi người dùng trong",
+        "descriptionSuffix": "Tất cả các quyền đang hoạt động và token làm mới sẽ bị thu hồi ngay lập tức. Người dùng sẽ thấy trạng thái đăng xuất trong vòng đời token truy cập (~15 phút). Họ không thể cấp quyền lại cho đến khi bạn bỏ chặn.",
+        "authorizedUsers": "người dùng hiện đang được cấp quyền — họ sẽ mất quyền truy cập vào ứng dụng này.",
+        "authorizedUsers_one": "người dùng hiện đang được cấp quyền — họ sẽ mất quyền truy cập vào ứng dụng này.",
+        "authorizedUsers_other": "người dùng hiện đang được cấp quyền — họ sẽ mất quyền truy cập vào ứng dụng này.",
+        "reason": "Lý do",
+        "reasonPlaceholder": "Đánh giá rủi ro nhà cung cấp, nghi ngờ xâm phạm, thay đổi chính sách…",
+        "cancel": "Hủy",
+        "blocking": "Đang chặn…",
+        "blockOrgWide": "Chặn toàn bộ tổ chức"
+      },
+      "unblockDialog": {
+        "title": "Bỏ chặn {{name}}?",
+        "close": "Đóng",
+        "descriptionPrefix": "Người dùng trong tổ chức này sẽ có thể cấp phép",
+        "descriptionSuffix": "lại. Các quyền hiện có vẫn bị thu hồi — mọi người dùng phải đăng nhập lại từ đầu qua quy trình OAuth.",
+        "cancel": "Hủy",
+        "unblocking": "Đang bỏ chặn…",
+        "unblock": "Bỏ chặn"
+      }
+    },
+    "quarantinedDevices": {
+      "title": "Thiết bị cách ly",
+      "description": "Thiết bị bị cách ly do chứng chỉ mTLS hết hạn hoặc không hợp lệ. Phê duyệt để cấp lại chứng chỉ hoặc từ chối để ngừng hoạt động.",
+      "loading": "Đang tải thiết bị cách ly...",
+      "refresh": "Làm mới",
+      "retry": "Thử lại",
+      "errors": {
+        "fetch": "Không thể tải thiết bị cách ly",
+        "generic": "Đã xảy ra lỗi",
+        "approve": "Không thể phê duyệt thiết bị",
+        "deny": "Không thể từ chối thiết bị"
+      },
+      "empty": {
+        "title": "Không có thiết bị cách ly",
+        "description": "Tất cả thiết bị đều có chứng chỉ mTLS hợp lệ. Thiết bị có chứng chỉ hết hạn hoặc bị thu hồi sẽ xuất hiện ở đây để xem xét."
+      },
+      "table": {
+        "hostname": "Tên máy",
+        "os": "HĐH",
+        "quarantinedAt": "Đã cách ly lúc",
+        "reason": "Lý do",
+        "actions": "Thao tác"
+      },
+      "actions": {
+        "approve": "Phê duyệt",
+        "deny": "Từ chối"
+      },
+      "count": "{{count}} thiết bị cách ly",
+      "count_one": "{{count}} thiết bị cách ly",
+      "count_other": "{{count}} thiết bị cách ly",
+      "denyDialog": {
+        "title": "Từ chối thiết bị",
+        "descriptionPrefix": "Bạn có chắc chắn muốn từ chối",
+        "descriptionSuffix": "Thao tác này sẽ ngừng hoạt động thiết bị vĩnh viễn và thu hồi chứng chỉ của thiết bị đó. Tác nhân sẽ ngừng báo cáo và thiết bị sẽ không còn được quản lý.",
+        "cancel": "Hủy",
+        "denying": "Đang từ chối...",
+        "confirm": "Từ chối & Ngừng hoạt động"
+      }
+    },
+    "thirdPartyCatalog": {
+      "title": "Danh mục gói bên thứ ba",
+      "description": "Siêu dữ liệu do Breeze tuyển chọn cho phần mềm bên thứ ba được phát hiện bởi winget trên các tác nhân.",
+      "totalEntries": "Tổng số mục:",
+      "refresh": "Làm mới",
+      "addPackage": "Thêm gói",
+      "searchPlaceholder": "Tìm theo tên, nhà cung cấp hoặc ID winget…",
+      "breezeTestedOnly": "Chỉ các gói do Breeze kiểm tra",
+      "breezeTested": "Được Breeze kiểm tra",
+      "dismiss": "Bỏ qua",
+      "loading": "Đang tải danh mục…",
+      "empty": "Không có mục danh mục nào khớp với bộ lọc hiện tại.",
+      "confirmDelete": "Xóa \"{{name}}\" khỏi danh mục?",
+      "errors": {
+        "load": "Không thể tải danh mục",
+        "generic": "Đã xảy ra lỗi",
+        "queueTestStatus": "Không thể xếp hàng kiểm tra ({{status}})",
+        "queueTest": "Không thể xếp hàng kiểm tra",
+        "deleteEntry": "Không thể xóa mục",
+        "delete": "Không thể xóa"
+      },
+      "notice": {
+        "testComplete": "Kiểm tra hoàn tất — {{summary}}",
+        "testQueued": "Đã xếp hàng kiểm tra cho {{name}}. Đang chờ kết quả…"
+      },
+      "prompt": {
+        "runSmokeTest": "Chạy kiểm tra khói cho {{name}} ở phiên bản nào?"
+      },
+      "platformAdmin": {
+        "title": "Yêu cầu quyền quản trị viên nền tảng",
+        "prefix": "Danh mục bên thứ ba được quản lý bởi quản trị viên nền tảng Breeze. Tài khoản của bạn",
+        "role": "là quản trị viên tổ chức/đối tác",
+        "suffix": "có thể xem danh mục đã tuyển chọn thông qua các quy trình vá lỗi thông thường nhưng không thể chỉnh sửa trực tiếp."
+      },
+      "table": {
+        "vendor": "Nhà cung cấp",
+        "package": "Gói",
+        "wingetId": "ID Winget",
+        "severity": "Mức độ nghiêm trọng",
+        "status": "Trạng thái",
+        "lastTest": "Kiểm tra lần cuối",
+        "actions": "Thao tác"
+      },
+      "severity": {
+        "critical": "nghiêm trọng",
+        "important": "quan trọng",
+        "moderate": "trung bình",
+        "low": "thấp",
+        "unknown": "không rõ"
+      },
+      "test": {
+        "running": "đang chạy…",
+        "versionTitle": "v{{version}}",
+        "pass": "đạt",
+        "fail": "không đạt",
+        "inconclusive": "không có kết luận",
+        "skipped": "đã bỏ qua"
+      },
+      "actions": {
+        "retest": "Kiểm tra lại",
+        "runSmokeTest": "Chạy kiểm tra khói",
+        "edit": "Sửa",
+        "delete": "Xóa"
+      }
+    },
+    "thirdPartyCatalogEditor": {
+      "title": {
+        "edit": "Sửa mục danh mục",
+        "add": "Thêm mục danh mục"
+      },
+      "errors": {
+        "saveStatus": "Lưu không thành công ({{status}})",
+        "save": "Không thể lưu"
+      },
+      "fields": {
+        "packageId": "ID gói Winget",
+        "vendor": "Nhà cung cấp",
+        "friendlyName": "Tên thân thiện",
+        "defaultSeverity": "Mức độ nghiêm trọng mặc định",
+        "breezeTested": "Được Breeze kiểm tra",
+        "homepageUrl": "URL trang chủ",
+        "notes": "Ghi chú"
+      },
+      "placeholders": {
+        "packageId": "vd: Mozilla.Firefox",
+        "vendor": "Mozilla",
+        "friendlyName": "Mozilla Firefox",
+        "homepageUrl": "https://example.com"
+      },
+      "severity": {
+        "critical": "nghiêm trọng",
+        "important": "quan trọng",
+        "moderate": "trung bình",
+        "low": "thấp",
+        "unknown": "không rõ"
+      },
+      "packageIdLocked": "ID gói không thể thay đổi sau khi đã lưu.",
+      "cancel": "Hủy",
+      "saveChanges": "Lưu thay đổi",
+      "addPackage": "Thêm gói"
+    },
+    "userDevicesPage": {
+      "title": "Thiết bị tin cậy",
+      "backToUsers": "Quay lại danh sách người dùng",
+      "retry": "Thử lại",
+      "unknownDevice": "Thiết bị không xác định",
+      "thisUser": "người dùng này",
+      "blockThisDevice": "Chặn thiết bị này",
+      "empty": "Người dùng này không có thiết bị nào được ghép nối.",
+      "auditLink": "Xem các sự kiện kiểm toán liên quan",
+      "auditSuffix": "để biết lịch sử đầy đủ về các phê duyệt, lượt đăng nhập và lượt chặn.",
+      "errors": {
+        "missingUserId": "Thiếu ID người dùng",
+        "requestFailed": "Yêu cầu thất bại ({{status}})",
+        "network": "Lỗi mạng"
+      },
+      "toast": {
+        "reasonRequired": "Bắt buộc phải nhập lý do.",
+        "blockFailed": "Chặn thất bại ({{status}})",
+        "blocked": "Đã chặn thiết bị. {{name}} sẽ không thể phê duyệt từ thiết bị này cho đến khi kết nối lại."
+      },
+      "unauthorized": {
+        "title": "Không được phép",
+        "description": "Bạn không có quyền quản lý người dùng này. Hãy đảm bảo bạn đã đăng nhập với tư cách quản trị viên tổ chức hoặc đối tác và người dùng này thuộc tenant của bạn."
+      },
+      "description": {
+        "prefix": "Thiết bị di động đã kết nối bởi",
+        "suffix": "Chặn thiết bị sẽ xóa các token đẩy và bắt buộc kết nối lại."
+      },
+      "selfWarning": {
+        "prefix": "Đây là",
+        "own": "tài khoản",
+        "middle": "của chính bạn. Sử dụng",
+        "suffix": "để quản lý thiết bị của riêng bạn — quản trị viên không thể tự chặn chính mình."
+      },
+      "status": {
+        "active": "Đang hoạt động",
+        "blocked": "Đã chặn"
+      },
+      "fields": {
+        "platform": "Nền tảng",
+        "appVersion": "ứng dụng {{version}}",
+        "lastActive": "Hoạt động lần cuối",
+        "paired": "Đã kết nối",
+        "blocked": "Đã chặn",
+        "installId": "ID cài đặt"
+      },
+      "blockDialog": {
+        "title": "Chặn thiết bị",
+        "close": "Đóng",
+        "descriptionPrefix": "Thao tác này sẽ chặn",
+        "descriptionMiddle": "đối với",
+        "descriptionSuffix": "Token đẩy sẽ bị xóa ngay lập tức và người dùng sẽ cần kết nối lại trước khi phê duyệt bất kỳ thứ gì từ điện thoại của họ.",
+        "reason": "Lý do",
+        "reasonPlaceholder": "Mất điện thoại, nhân viên nghỉ việc, nghi ngờ bị xâm phạm…",
+        "reasonRequired": "Bắt buộc phải có lý do cho nhật ký kiểm toán.",
+        "cancel": "Hủy",
+        "blocking": "Đang chặn…",
+        "blockDevice": "Chặn thiết bị"
+      }
+    },
+    "llmProviderCatalog": {
+      "title": "Danh mục Nhà cung cấp LLM",
+      "description": "Các điểm cuối được nền tảng kiểm duyệt mà đối tác có thể định tuyến lưu lượng AI của họ qua.",
+      "totalEntries": "Tổng số mục:",
+      "refresh": "Làm mới",
+      "addEntry": "Thêm nhà cung cấp",
+      "loading": "Đang tải danh mục…",
+      "empty": "Chưa có mục nào trong danh mục.",
+      "noRevisions": "Chưa có bản sửa đổi nào.",
+      "dismiss": "Bỏ qua",
+      "platformAdmin": {
+        "title": "Yêu cầu quyền quản trị viên nền tảng",
+        "prefix": "Danh mục nhà cung cấp LLM được quản lý bởi quản trị viên nền tảng Breeze. Tài khoản của bạn",
+        "role": "quản trị viên tổ chức/đối tác",
+        "suffix": "không thể xem hoặc chỉnh sửa trực tiếp."
+      },
+      "errors": {
+        "load": "Không thể tải danh mục",
+        "generic": "Đã xảy ra lỗi",
+        "createEntry": "Không thể tạo nhà cung cấp",
+        "createRevision": "Không thể tạo bản sửa đổi",
+        "activate": "Không thể kích hoạt bản sửa đổi",
+        "setStatus": "Không thể cập nhật trạng thái",
+        "verify": "Yêu cầu xác minh thất bại"
+      },
+      "notice": {
+        "entryCreated": "Đã tạo nhà cung cấp \"{{name}}\".",
+        "revisionCreated": "Đã tạo bản sửa đổi mới cho \"{{name}}\".",
+        "activated": "Đã kích hoạt bản sửa đổi.",
+        "statusUpdated": "Đã cập nhật trạng thái thành {{status}}."
+      },
+      "status": {
+        "draft": "Bản nháp",
+        "listed": "Đã liệt kê",
+        "delisted": "Đã gỡ"
+      },
+      "table": {
+        "slug": "Slug",
+        "name": "Tên",
+        "status": "Trạng thái",
+        "activeRevision": "Bản sửa đổi hoạt động",
+        "revisions": "Bản sửa đổi",
+        "actions": "Thao tác"
+      },
+      "actions": {
+        "expand": "Hiển thị bản sửa đổi",
+        "collapse": "Ẩn bản sửa đổi",
+        "addRevision": "Thêm bản sửa đổi",
+        "activate": "Kích hoạt",
+        "list": "Liệt kê",
+        "delist": "Gỡ",
+        "verify": "Chạy xác minh"
+      },
+      "confirmDelist": "Gỡ \"{{name}}\"? Các đối tác đang sử dụng vẫn tiếp tục hoạt động, nhưng nó sẽ biến mất khỏi danh sách chọn cho các thiết lập mới.",
+      "revision": {
+        "baseUrl": "URL cơ sở",
+        "authMode": "Chế độ xác thực",
+        "dataNote": "Ghi chú xử lý dữ liệu",
+        "createdAt": "Đã tạo",
+        "notVerified": "Chưa xác minh",
+        "verified": "Đã xác minh",
+        "activateBlocked": "Mỗi mô hình được ánh xạ cần vượt qua xác minh trước khi bản sửa đổi này có thể được kích hoạt.",
+        "listBlocked": "Mỗi mô hình được ánh xạ trên bản sửa đổi hoạt động cần vượt qua xác minh trước khi nhà cung cấp này có thể được liệt kê."
+      },
+      "authModeOptions": {
+        "x-api-key": "Tiêu đề khóa API",
+        "bearer": "Token Bearer"
+      },
+      "entryForm": {
+        "title": "Thêm nhà cung cấp",
+        "fields": {
+          "slug": "Slug",
+          "name": "Tên",
+          "notes": "Ghi chú"
+        },
+        "placeholders": {
+          "slug": "openrouter",
+          "name": "OpenRouter",
+          "notes": "Ghi chú nội bộ về nhà cung cấp này…"
+        },
+        "submit": "Tạo nhà cung cấp",
+        "cancel": "Hủy"
+      },
+      "revisionForm": {
+        "title": "Thêm bản sửa đổi cho \"{{name}}\"",
+        "fields": {
+          "baseUrl": "URL cơ sở",
+          "authMode": "Chế độ xác thực",
+          "dataNote": "Ghi chú xử lý dữ liệu"
+        },
+        "placeholders": {
+          "baseUrl": "https://openrouter.ai/api/anthropic",
+          "dataNote": "Điểm cuối này xử lý dữ liệu yêu cầu như thế nào…"
+        },
+        "modelMap": {
+          "title": "Ánh xạ mô hình và định giá",
+          "description": "Chỉ các mô hình được ánh xạ mới có thể được chọn bởi đối tác. Giá tính bằng xu cho mỗi triệu token.",
+          "included": "Bao gồm mô hình này",
+          "providerModel": "ID mô hình nhà cung cấp",
+          "inputPrice": "Đầu vào",
+          "outputPrice": "Đầu ra",
+          "cacheReadPrice": "Đọc bộ nhớ đệm",
+          "cacheWritePrice": "Ghi bộ nhớ đệm"
+        },
+        "submit": "Tạo bản sửa đổi",
+        "cancel": "Hủy",
+        "errors": {
+          "noModelsMapped": "Ánh xạ ít nhất một mô hình trước khi tạo bản sửa đổi."
+        }
+      },
+      "verifyForm": {
+        "title": "Chạy xác minh — {{model}}",
+        "description": "Khóa chỉ được sử dụng cho yêu cầu này và không bao giờ được lưu trữ.",
+        "apiKeyLabel": "Kiểm tra khóa API",
+        "apiKeyPlaceholder": "Dán một khóa kiểm tra tạm thời",
+        "submit": "Chạy",
+        "cancel": "Hủy",
+        "running": "Đang chạy…",
+        "passed": "Thành công",
+        "failed": "Thất bại"
+      }
+    },
+    "aiKillSwitch": {
+      "title": "Công tắc Khẩn cấp AI",
+      "description": "Dừng khẩn cấp toàn nền tảng đối với hoạt động của tác nhân AI tự động. Bật tính năng này sẽ ảnh hưởng đến mọi đối tác cùng lúc — đây là thao tác ở cấp độ nền tảng, không phải cài đặt theo từng tenant.",
+      "refresh": "Làm mới",
+      "loading": "Đang tải trạng thái công tắc ngắt…",
+      "impactNote": "Việc bật công tắc ngắt sẽ dừng các tác vụ AI tự động cho mọi đối tác trong khoảng 5 giây. Các tác vụ đang chạy hiện tại không bị gián đoạn.",
+      "platformAdmin": {
+        "title": "Yêu cầu quyền quản trị nền tảng",
+        "description": "Công tắc ngắt AI là điều khiển toàn nền tảng do quản trị viên nền tảng của Breeze quản lý. Tài khoản của bạn không thể xem hoặc thay đổi mục này."
+      },
+      "status": {
+        "active": "Tác vụ AI tự động đang bật",
+        "killed": "Tác vụ AI tự động đã bị ngắt"
+      },
+      "fields": {
+        "epoch": "Epoch",
+        "updatedBy": "Người sửa cuối",
+        "updatedAt": "Thời gian sửa cuối",
+        "lastReason": "Lý do cuối",
+        "none": "—"
+      },
+      "actions": {
+        "kill": "Ngắt tác vụ AI toàn nền tảng",
+        "restore": "Khôi phục tác vụ AI"
+      },
+      "confirm": {
+        "killTitle": "Ngắt tác vụ AI toàn nền tảng?",
+        "killDescription": "Thao tác này sẽ ngay lập tức dừng hoạt động của tác vụ AI tự động cho mọi đối tác trên Breeze. Chỉ sử dụng trong sự cố đang diễn ra.",
+        "restoreTitle": "Khôi phục tác vụ AI?",
+        "restoreDescription": "Thao tác này bật lại hoạt động của tác vụ AI tự động cho mọi đối tác trên Breeze.",
+        "reasonLabel": "Lý do (bắt buộc, dùng cho nhật ký kiểm toán)",
+        "reasonPlaceholder": "Mô tả sự cố hoặc lý do thay đổi này…",
+        "cancel": "Hủy",
+        "killSubmit": "Ngắt tác vụ AI",
+        "restoreSubmit": "Khôi phục tác vụ AI"
+      },
+      "notice": {
+        "killed": "Đã ngắt các tác vụ AI trên toàn nền tảng.",
+        "restored": "Đã khôi phục các tác vụ AI trên toàn nền tảng."
+      },
+      "errors": {
+        "load": "Không thể tải trạng thái công tắc ngắt",
+        "generic": "Đã xảy ra lỗi",
+        "flip": "Không thể cập nhật công tắc ngắt",
+        "mfaRequired": "Việc bật/tắt công tắc ngắt AI yêu cầu xác thực đa yếu tố. Hãy bật MFA trong cài đặt bảo mật hồ sơ của bạn, sau đó thử lại."
+      }
+    },
+    "wisp": {
+      "title": "Wisp",
+      "description": "Tổng quan theo đối tác về các phân bổ Wisp và hoạt động hôm nay. Chỉ đọc.",
+      "refresh": "Làm mới",
+      "retry": "Thử lại",
+      "loading": "Đang tải...",
+      "empty": "Chưa có đối tác nào được phân bổ Wisp",
+      "disabled": "Wisp chưa được bật trên bản triển khai này (BREEZE_WISP_ENABLED).",
+      "errors": {
+        "load": "Không thể tải tổng quan Wisp"
+      },
+      "platformAdmin": {
+        "title": "Chỉ quản trị viên nền tảng",
+        "description": "Tổng quan Wisp khả dụng cho quản trị viên nền tảng."
+      },
+      "table": {
+        "partner": "Đối tác",
+        "plan": "Gói",
+        "activeGrants": "Phân bổ đang hoạt động",
+        "pausedGrants": "Phân bổ tạm dừng",
+        "assessmentsToday": "Kiểm tra hôm nay",
+        "specialistRequestsToday": "Yêu cầu chuyên gia hôm nay",
+        "openConcerns": "Vấn đề mở",
+        "budgetExhaustedToday": "Phân bổ cạn ngân sách hôm nay"
+      },
+      "grants": {
+        "loading": "Đang tải phân bổ...",
+        "error": "Không thể tải phân bổ",
+        "empty": "Đối tác này không có phân bổ nào",
+        "grantor": "Bên cấp",
+        "scope": "Phạm vi",
+        "status": "Trạng thái",
+        "pausedReason": "Lý do tạm dừng",
+        "expires": "Hết hạn",
+        "budget": "Ngân sách (xu/ngày)",
+        "tickMinutes": "Nhịp (phút)",
+        "assessmentsToday": "Kiểm tra hôm nay",
+        "partnerWide": "Toàn đối tác"
+      },
+      "status": {
+        "active": "Hoạt động",
+        "paused": "Tạm dừng",
+        "revoked": "Đã thu hồi",
+        "expired": "Đã hết hạn"
+      },
+      "pausedReason": {
+        "budget_exhausted": "Đã cạn ngân sách",
+        "grantor_suspended": "Bên cấp đã đình chỉ",
+        "grantor_access_lost": "Bên cấp mất quyền truy cập",
+        "factor_expired": "Hệ số hết hạn",
+        "entitlement_lost": "Mất quyền",
+        "user_paused": "Tạm dừng bởi người dùng",
+        "partner_disabled": "Đối tác đã bị vô hiệu hóa"
+      }
+    },
+    "systemPage": {
+      "title": "Hệ thống",
+      "description": "Trạng thái toàn bộ bản triển khai dành cho quản trị viên nền tảng. Trang này chỉ đọc.",
+      "tabs": {
+        "label": "Phần hệ thống",
+        "connections": "Kết nối",
+        "deprecations": "Tính năng sắp bỏ"
+      },
+      "connections": {
+        "enabledMeaning": "Đã bật nghĩa là đã cấu hình. Breeze không liên hệ dịch vụ để kiểm tra phản hồi.",
+        "footnote": "Chỉ hiển thị môi trường của container API. Container web, cổng thông tin và worker không được bao gồm.",
+        "meta": "Đang chạy phiên bản {{version}} · {{mode}}",
+        "versionMismatch": "Image API này là {{running}}, nhưng BREEZE_VERSION là {{configured}}. Thay đổi BREEZE_VERSION không làm thay đổi image đã ghim mã băm, và các agent nhận bản phát hành BREEZE_VERSION. Nâng cấp bằng guided-setup.sh --upgrade, hoặc đặt lại BREEZE_VERSION thành {{running}}.",
+        "deployMode": {
+          "hosted": "Được lưu trữ",
+          "self_host": "Tự lưu trữ"
+        },
+        "refresh": "Làm mới",
+        "loading": "Đang tải trạng thái kết nối…",
+        "errors": {
+          "load": "Không thể tải trạng thái kết nối."
+        },
+        "platformAdmin": {
+          "title": "Yêu cầu quyền quản trị nền tảng",
+          "description": "Trạng thái kết nối bao gồm toàn bộ bản triển khai, do đó chỉ quản trị viên nền tảng mới có thể xem."
+        },
+        "summaryLabel": "Tóm tắt kết nối",
+        "problemsOnly": "Chỉ hiển thị lỗi",
+        "noProblems": "Không tìm thấy lỗi. Mọi kết nối đều đã được bật hoặc tắt.",
+        "empty": "Không có kết nối nào được đăng ký.",
+        "status": {
+          "enabled": "Đã bật",
+          "disabled": "Đã tắt",
+          "misconfigured": "Cấu hình sai",
+          "required_missing": "Bắt buộc, còn thiếu"
+        },
+        "var": {
+          "set": "đã đặt",
+          "notSet": "chưa đặt",
+          "secret": "Giá trị bảo mật, không bao giờ hiển thị"
+        },
+        "docs": "Đọc tài liệu",
+        "groups": {
+          "core": "Dịch vụ lõi",
+          "email": "Email",
+          "storage-backups": "Lưu trữ và sao lưu",
+          "ai": "AI",
+          "billing": "Thanh toán",
+          "microsoft-365": "Microsoft 365",
+          "identity-sso": "Danh tính và SSO",
+          "remote-access": "Truy cập từ xa",
+          "agent-releases": "Bản phát hành agent",
+          "observability": "Khả năng quan sát",
+          "security-abuse": "Bảo mật và lạm dụng",
+          "integrations": "Tích hợp"
+        },
+        "probe": {
+          "checkNow": "Kiểm tra ngay",
+          "checking": "Đang kiểm tra…",
+          "failed": "Không thể chạy kiểm tra executor.",
+          "notConfigured": "Chưa đặt URL executor.",
+          "reachable": "Có thể truy cập · {{ms}} ms",
+          "unreachable": "Không thể truy cập",
+          "route": "Đường dẫn /v1/{{route}}: {{state}}",
+          "version": "Phiên bản {{version}} ({{sha}})",
+          "versionMismatch": "Phiên bản {{version}} ({{sha}}) khác với API này",
+          "versionUnavailable": "Không báo cáo phiên bản (bản dựng cũ hơn)",
+          "state": {
+            "present": "Có mặt",
+            "missing": "Thiếu",
+            "unknown": "Không rõ"
+          }
+        }
+      },
+      "connectionHealthJobs": {
+        "title": "Tác vụ nền trạng thái kết nối",
+        "description": "Hiển thị xem các tác vụ theo dõi trạng thái kết nối có đang chạy không. Được kiểm tra từ tín hiệu nhịp tim Redis.",
+        "jobs": {
+          "reconcile": {
+            "label": "Trình đối chiếu sự cố",
+            "description": "Mở và giải quyết sự cố trạng thái kết nối cứ sau 15 phút."
+          },
+          "digest": {
+            "label": "Email tổng hợp hàng ngày",
+            "description": "Gửi bản tổng hợp trạng thái kết nối; chạy hàng giờ."
+          }
+        },
+        "state": {
+          "ok": "OK",
+          "stale": "Cũ",
+          "missing": "Không có nhịp tim",
+          "failing": "Đang lỗi"
+        },
+        "lastRun": "Chạy lần cuối {{relative}}",
+        "neverRun": "Không ghi nhận nhịp tim",
+        "kindsHeading": "Nguồn trạng thái",
+        "lastOk": "OK lần cuối {{relative}}",
+        "neverOk": "Chưa từng thành công",
+        "failureStreak": "Lỗi liên tiếp: {{count}}",
+        "redisUnavailable": "Không thể đọc trạng thái tác vụ do Redis không khả dụng. Điều này không có nghĩa là các tác vụ đã dừng.",
+        "errors": {
+          "load": "Không thể tải trạng thái tác vụ."
+        },
+        "retry": "Thử lại"
+      }
+    },
+    "aiModels": {
+      "title": "Mô hình AI",
+      "subtitle": "Các mô hình mà nền tảng nhận diện được từ quá trình khám phá của Anthropic. Mô hình mới đến sẽ chưa có giá và không được cung cấp cho ai cho đến khi bạn đặt giá và cung cấp chúng.",
+      "refresh": "Làm mới mô hình",
+      "requiresPlatformAdmin": "Cần quyền quản trị viên nền tảng để quản lý các mô hình AI.",
+      "empty": "Chưa có mô hình nào. Làm mới để khám phá mô hình bằng khóa nền tảng.",
+      "newBadge": "Mới",
+      "notSeen": "Chưa được khám phá",
+      "unpriced": "Chưa có giá",
+      "yes": "Có",
+      "no": "Không",
+      "edit": "Sửa",
+      "columns": {
+        "model": "Mô hình",
+        "status": "Trạng thái",
+        "thinking": "Đang suy nghĩ",
+        "price": "Đầu vào / đầu ra mỗi MTok",
+        "offered": "Được cung cấp",
+        "default": "Mặc định nền tảng",
+        "actions": "Thao tác"
+      },
+      "lifecycle": {
+        "available": "Khả dụng",
+        "missing": "Thiếu",
+        "retired": "Đã ngừng"
+      },
+      "thinkingMode": {
+        "adaptive": "Thích ứng",
+        "budget": "Ngân sách",
+        "none": "Không có",
+        "unknown": "Chưa xác minh"
+      },
+      "thinkingDisplay": {
+        "omitted": "Đã bỏ qua",
+        "summarized": "Đã tóm tắt",
+        "updates": "Cập nhật tiến độ"
+      },
+      "promptProfile": {
+        "claude-frontier": "Tiên phong",
+        "claude-standard": "Tiêu chuẩn",
+        "claude-small": "Nhỏ",
+        "generic": "Chung"
+      },
+      "drawer": {
+        "title": "Sửa {{name}}",
+        "prices": "Giá (USD trên mỗi triệu token)",
+        "storedPrice": "Đã lưu: {{value}}",
+        "priceChangeTitle": "Xác nhận thay đổi giá lớn",
+        "priceChangeIntro": "Các mức giá này chênh lệch hơn 10× so với giá trị đã lưu. Kiểm tra lại đơn vị: bạn đang nhập số đô la cho mỗi triệu token.",
+        "priceChangeRow": "{{group}} · {{field}}: {{stored}} → {{next}}",
+        "priceChangeConfirm": "Xác nhận và lưu",
+        "priceChangeBack": "Quay lại",
+        "priceGroupStandard": "Tiêu chuẩn",
+        "priceGroupFast": "Chế độ nhanh",
+        "fastPrices": "Giá chế độ nhanh (tùy chọn)",
+        "fastPricesHint": "Không thể chọn chế độ nhanh cho đến khi đặt cả bốn mức giá nhanh.",
+        "inputCentsPerM": "Đầu vào",
+        "outputCentsPerM": "Đầu ra",
+        "cacheReadCentsPerM": "Đọc bộ nhớ đệm",
+        "cacheWriteCentsPerM": "Ghi bộ nhớ đệm",
+        "effort": "Mức độ nỗ lực",
+        "thinkingDisplay": "Hiển thị suy nghĩ",
+        "fast": "Hỗ trợ chế độ nhanh",
+        "inferenceGeo": "Khu vực suy luận",
+        "inferenceGeoHint": "Các giá trị phân tách bằng dấu phẩy đã xác thực với Anthropic API, ví dụ: us, global.",
+        "minPlan": "Gói tối thiểu",
+        "allPlans": "Tất cả các gói",
+        "promptProfile": "Hồ sơ lời nhắc",
+        "offered": "Cung cấp trên khóa nền tảng",
+        "offeredHint": "Yêu cầu cả bốn mức giá.",
+        "isDefault": "Mặc định nền tảng",
+        "defaultHint": "Được ghi lại cho bộ phân giải mô hình theo tính năng sắp tới. Cho đến khi phát hành, mặc định triển khai lấy từ ANTHROPIC_MODEL hoặc mặc định có sẵn.",
+        "defaultLocked": "Đây là mặc định nền tảng. Đặt mô hình khác làm mặc định để thay đổi điều này.",
+        "save": "Lưu",
+        "cancel": "Hủy"
+      },
+      "notice": {
+        "saved": "Đã lưu mô hình.",
+        "refreshQueued": "Đã xếp hàng làm mới mô hình."
+      },
+      "errors": {
+        "load": "Không thể tải các mô hình AI.",
+        "save": "Không thể lưu mô hình.",
+        "refresh": "Không thể xếp hàng làm mới mô hình.",
+        "invalidRates": "Nhập cả bốn mức giá là số không âm, hoặc để trống cả bốn."
+      },
+      "variants": {
+        "title": "Biến thể lời nhắc",
+        "subtitle": "Hướng dẫn được nối thêm vào lời nhắc hệ thống của một tính năng cho một dòng mô hình, so với lời nhắc cơ sở trên mọi đối tác. Biến thể thay đổi theo bản phát hành.",
+        "range": "{{from}} đến {{to}}.",
+        "base": "Lời nhắc cơ sở",
+        "columns": {
+          "variant": "Biến thể",
+          "state": "Trạng thái",
+          "conversations": "Cuộc trò chuyện",
+          "flagRate": "Tỷ lệ gắn cờ",
+          "refusalRate": "Tỷ lệ từ chối",
+          "leftRate": "Đã chuyển sang mô hình khác",
+          "turns": "Lượt để giải quyết",
+          "costPerConversation": "Chi phí / cuộc trò chuyện"
+        },
+        "states": {
+          "staged": "Đã dàn dựng",
+          "candidate": "Ứng viên",
+          "active": "Hoạt động",
+          "retired": "Đã ngừng"
+        },
+        "lowSample": "Ít hơn {{min}} cuộc trò chuyện — quá ít để so sánh",
+        "incumbent": "Đương nhiệm",
+        "loading": "Đang tải biến thể lời nhắc…",
+        "empty": "Không có biến thể lời nhắc nào được đăng ký.",
+        "error": "Không thể tải báo cáo biến thể lời nhắc."
+      }
+    }
+  },
+  "audit": {
+    "actions": {
+      "agent.sessions.submit": "Phiên đã báo cáo",
+      "agent.security_status.submit": "Trạng thái bảo mật đã báo cáo",
+      "agent.management_posture.submit": "Tư thế quản lý đã báo cáo",
+      "agent.patches.submit": "Bản vá đã báo cáo",
+      "agent.eventlogs.submit": "Nhật ký sự kiện đã báo cáo",
+      "agent.reliability.submit": "Độ tin cậy đã báo cáo",
+      "agent.command.result.submit": "Kết quả lệnh đã gửi",
+      "agent.command.*": "Lệnh đã xếp hàng: {command}",
+      "agent.filesystem.threshold_scan.queued": "Đã xếp hàng quét hệ thống tệp",
+      "agent.enroll": "Agent đã đăng ký",
+      "api.fallback.post": "Đã gửi {target}",
+      "api.fallback.put": "Đã cập nhật {target}",
+      "api.fallback.patch": "Đã cập nhật {target}",
+      "api.fallback.delete": "Đã xóa {target}",
+      "user.login": "Đã đăng nhập",
+      "user.logout": "Đã đăng xuất",
+      "session_initiated": "Đã bắt đầu phiên",
+      "session_offer_submitted": "Đã gửi đề xuất phiên",
+      "session_consent_granted": "Đã cấp quyền cho phiên điều khiển từ xa",
+      "session_consent_denied": "Phiên điều khiển từ xa bị người dùng từ chối",
+      "remote.session.ended_by_user": "Phiên điều khiển từ xa đã kết thúc bởi người dùng",
+      "session_consent_blocked_unanswered": "Phiên điều khiển từ xa bị chặn: không trả lời yêu cầu đồng ý",
+      "session_consent_blocked_unavailable": "Phiên điều khiển từ xa bị chặn: không có bảng đồng ý",
+      "session_consent_bypassed": "Phiên điều khiển từ xa bắt đầu mà không có phản hồi yêu cầu đồng ý",
+      "screen_access_consent_blocked": "Truy cập màn hình bị chặn: thiết bị yêu cầu người dùng đồng ý",
+      "device.wake_on_lan": "Đã gửi Wake-on-LAN",
+      "device.recovery_key.reveal": "Đã hiển thị khóa khôi phục",
+      "device.recovery_key.rotate": "Đã xoay vòng khóa khôi phục",
+      "device.create": "Đã thêm thiết bị",
+      "device.update": "Đã cập nhật thiết bị",
+      "device.delete": "Đã xóa thiết bị",
+      "device.archive": "Đã lưu trữ thiết bị",
+      "organization.create": "Đã tạo tổ chức",
+      "organization.update": "Đã cập nhật tổ chức",
+      "organization.delete": "Đã xóa tổ chức",
+      "site.create": "Đã tạo chi nhánh",
+      "site.update": "Đã cập nhật chi nhánh",
+      "site.delete": "Đã xóa chi nhánh",
+      "alert.create": "Đã tạo cảnh báo",
+      "alert.resolve": "Đã xử lý cảnh báo",
+      "alert.acknowledge": "Đã ghi nhận cảnh báo",
+      "alert.dismiss": "Đã bỏ qua cảnh báo",
+      "enrollment_key.create": "Đã tạo khóa đăng ký",
+      "enrollment_key.revoke": "Đã thu hồi khóa đăng ký",
+      "partner.settings.update": "Đã cập nhật cài đặt đối tác",
+      "ai.message.send": "Đã gửi tin nhắn AI",
+      "backup.restore.create": "Đã bắt đầu khôi phục",
+      "backup.restore.cancel": "Đã hủy khôi phục",
+      "backup.restore.unattested_override": "Đã xác nhận khôi phục bản chụp chưa xác minh",
+      "ai.tool_approval.update": "Đã cập nhật phê duyệt công cụ AI",
+      "ai.tool.*": "Công cụ AI: {tool}",
+      "ai.session.create": "Đã bắt đầu cuộc trò chuyện Breeze AI",
+      "ai.session.close": "Đã đóng cuộc trò chuyện Breeze AI",
+      "ai.session.flag": "Đã gắn cờ cuộc trò chuyện Breeze AI",
+      "ai.session.unflag": "Đã bỏ gắn cờ cuộc trò chuyện Breeze AI",
+      "ai.message.interrupt": "Đã dừng phản hồi AI",
+      "ai.command.executed": "AI đã chạy một lệnh",
+      "ai.script.executed": "AI đã chạy một script",
+      "ai.external_tool.call": "AI đã gọi một công cụ ngoài",
+      "ai.plan_approval.update": "Đã cập nhật phê duyệt gói AI",
+      "ai.plan.abort": "Đã hủy gói AI",
+      "ai.security.prompt_injection_detected": "AI: phát hiện lệnh chèn (prompt injection)",
+      "ai.budget.update": "Đã cập nhật ngân sách AI",
+      "mcp.initialize": "MCP: khởi tạo",
+      "mcp.notifications.initialized": "MCP: đã khởi tạo thông báo",
+      "mcp.tools.list": "MCP: liệt kê công cụ",
+      "mcp.tools.call": "MCP: gọi công cụ",
+      "mcp.resources.list": "MCP: liệt kê tài nguyên",
+      "terminal.session.summary": "Tóm tắt phiên terminal",
+      "script.run": "Đã chạy script",
+      "script.execute": "Đã chạy script trên thiết bị",
+      "script.create": "Đã tạo script",
+      "script.update": "Đã cập nhật script",
+      "script.delete": "Đã xóa script",
+      "automation.create": "Đã tạo tự động hóa",
+      "automation.update": "Đã cập nhật tự động hóa",
+      "automation.delete": "Đã xóa tự động hóa"
+    },
+    "resourceTypes": {
+      "abuse_signal": "Tín hiệu lạm dụng",
+      "access_review": "Đánh giá quyền truy cập",
+      "access_review_item": "Mục đánh giá quyền truy cập",
+      "accounting_connection": "Kết nối kế toán",
+      "accounting_entity_mapping": "Ánh xạ bản ghi kế toán",
+      "accounting_mapping": "Ánh xạ kế toán",
+      "action_intent": "Ý định hành động",
+      "agent_version": "Phiên bản Agent",
+      "agreement_request": "Yêu cầu thỏa thuận",
+      "ai_action_plan": "Kế hoạch hành động AI",
+      "ai_agent": "Agent AI",
+      "ai_agent_impact": "Tác động của Agent AI",
+      "ai_agent_impact_weights": "Trọng số tác động của Agent AI",
+      "ai_agent_schedule": "Lịch trình Agent AI",
+      "ai_alert_verdict": "Nhận định cảnh báo AI",
+      "ai_budget": "Ngân sách AI",
+      "ai_credit_debit": "Phí tín dụng AI",
+      "ai_data_policies": "Chính sách dữ liệu AI",
+      "ai_execution": "Thực thi AI",
+      "ai_kill_state": "Công tắc ngắt AI (kill switch)",
+      "ai_memory_blocks": "Bộ nhớ AI",
+      "ai_operator_task": "Tác vụ vận hành AI",
+      "ai_platform_model": "Mô hình nền tảng AI",
+      "ai_script_lane_state": "Luồng script AI",
+      "ai_script_policies": "Chính sách script AI",
+      "ai_session": "Cuộc trò chuyện AI",
+      "ai_tool_execution": "Lần chạy công cụ AI",
+      "alert": "Cảnh báo",
+      "alert_correlation": "Tương quan cảnh báo",
+      "alert_notification": "Thông báo cảnh báo",
+      "alert_rule": "Quy tắc cảnh báo",
+      "alert_templates": "Mẫu cảnh báo",
+      "analytics_dashboard": "Tổng quan phân tích",
+      "analytics_query": "Truy vấn phân tích",
+      "analytics_widget": "Tiện ích phân tích",
+      "api_key": "Khóa API",
+      "approval_request": "Yêu cầu phê duyệt",
+      "asset_checkout": "Xuất tài sản",
+      "audit_baseline": "Đường cơ sở kiểm toán",
+      "audit_baseline_apply_approval": "Phê duyệt đường cơ sở kiểm toán",
+      "audit_log": "Nhật ký kiểm toán",
+      "automation": "Tự động hóa",
+      "automation_policy": "Chính sách tự động hóa",
+      "automation_run": "Lần chạy tự động hóa",
+      "automations": "Tự động hóa (cũ)",
+      "backup_config": "Cấu hình sao lưu",
+      "backup_job": "Tác vụ sao lưu",
+      "backup_profile": "Hồ sơ sao lưu",
+      "backup_provider_connection": "Kết nối nhà cung cấp sao lưu",
+      "backup_provider_customer": "Khách hàng nhà cung cấp sao lưu",
+      "backup_provider_device": "Thiết bị nhà cung cấp sao lưu",
+      "backup_sla_config": "SLA sao lưu",
+      "backup_snapshot": "Bản chụp sao lưu",
+      "backup_storage_credential": "Thông tin xác thực lưu trữ sao lưu",
+      "backup_verification": "Xác minh sao lưu",
+      "bare_metal_recovery": "Khôi phục thiết bị gốc",
+      "billing_export": "Xuất dữ liệu thanh toán",
+      "billing_profile": "Hồ sơ thanh toán",
+      "browser_policy": "Chính sách trình duyệt",
+      "business_calendar": "Lịch làm việc",
+      "c2c_backup_config": "Cấu hình sao lưu đám mây",
+      "c2c_backup_job": "Tác vụ sao lưu đám mây",
+      "c2c_connection": "Kết nối sao lưu đám mây",
+      "c2c_restore_job": "Tác vụ khôi phục đám mây",
+      "caller_verification": "Xác minh người gọi",
+      "change": "Thay đổi",
+      "circuit": "Đường truyền",
+      "cis_baseline": "Đường cơ sở CIS",
+      "cis_remediation_action": "Khắc phục CIS",
+      "client_ai_org_policy": "Chính sách AI tổ chức của khách hàng",
+      "client_ai_prompt_template": "Mẫu prompt AI của khách hàng",
+      "client_ai_session": "Cuộc trò chuyện AI của khách hàng",
+      "client_ai_tenant_mapping": "Ánh xạ tenant AI của khách hàng",
+      "client_ai_usage": "Mức sử dụng AI của khách hàng",
+      "config_policy_alert_rules": "Quy tắc cảnh báo chính sách",
+      "config_policy_automations": "Tự động hóa chính sách",
+      "config_policy_monitoring_watches": "Theo dõi giám sát chính sách",
+      "configuration_policy": "Chính sách cấu hình",
+      "contact": "Liên hệ",
+      "contract": "Hợp đồng",
+      "contract_document": "Tài liệu hợp đồng",
+      "contract_template": "Mẫu hợp đồng",
+      "custom_field": "Trường tùy chỉnh",
+      "deployment": "Triển khai",
+      "deployment_invite": "Lời mời triển khai",
+      "deployment_target": "Mục tiêu triển khai",
+      "device": "Thiết bị",
+      "device_bulk_purge": "Xóa hàng loạt thiết bị",
+      "device_command": "Lệnh thiết bị",
+      "device_file": "Tệp thiết bị",
+      "device_group": "Nhóm thiết bị",
+      "device_link_group": "Nhóm thiết bị đã liên kết",
+      "device_vulnerability": "Lỗ hổng thiết bị",
+      "diagnostic_access_grant": "Cấp quyền truy cập chẩn đoán",
+      "discovered_asset": "Tài sản được phát hiện",
+      "discovery_job": "Tác vụ phát hiện",
+      "discovery_profile": "Hồ sơ phát hiện",
+      "dns_integration": "Tích hợp DNS",
+      "dns_policy": "Chính sách DNS",
+      "dr_execution": "Chạy khôi phục thảm họa",
+      "dr_plan": "Kế hoạch khôi phục thảm họa",
+      "edr_action": "Hành động EDR",
+      "edr_connection": "Kết nối EDR",
+      "edr_endpoint": "Điểm cuối EDR",
+      "edr_tenant": "Tenant EDR",
+      "elevation_audit": "Kiểm toán nâng quyền",
+      "elevation_request": "Yêu cầu nâng quyền",
+      "encryption_key": "Khóa mã hóa",
+      "endpoint_conversation": "Trò chuyện thiết bị",
+      "endpoint_message": "Tin nhắn trò chuyện thiết bị",
+      "enrollment_key": "Khóa đăng ký",
+      "escalation_policy": "Chính sách leo thang",
+      "fix_instructions": "Hướng dẫn sửa lỗi",
+      "fix_memory": "Bộ nhớ sửa lỗi",
+      "fleet_finding": "Phát hiện trên toàn hệ thống",
+      "flow": "Luồng",
+      "flow_automation_conversion": "Chuyển đổi tự động hóa sang luồng",
+      "flow_run": "Chạy luồng",
+      "google_workspace_connection": "Kết nối Google Workspace",
+      "huntress_integration": "Tích hợp Huntress",
+      "huntress_org_mapping": "Ánh xạ tổ chức Huntress",
+      "hyperv_vm": "Hyper-V VM",
+      "incident": "Sự cố",
+      "installer_bootstrap_token": "Mã khởiBootstrap trình cài đặt",
+      "integration": "Tích hợp",
+      "invoice": "Hóa đơn",
+      "invoice_payment": "Thanh toán hóa đơn",
+      "link_health": "Trạng thái liên kết",
+      "llm_provider_catalog": "Danh mục nhà cung cấp LLM",
+      "local_vault": "Kho lưu trữ cục bộ",
+      "m365_connection": "Kết nối Microsoft 365",
+      "maintenance_occurrence": "Sự cố bảo trì",
+      "maintenance_window": "Khung thời gian bảo trì",
+      "manual_asset": "Tài sản thủ công",
+      "mcp_request": "Yêu cầu MCP",
+      "mcp_tool_execution": "Chạy công cụ MCP",
+      "mcp_transport": "Truyền dẫn MCP",
+      "metric_anomaly_episode": "Điểm bất thường chỉ số",
+      "migration_window": "Khung thời gian di chuyển",
+      "mobile_device": "Thiết bị di động",
+      "monitor_conversion": "Chuyển đổi giám sát",
+      "monitor_definition": "Trình theo dõi",
+      "network_baseline": "Đường cơ sở mạng",
+      "network_change_event": "Thay đổi mạng",
+      "network_monitor": "Trình theo dõi mạng",
+      "network_monitors": "Trình theo dõi mạng (cũ)",
+      "node": "Nút",
+      "notification": "Thông báo",
+      "notification_channel": "Kênh thông báo",
+      "notification_routing_rule": "Quy tắc định tuyến thông báo",
+      "oauth_client": "Client OAuth",
+      "observation": "Quan sát",
+      "office_addin_binding": "Liên kết tiện ích Office",
+      "office_addin_session": "Phiên tiện ích Office",
+      "org_document": "Tài liệu tổ chức",
+      "organization": "Tổ chức",
+      "organization_external_link": "Liên kết ngoài của tổ chức",
+      "pam_org_config": "Cài đặt tổ chức PAM",
+      "pam_rule": "Quy tắc PAM",
+      "pam_signer_group": "Nhóm ký PAM",
+      "partner": "Đối tác",
+      "partner_entitlement": "Quyền lợi của đối tác",
+      "partner_export": "Xuất dữ liệu đối tác",
+      "partner_login_branding": "Thương hiệu đăng nhập đối tác",
+      "partner_sender_identity": "Danh tính người gửi của đối tác",
+      "partner_sending_domain": "Miền gửi của đối tác",
+      "partner_service_principal": "Service principal của đối tác",
+      "partner_service_principal_key": "Mật khẩu service principal của đối tác",
+      "patch": "Bản vá",
+      "patch_compliance_report": "Báo cáo tuân thủ bản vá",
+      "pax8_company_mapping": "Ánh xạ công ty Pax8",
+      "pax8_integration": "Tích hợp Pax8",
+      "pax8_order": "Đơn hàng Pax8",
+      "pax8_subscription_snapshot": "Bản chụp gói đăng ký Pax8",
+      "peripheral_policy": "Chính sách thiết bị ngoại vi",
+      "platform_admin": "Quản trị viên nền tảng",
+      "plugin": "Plugin",
+      "policy": "Chính sách",
+      "portal_auth": "Đăng nhập cổng thông tin",
+      "portal_user": "Người dùng cổng thông tin",
+      "psa_connection": "Kết nối PSA",
+      "psa_ticket_mapping": "Ánh xạ phiếu hỗ trợ PSA",
+      "quote": "Báo giá",
+      "recovery_media_artifact": "Phương tiện khôi phục",
+      "recovery_token": "Mã thông báo khôi phục",
+      "refresh_token_family": "Phiên đăng nhập",
+      "relationship": "Mối quan hệ",
+      "remediation_suggestion": "Đề xuất khắc phục",
+      "remote_session": "Phiên từ xa",
+      "report": "Báo cáo",
+      "report_run": "Lần chạy báo cáo",
+      "report_series": "Chuỗi báo cáo",
+      "restore_job": "Tác vụ khôi phục",
+      "role": "Vai trò",
+      "s1_action": "Hành động SentinelOne",
+      "s1_integration": "Tích hợp SentinelOne",
+      "s1_org_mapping": "Ánh xạ tổ chức SentinelOne",
+      "saved_filter": "Chế độ xem đã lưu",
+      "script": "Script",
+      "script_bundle": "Gói script",
+      "script_category": "Danh mục script",
+      "script_execution": "Lần chạy script",
+      "script_proposal": "Đề xuất script",
+      "script_tag": "Thẻ script",
+      "security_policy": "Chính sách bảo mật",
+      "security_recommendation": "Khuyến nghị bảo mật",
+      "security_scan": "Quét bảo mật",
+      "security_scan_sweep": "Quét rà soát bảo mật",
+      "sensitive_data_finding": "Kết quả tìm kiếm dữ liệu nhạy cảm",
+      "sensitive_data_policy": "Chính sách dữ liệu nhạy cảm",
+      "sensitive_data_scan": "Quét dữ liệu nhạy cảm",
+      "service_principal": "Service principal",
+      "site": "Chi nhánh",
+      "sla_definition": "Định nghĩa SLA",
+      "snmp_template": "Mẫu SNMP",
+      "software_catalog": "Danh mục phần mềm",
+      "software_catalog_item": "Mục danh mục phần mềm",
+      "software_deployment": "Triển khai phần mềm",
+      "software_install_method": "Phương pháp cài đặt phần mềm",
+      "software_policy": "Chính sách phần mềm",
+      "software_version": "Phiên bản phần mềm",
+      "sso_provider": "Nhà cung cấp SSO",
+      "sso_verified_domain": "Miền đã xác minh SSO",
+      "system": "Hệ thống",
+      "tenant_variable": "Biến đối tượng thuê",
+      "ticket": "Phiếu hỗ trợ",
+      "ticket_approval_request": "Yêu cầu phê duyệt phiếu hỗ trợ",
+      "ticket_category": "Danh mục phiếu hỗ trợ",
+      "ticket_comment": "Bình luận phiếu hỗ trợ",
+      "ticket_customer_email_domain": "Miền khách hàng của phiếu hỗ trợ",
+      "ticket_email_inbound": "Email phiếu hỗ trợ đến",
+      "ticket_form": "Biểu mẫu phiếu hỗ trợ",
+      "ticket_mailbox_connection": "Hộp thư phiếu hỗ trợ",
+      "ticket_priority_settings": "Cài đặt ưu tiên phiếu hỗ trợ",
+      "ticket_response_template": "Mẫu phản hồi phiếu hỗ trợ",
+      "ticket_routing_rule": "Quy tắc định tuyến phiếu hỗ trợ",
+      "ticket_status": "Trạng thái phiếu hỗ trợ",
+      "time_entry": "Bản ghi thời gian",
+      "time_suggestion": "Gợi ý thời gian",
+      "tool_source": "Nguồn công cụ",
+      "tool_source_tool": "Công cụ nguồn công cụ",
+      "topology_interface": "Giao diện topology",
+      "topology_layout": "Bố cục topology",
+      "topology_manual_edge": "Liên kết thủ công topology",
+      "topology_manual_node": "Node thủ công topology",
+      "topology_monitor_binding": "Ràng buộc giám sát topology",
+      "topology_monitoring_policy": "Chính sách giám sát topology",
+      "topology_node": "Node topology",
+      "topology_relationship": "Mối quan hệ topology",
+      "topology_site": "Chi nhánh topology",
+      "topology_telemetry_arm": "Dữ liệu từ xa topology",
+      "topology_template": "Mẫu topology",
+      "topology_template_application": "Ứng dụng mẫu topology",
+      "topology_view_exclusion": "Loại trừ chế độ xem topology",
+      "trust_page": "Trang Trung tâm Tin cậy",
+      "trust_page_access_request": "Yêu cầu truy cập Trung tâm Tin cậy",
+      "trust_page_template": "Mẫu Trung tâm Tin cậy",
+      "tunnel_allowlist": "Danh sách cho phép đường hầm",
+      "tunnel_session": "Phiên đường hầm",
+      "update_ring": "Vòng cập nhật",
+      "user": "Người dùng",
+      "user_risk_policy": "Chính sách rủi ro người dùng",
+      "vulnerability_source": "Nguồn lỗ hổng",
+      "webhook": "Webhook",
+      "wisp_concern": "Vấn đề Wisp",
+      "wisp_grant": "Cấp quyền Wisp",
+      "wisp_thread": "Luồng Wisp",
+      "wisp_thread_attachment": "Tệp đính kèm luồng Wisp",
+      "wisp_watch": "Theo dõi Wisp",
+      "work_type": "Loại công việc",
+      "workspace_file": "Tệp không gian làm việc",
+      "workspace_org_settings": "Cài đặt tổ chức không gian làm việc",
+      "workspace_source": "Nguồn không gian làm việc",
+      "ws_ticket": "Phiếu hỗ trợ kết nối trực tiếp",
+      "yara_rule": "Quy tắc YARA",
+      "yara_rule_set": "Bộ quy tắc YARA"
+    },
+    "auditExport": {
+      "title": "Xuất Nhật ký Kiểm toán",
+      "description": "Tải xuống các bản ghi bằng cách sử dụng bộ lọc và cột hiện tại.",
+      "dateRange": "Khoảng thời gian",
+      "defaultRange": "30 ngày qua",
+      "format": "Định dạng",
+      "columns": "Cột",
+      "includeDetails": "Bao gồm chi tiết & thay đổi",
+      "exporting": "Đang xuất...",
+      "exportFormat": "Xuất {{format}}",
+      "formats": {
+        "csv": "CSV",
+        "json": "JSON"
+      },
+      "columnLabels": {
+        "timestamp": "Dấu thời gian",
+        "user": "Người dùng",
+        "action": "Hành động",
+        "resource": "Tài nguyên",
+        "details": "Chi tiết",
+        "ipAddress": "Địa chỉ IP"
+      },
+      "errors": {
+        "status": "{{status}} {{statusText}}",
+        "export": "Xuất nhật ký kiểm toán thất bại"
+      }
+    },
+    "auditFilters": {
+      "title": "Bộ lọc kiểm toán",
+      "description": "Lọc các mục kiểm toán theo người dùng, hành động và tài nguyên.",
+      "dateRange": "Khoảng thời gian",
+      "start": "Bắt đầu",
+      "end": "Kết thúc",
+      "user": "Người dùng",
+      "searchUsers": "Tìm kiếm người dùng",
+      "loadingUsers": "Đang tải người dùng...",
+      "noUsersFound": "Không tìm thấy người dùng",
+      "filteringBy": "Đang lọc theo",
+      "clear": "Xóa",
+      "actionTypes": "Loại hành động",
+      "resourceTypes": "Loại tài nguyên",
+      "searchDetails": "Tìm kiếm chi tiết",
+      "searchDetailsPlaceholder": "Tìm kiếm chi tiết hoạt động",
+      "applyFilters": "Áp dụng bộ lọc",
+      "clearAll": "Xóa tất cả",
+      "presets": {
+        "today": "Hôm nay",
+        "last7Days": "7 ngày qua",
+        "last30Days": "30 ngày qua",
+        "custom": "Tùy chỉnh"
+      },
+      "actions": {
+        "login": "đăng nhập",
+        "update": "cập nhật",
+        "delete": "xóa",
+        "create": "tạo",
+        "export": "xuất",
+        "access": "truy cập"
+      },
+      "resources": {
+        "policy": "chính sách",
+        "report": "báo cáo",
+        "dataset": "tập dữ liệu",
+        "identity": "định danh",
+        "automation": "tự động hóa",
+        "asset": "tài sản"
+      },
+      "site": "Chi nhánh",
+      "allSites": "Tất cả chi nhánh",
+      "loadingSites": "Đang tải chi nhánh…",
+      "siteHint": "Hoạt động trên thiết bị được chỉ định cho chi nhánh này: báo cáo agent và các hành động thực hiện trên thiết bị đó."
+    },
+    "auditLogDetail": {
+      "title": "Chi tiết nhật ký kiểm toán",
+      "subtitle": "{{action}} trên {{resource}}",
+      "close": "Đóng",
+      "activitySummary": "Tóm tắt hoạt động",
+      "changesSnapshot": "Ảnh chụp thay đổi",
+      "before": "Trước",
+      "after": "Sau",
+      "noFieldChanges": "Không có thay đổi trường nào được ghi nhận cho hành động này.",
+      "userInfo": "Thông tin người dùng",
+      "requestMetadata": "Metadata yêu cầu",
+      "fields": {
+        "timestamp": "Thời gian:",
+        "action": "Hành động:",
+        "resource": "Tài nguyên:",
+        "details": "Chi tiết:",
+        "ip": "IP:",
+        "userAgent": "User Agent:",
+        "session": "Phiên:"
+      }
+    },
+    "auditLogViewer": {
+      "title": "Luồng kiểm toán",
+      "description": "Theo dõi thao tác người dùng, các thao tác nhạy cảm và thay đổi hệ thống.",
+      "retry": "Thử lại",
+      "filters": "Bộ lọc",
+      "clear": "Xóa",
+      "exportLogs": "Xuất nhật ký",
+      "empty": "Không tìm thấy nhật ký kiểm toán.",
+      "viewDetails": "Xem chi tiết",
+      "scope": {
+        "label": "Phạm vi hoạt động",
+        "organization": "Tổ chức",
+        "partnerAccounts": "Tài khoản đối tác",
+        "partnerHint": "Đăng nhập, lời mời, MFA và thay đổi người dùng của tài khoản đối tác. Các sự kiện này không thuộc tổ chức nào nên chế độ xem tổ chức sẽ không hiển thị.",
+        "forbidden": "Xem hoạt động tài khoản đối tác yêu cầu quyền truy cập đối tác vào tất cả tổ chức."
+      },
+      "siteFilter": "Chi nhánh:",
+      "errors": {
+        "export": "Xuất nhật ký kiểm toán thất bại",
+        "fetch": "Tải nhật ký kiểm toán thất bại",
+        "load": "Không thể tải nhật ký kiểm toán"
+      },
+      "columns": {
+        "timestamp": "Thời gian",
+        "user": "Người dùng",
+        "action": "Hành động",
+        "resource": "Tài nguyên",
+        "details": "Chi tiết",
+        "ipAddress": "IP"
+      },
+      "expanded": {
+        "fullDetails": "Chi tiết đầy đủ",
+        "session": "Phiên",
+        "changes": "Thay đổi",
+        "fieldsUpdated": "{{count}} trường đã cập nhật",
+        "fieldsUpdated_one": "{{count}} trường đã cập nhật",
+        "fieldsUpdated_other": "{{count}} trường đã cập nhật",
+        "reviewFullSnapshot": "Xem toàn bộ ảnh chụp"
+      },
+      "pagination": {
+        "showingRange": "Đang hiển thị {{from}}-{{to}}",
+        "showingOf": "Đang hiển thị {{from}}-{{to}} trong tổng số {{total}}",
+        "previous": "Trước",
+        "page": "Trang {{page}}",
+        "next": "Tiếp"
+      }
+    },
+    "userActivityReport": {
+      "title": "Báo cáo hoạt động người dùng",
+      "description": "Xem xu hướng hoạt động và lịch sử xuất.",
+      "allUsers": "Tất cả người dùng",
+      "unknown": "Không xác định",
+      "retry": "Thử lại",
+      "exportActivity": "Xuất hoạt động",
+      "selectedActivity": "Hoạt động của {{user}}",
+      "totalActions": "Tổng số hành động",
+      "topAction": "Hành động hàng đầu",
+      "notApplicable": "n/a",
+      "occurrences": "{{count}} lần",
+      "occurrences_one": "{{count}} lần",
+      "occurrences_other": "{{count}} lần",
+      "distinctActions": "Hành động khác biệt",
+      "activityTimeline": "Dòng thời gian hoạt động",
+      "noActivity": "Không tìm thấy hoạt động.",
+      "actionsByType": "Hành động theo loại",
+      "noActionsRecorded": "Không có hành động nào được ghi nhận.",
+      "recentActions": "Hành động gần đây",
+      "noRecentActions": "Không tìm thấy hành động gần đây.",
+      "errors": {
+        "fetchUsers": "Tải danh sách người dùng thất bại",
+        "fetchActivity": "Tải hoạt động thất bại",
+        "loadData": "Không thể tải dữ liệu"
+      },
+      "table": {
+        "time": "Thời gian",
+        "action": "Hành động",
+        "resource": "Tài nguyên",
+        "ip": "IP"
+      }
+    }
+  }
+}

@@ -1,0 +1,778 @@
+{
+  "title": "Quy trình",
+  "subtitle": "Tự động hóa nhiều bước liên kết các công cụ với nhau.",
+  "empty": {
+    "title": "Chưa có quy trình nào",
+    "body": "Yêu cầu Breeze AI phác thảo quy trình, sau đó xem xét lại ở đây."
+  },
+  "list": {
+    "name": "Tên",
+    "owner": "Người sở hữu",
+    "allOrgs": "Tất cả tổ chức",
+    "status": "Trạng thái",
+    "tier": "Cấp",
+    "trigger": "Bộ kích hoạt",
+    "updated": "Đã cập nhật"
+  },
+  "status": {
+    "draft": "Bản nháp",
+    "enabled": "Đã bật",
+    "paused": "Đã tạm dừng",
+    "disabled": "Đã tắt",
+    "pausedReason": {
+      "drift": "Đã tạm dừng do quy trình đã thay đổi sau khi được bật.",
+      "binding_drift": "Đã tạm dừng do tập lệnh hoặc mục tiêu được phê duyệt trước đã thay đổi.",
+      "delegator_inactive": "Đã tạm dừng do người đại diện thực hiện quy trình không còn hoạt động.",
+      "org_merged": "Đã tạm dừng do tổ chức đã được hợp nhất.",
+      "event_dispatch_not_durable": "Đã tạm dừng do việc gửi sự kiện không được lưu bền vững trên máy chủ này."
+    }
+  },
+  "trigger": {
+    "schedule": "Lịch trình",
+    "event": "Sự kiện",
+    "webhook": "Webhook",
+    "manual": "Thủ công"
+  },
+  "detail": {
+    "back": "Quay lại danh sách quy trình",
+    "trigger": "Bộ kích hoạt",
+    "inputs": "Đầu vào",
+    "steps": "Các bước",
+    "version": "Phiên bản {{version}}",
+    "createdInChat": "Được tạo trong Breeze AI",
+    "movedFromJob": "Đã chuyển từ Tác vụ",
+    "movedFromJobReverted": "(đã chuyển lại)"
+  },
+  "step": {
+    "tool": "Công cụ",
+    "tier": "Cấp {{tier}}",
+    "approval": "Phê duyệt",
+    "approvalDefault": "Phê duyệt chuẩn",
+    "approvalPreApproved": "Đã phê duyệt trước",
+    "when": "Chạy khi",
+    "forEach": "Cho mỗi",
+    "onFailure": "Khi thất bại",
+    "timeout": "Hết thời gian",
+    "input": "Đầu vào",
+    "source": {
+      "core": "Công cụ lõi",
+      "tenant": "Nguồn công cụ",
+      "builtin": "Tích hợp sẵn",
+      "unknown": "Công cụ không xác định"
+    },
+    "preApprovedBadge": "Đã phê duyệt trước",
+    "builtin": {
+      "notify": "Gửi thông báo",
+      "http_request": "Gọi API bên ngoài",
+      "ai": "Hỏi AI",
+      "run_script_on_targets": "Chạy tập lệnh trên thiết bị",
+      "resolve_targets": "Tìm thiết bị",
+      "create_alert": "Tạo cảnh báo"
+    },
+    "notify": {
+      "channel": "Kênh: {{channel}}"
+    },
+    "http": {
+      "request": "{{method}} {{origin}}",
+      "anonymous": "Ẩn danh (không có thông tin đăng nhập)"
+    },
+    "ai": {
+      "tools": "Công cụ: {{tools}}",
+      "noTools": "Không có công cụ",
+      "output": "Trường kết quả: {{fields}}"
+    },
+    "fleet": {
+      "script": "Tập lệnh {{scriptId}}",
+      "target": {
+        "all": "Tất cả thiết bị",
+        "devices": "Thiết bị được liệt kê",
+        "groups": "Nhóm thiết bị",
+        "filter": "Thiết bị khớp với bộ lọc",
+        "other": "Mục tiêu thiết bị"
+      },
+      "conditions": "Thiết bị khớp với điều kiện tác vụ",
+      "triggerDevice": "Thiết bị từ sự kiện",
+      "devices_one": "{{count}} thiết bị",
+      "devices_other": "{{count}} thiết bị",
+      "fromStep": {
+        "succeeded": "Thiết bị thành công ở {{stepId}}",
+        "dispatched": "Thiết bị được tiếp cận bởi {{stepId}}",
+        "failed": "Thiết bị thất bại ở {{stepId}}"
+      },
+      "offlineQueue": "Thiết bị ngoại tuyến: đã xếp hàng",
+      "offlineSkip": "Thiết bị ngoại tuyến: đã bỏ qua",
+      "alert": "Mức độ nghiêm trọng {{severity}}"
+    }
+  },
+  "issues": {
+    "title": "Xác thực",
+    "none": "Không có vấn đề xác thực nào.",
+    "error": "Lỗi",
+    "warning": "Cảnh báo"
+  },
+  "card": {
+    "title": "Bản nháp quy trình",
+    "review": "Xem lại",
+    "steps": "Số bước: {{count}}"
+  },
+  "errors": {
+    "loadFailed": "Không thể tải quy trình.",
+    "notFound": "Không tìm thấy quy trình.",
+    "enableFailed": "Không thể bật quy trình.",
+    "disableFailed": "Không thể tắt quy trình.",
+    "runFailed": "Không thể bắt đầu chạy.",
+    "cancelFailed": "Không thể hủy lượt chạy."
+  },
+  "tabs": {
+    "overview": "Tổng quan",
+    "runs": "Lượt chạy",
+    "webhook": "Webhook"
+  },
+  "actions": {
+    "enable": "Bật",
+    "disable": "Tắt",
+    "runNow": "Chạy ngay",
+    "cancelRun": "Hủy lượt chạy",
+    "cancel": "Hủy"
+  },
+  "enable": {
+    "title": "Bật quy trình",
+    "body": "Việc bật sẽ xuất bản phiên bản quy trình này. Sau đó quy trình sẽ chạy theo bộ kích hoạt. Các bước cần phê duyệt vẫn sẽ yêu cầu phê duyệt trừ khi bạn phê duyệt trước ở bên dưới.",
+    "preApprove": "Phê duyệt trước bước này",
+    "preApproveHelp": "Các lần chạy phiên bản này sẽ bỏ qua lời nhắc phê duyệt cho bước này. Phê duyệt trước áp dụng chính xác cho tập lệnh và mục tiêu hiển thị ở đây, và sẽ ngừng áp dụng nếu quy trình thay đổi.",
+    "preApproveAll": "Phê duyệt trước tất cả {{count}} bước",
+    "notEligible": {
+      "not_tier3": "Chỉ các bước cần phê duyệt mới có thể được phê duyệt trước.",
+      "tool_not_supported": "Công cụ này không thể được phê duyệt trước.",
+      "script_not_literal": "Tập lệnh được chọn tại thời điểm chạy nên không thể phê duyệt trước.",
+      "run_context_not_literal": "Cài đặt chạy với tư cách được chọn tại thời điểm chạy nên không thể phê duyệt trước.",
+      "group_target": "Bước này nhắm mục tiêu vào nhóm thiết bị có thể thay đổi. Phê duyệt trước cần các thiết bị cố định.",
+      "variable_dependent": "Bước này phụ thuộc vào các giá trị chỉ được biết tại thời điểm chạy.",
+      "script_not_found": "Không tìm thấy tập lệnh mà bước này sử dụng.",
+      "four_eyes": "Hành động này luôn cần người thứ hai phê duyệt.",
+      "tenant_tool": "Nguồn công cụ tùy chỉnh không thể được phê duyệt trước.",
+      "for_each": "Các bước lặp lại cho mỗi mục không thể được phê duyệt trước.",
+      "run_as_elevated": "Tập lệnh này chạy với quyền nâng cao nên không thể phê duyệt trước.",
+      "selector_not_literal": "Thiết bị được chọn tại thời điểm chạy nên bước này không thể phê duyệt trước.",
+      "max_targets_invalid": "Đặt số lượng thiết bị mà bước này có thể chạy trên đó (1–500) để phê duyệt trước."
+    },
+    "eventScope": "Quy trình sự kiện phản hồi các sự kiện trên nền tảng bất kể nguyên nhân nào, bao gồm hành động của con người, quy trình khác hoặc tự động hóa. Hãy kiểm tra bộ lọc kích hoạt trước khi bật.",
+    "missingPermissions": "Bạn thiếu quyền mà các bước trong quy trình này yêu cầu:",
+    "eventNotDurable": "Việc gửi sự kiện không được lưu bền vững trên máy chủ này, vì vậy không thể bật quy trình sự kiện lúc này.",
+    "forEachConcurrency": "Các bước lặp lại cho mỗi mục sẽ chạy từng mục một.",
+    "confirm": "Bật quy trình",
+    "tier3Heading": "Các bước cần phê duyệt",
+    "noTier3": "Không có bước nào trong quy trình này cần phê duyệt.",
+    "validationFailed": "Luồng có lỗi xác thực. Vui lòng khắc phục trước khi bật:",
+    "versionConflict": "Luồng đã thay đổi kể từ khi bạn mở trang này. Hãy tải lại và xem xét các thay đổi trước khi bật.",
+    "alreadyEnabled": "Luồng này đã được bật.",
+    "preApprovalNotEligible": "Bước {{stepId}} không thể được phê duyệt trước. {{reason}}",
+    "foreachConcurrencyNotAvailable": "Luồng này lặp lại một bước cho từng mục song song, điều mà máy chủ này chưa hỗ trợ.",
+    "delegationScopeRestricted": "Quyền truy cập của bạn bị giới hạn ở một số chi nhánh, vì vậy bạn không thể bật luồng chạy trên toàn tổ chức.",
+    "partnerWideForbidden": "Bạn không có quyền bật luồng cho tất cả các tổ chức.",
+    "interactiveRequired": "Chỉ có thể bật luồng từ phiên trình duyệt đã đăng nhập.",
+    "slugUnavailable": "Một luồng khác trong phạm vi này đã sử dụng mã định danh này.",
+    "generic": "Không thể bật luồng.",
+    "webhookSecretMissing": "Tạo một secret webhook trước khi bạn bật luồng này.",
+    "aiBudgetUnavailable": "Tổ chức này không có ngân sách AI để sử dụng, vì vậy không thể bật luồng có bước AI.",
+    "webhookSecretInvalidated": "Việc bật phiên bản này đã xóa secret webhook, do secret được tạo cho một bản nháp cũ hơn. Mọi yêu cầu sẽ bị từ chối cho đến khi bạn tạo secret mới và cung cấp cho bên gửi."
+  },
+  "run": {
+    "title": "Chạy luồng",
+    "org": "Tổ chức",
+    "inputs": "Đầu vào",
+    "submit": "Bắt đầu chạy",
+    "queueFull": "Luồng này có quá nhiều lượt chạy đang chờ. Thử lại sau khi một số lượt đã hoàn tất.",
+    "permissionMissing": "Bạn không có quyền chạy các bước của luồng này: {{permissions}}",
+    "preApprovalsNotHonored": "Lượt chạy này được bắt đầu bởi người không có quyền phê duyệt, vì vậy các phê duyệt trước không được áp dụng và mỗi bước đều yêu cầu phê duyệt.",
+    "selectOrg": "Chọn một tổ chức",
+    "orgRequired": "Chọn tổ chức để chạy luồng này.",
+    "requiredInput": "{{name}} là bắt buộc.",
+    "invalidNumber": "{{name}} phải là một số.",
+    "invalidUuid": "{{name}} phải là một ID hợp lệ.",
+    "inputsInvalid": "Một số đầu vào không hợp lệ:",
+    "notEnabled": "Luồng này chưa được bật, vì vậy không thể chạy.",
+    "delegationScopeRestricted": "Quyền truy cập của bạn bị giới hạn ở một số chi nhánh, vì vậy bạn không thể chạy luồng hoạt động trên toàn tổ chức.",
+    "interactiveUserRequired": "Chỉ người đã đăng nhập mới có thể bắt đầu chạy thủ công. Đăng nhập vào ứng dụng web và thử lại.",
+    "orgForbidden": "Bạn không có quyền truy cập vào tổ chức đó.",
+    "notManual": "Luồng này không chạy thủ công. Nó bắt đầu từ trình kích hoạt của mình."
+  },
+  "runs": {
+    "empty": "Chưa có lượt chạy nào.",
+    "emptyFiltered": "Không có lượt chạy nào khớp với bộ lọc này.",
+    "status": {
+      "queued": "Đang xếp hàng",
+      "running": "Đang chạy",
+      "waiting": "Đang chờ",
+      "awaiting_approval": "Đang đợi phê duyệt",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "cancelled": "Đã hủy",
+      "expired": "Đã hết hạn"
+    },
+    "trigger": {
+      "manual": "Thủ công",
+      "schedule": "Lịch trình",
+      "event": "Sự kiện",
+      "webhook": "Webhook",
+      "tool": "Gọi công cụ"
+    },
+    "via": {
+      "ui": "Từ ứng dụng web",
+      "api": "Từ API",
+      "ai_tool": "Từ Breeze AI",
+      "scheduler": "Bởi bộ lập lịch",
+      "event": "Bởi một sự kiện",
+      "webhook": "Webhook",
+      "mcp": "MCP",
+      "ai_agent": "Tác nhân AI"
+    },
+    "columns": {
+      "started": "Đã bắt đầu",
+      "status": "Trạng thái",
+      "trigger": "Trình kích hoạt",
+      "duration": "Thời lượng",
+      "org": "Tổ chức"
+    },
+    "filter": {
+      "label": "Trạng thái",
+      "all": "Tất cả trạng thái"
+    },
+    "loadFailed": "Không thể tải các lượt chạy."
+  },
+  "runDetail": {
+    "title": "Lượt chạy luồng",
+    "back": "Quay lại danh sách chạy",
+    "awaitingApproval": "Lượt chạy này bị tạm dừng cho đến khi có người phê duyệt một bước.",
+    "openApprovals": "Mở phần phê duyệt",
+    "error": {
+      "step_failed": "Một bước đã thất bại.",
+      "rejected": "Người phê duyệt đã từ chối một bước.",
+      "drift": "Luồng đã thay đổi sau khi được bật, vì vậy lượt chạy đã bị dừng.",
+      "binding_drift": "Tập lệnh hoặc mục tiêu được phê duyệt trước đã thay đổi, vì vậy lượt chạy đã bị dừng.",
+      "unknown_outcome": "Kết quả của bước không xác định. Bước có thể đã chạy. Kiểm tra thủ công thiết bị trước khi chạy lại luồng.",
+      "step_timeout": "Một bước mất quá nhiều thời gian và đã bị dừng.",
+      "input_invalid": "Một bước nhận được đầu vào mà nó không thể sử dụng.",
+      "reference_not_owned": "Một bước tham chiếu đến đối tượng thuộc về tổ chức khác.",
+      "tool_unavailable": "Công cụ được luồng này sử dụng hiện không còn khả dụng.",
+      "tool_blocked": "Công cụ được luồng này sử dụng đã bị chặn.",
+      "too_many_items": "Một bước sẽ lặp lại với số mục nhiều hơn mức cho phép.",
+      "render_failed": "Không thể tạo đầu vào của bước từ các kết quả trước đó.",
+      "no_eligible_approvers": "Không ai có thể phê duyệt bước cần được phê duyệt.",
+      "worker_lost": "Lượt chạy bị gián đoạn và không thể tiếp tục.",
+      "cancelled": "Lượt chạy đã bị hủy.",
+      "run_timeout": "Lượt chạy vượt quá giới hạn một giờ và đã bị dừng.",
+      "flow_disabled": "Luồng đã bị tắt trong khi lượt chạy này đang hoạt động.",
+      "flows_disabled": "Các luồng đã bị tắt trên máy chủ này.",
+      "delegator_inactive": "Người mà lượt chạy này đại diện không còn hoạt động.",
+      "org_merged": "Tổ chức đã được hợp nhất vào tổ chức khác.",
+      "egress_blocked": "Yêu cầu đi ra ngoài đã bị chặn bởi chính sách đầu ra.",
+      "http_status": "API bên ngoài phản hồi với trạng thái lỗi.",
+      "notify_failed": "Không thể gửi thông báo.",
+      "ai_budget_exhausted": "Ngân sách AI của tổ chức đã cạn kiệt.",
+      "ai_output_invalid": "Kết quả AI không khớp với định dạng dự kiến.",
+      "ai_token_cap_reached": "Lượt chạy đã đạt giới hạn token AI.",
+      "targets_over_cap": "Bước đã nhắm mục tiêu nhiều thiết bị hơn mức cho phép của một bước luồng (500).",
+      "targets_unresolvable": "Không thể phân giải mục tiêu thiết bị của bước.",
+      "alert_create_failed": "Không thể tạo cảnh báo.",
+      "script_dispatch_failed": "Không thể gửi tập lệnh đến một hoặc nhiều thiết bị."
+    },
+    "step": {
+      "status": {
+        "running": "Đang chạy",
+        "awaiting_approval": "Đang đợi phê duyệt",
+        "completed": "Đã hoàn thành",
+        "failed": "Thất bại",
+        "skipped": "Đã bỏ qua",
+        "unknown_outcome": "Kết quả không rõ, kiểm tra thủ công",
+        "cancelled": "Đã hủy"
+      },
+      "approval": {
+        "none": "Không cần phê duyệt",
+        "intent": "Cần người phê duyệt",
+        "pre_approved": "Đã được phê duyệt trước"
+      },
+      "input": "Đầu vào",
+      "output": "Đầu ra",
+      "truncated": "Đầu ra đã bị rút ngắn vì quá lớn.",
+      "notReached": "Chưa đến",
+      "pending": "Đang chờ xử lý",
+      "item": "Mục {{index}}",
+      "approver": "Người phê duyệt: {{id}}",
+      "attempt": "Lần thử {{n}}",
+      "show": "Hiển thị chi tiết",
+      "hide": "Ẩn chi tiết",
+      "loading": "Đang tải...",
+      "loadFailed": "Không thể tải chi tiết bước.",
+      "pruned": "Chi tiết đã bị xóa bởi chính sách lưu giữ.",
+      "redacted": "Chi tiết bước không khả dụng với quyền truy cập của bạn.",
+      "aiUsage": "AI: {{input}} vào, {{output}} ra token, {{cost}}",
+      "httpStatus": "HTTP {{status}}"
+    },
+    "notFound": "Không tìm thấy lượt chạy.",
+    "alreadyTerminal": "Lượt chạy này đã hoàn thành.",
+    "loadFailed": "Không thể tải lượt chạy này.",
+    "retry": "Thử lại",
+    "version": "Phiên bản {{version}} (bản công bố {{seq}})",
+    "org": "Tổ chức: {{org}}",
+    "waitingUntil": "Đang đợi đến {{time}}",
+    "queuedNote": "Đang xếp hàng. Đang đợi khe chạy trống.",
+    "paused": "Đã tạm dừng cập nhật trực tiếp.",
+    "lastUpdated": "Cập nhật lần cuối {{time}}",
+    "timeline": "Các bước",
+    "agentRun": "Được khởi chạy bởi một tác vụ AI agent",
+    "openAgentRun": "Mở lượt chạy agent",
+    "aiTokensUsed": "Token AI đã dùng: {{count}}",
+    "parallel": "{{count}} mục chạy song song"
+  },
+  "toast": {
+    "enabled": "Đã bật luồng",
+    "disabled": "Đã tắt luồng",
+    "runStarted": "Đã bắt đầu chạy",
+    "runCancelled": "Đã hủy chạy"
+  },
+  "disable": {
+    "title": "Tắt luồng",
+    "message": "Tắt luồng sẽ dừng các lượt chạy mới và hủy các lượt chạy đang diễn ra. Bạn có thể bật lại luồng sau."
+  },
+  "webhook": {
+    "title": "Webhook",
+    "url": "URL Webhook",
+    "copy": "Sao chép",
+    "copied": "Đã sao chép",
+    "copyFailed": "Không thể tự động sao chép. Hãy chọn giá trị và thủ công sao chép.",
+    "authMode": {
+      "label": "Xác thực",
+      "hmac": "Yêu cầu đã ký (HMAC-SHA256)",
+      "token": "Khóa bí mật trong tiêu đề (header)"
+    },
+    "authHelp": {
+      "hmac": "Bên gửi ký vào mỗi yêu cầu bằng khóa bí mật. Breeze từ chối các yêu cầu không có chữ ký, ký sai hoặc cũ hơn năm phút, và chỉ chạy yêu cầu phát lại một lần duy nhất.",
+      "token": "Bên gửi đặt trực tiếp khóa bí mật vào tiêu đề. Cách này kém bảo mật hơn chữ ký: bất kỳ ai thấy một yêu cầu đều có thể gửi thêm. Chỉ sử dụng cho các bên gửi không thể ký."
+    },
+    "signing": {
+      "title": "Cách gửi yêu cầu",
+      "hmac": "Gửi đối tượng JSON làm phần thân. Tính toán HMAC-SHA256 trên <timestamp>.<raw body> với khóa bí mật, và gửi các tiêu đề sau:",
+      "token": "Gửi đối tượng JSON làm phần thân, kèm theo khóa bí mật trong tiêu đề này:",
+      "deliveryId": "Tùy chọn: gửi một {{header}} duy nhất để việc thử lại cùng một lần gửi chỉ chạy một lần."
+    },
+    "secret": {
+      "label": "Khóa bí mật",
+      "create": "Tạo khóa bí mật",
+      "rotate": "Đổi khóa bí mật",
+      "none": "Chưa có khóa bí mật. Mọi yêu cầu đều bị từ chối cho đến khi bạn tạo một khóa.",
+      "fingerprint": "Dấu vân tay",
+      "rotatedAt": "Đã tạo",
+      "dialogTitle": "Khóa bí mật webhook",
+      "warning": "Sao chép khóa bí mật này ngay. Khóa sẽ không hiển thị lại.",
+      "done": "Hoàn tất",
+      "rotateTitle": "Đổi khóa bí mật webhook?",
+      "rotateMessage": "Khóa hiện tại sẽ ngừng hoạt động ngay lập tức. Bên gửi sẽ bị từ chối cho đến khi sử dụng khóa mới.",
+      "failed": "Không thể tạo khóa bí mật webhook.",
+      "draftUnresolvable": "Các bước của bản nháp không còn phân giải được, do đó không thể tạo khóa bí mật cho bản nháp này. Hãy sửa bản nháp trước.",
+      "notWebhook": "Luồng này không được khởi chạy bởi webhook."
+    },
+    "lastFailure": {
+      "label": "Yêu cầu bị từ chối gần nhất",
+      "none": "Không có",
+      "missing_signature": "Yêu cầu chưa được ký.",
+      "bad_signature": "Chữ ký không khớp.",
+      "stale_timestamp": "Thiếu dấu thời gian (timestamp) hoặc lệch hơn năm phút.",
+      "missing_token": "Thiếu tiêu đề khóa bí mật.",
+      "bad_token": "Khóa bí mật trong tiêu đề không đúng.",
+      "bad_delivery_id": "ID lần gửi không hợp lệ."
+    },
+    "orgResolver": {
+      "label": "Tổ chức",
+      "externalId": "Khớp theo {{path}} với ID bên ngoài kiểu {{system}}",
+      "breezeOrgId": "Đọc từ {{path}} dưới dạng ID tổ chức Breeze",
+      "orgFlow": "Chạy trong tổ chức của luồng này"
+    }
+  },
+  "deliveries": {
+    "title": "Lần gửi gần đây",
+    "empty": "Chưa có lần gửi nào.",
+    "loadFailed": "Không thể tải các lần gửi.",
+    "loadMore": "Tải thêm",
+    "hidden": "ID lần gửi và giá trị tổ chức bị ẩn theo quyền truy cập của bạn.",
+    "columns": {
+      "received": "Đã nhận",
+      "status": "Trạng thái",
+      "org": "Tổ chức",
+      "run": "Lượt chạy",
+      "attempts": "Số lần thử",
+      "detail": "Chi tiết"
+    },
+    "status": {
+      "accepted": "Đã chấp nhận",
+      "org_unresolved": "Không có tổ chức phù hợp",
+      "refused": "Đã từ chối",
+      "invalid_body": "Phần thân không hợp lệ"
+    },
+    "resolverValue": "Giá trị: {{value}}",
+    "deliveryId": "ID lần gửi: {{id}}",
+    "openRun": "Mở lượt chạy"
+  },
+  "usage": {
+    "title": "Lượt chạy tháng này",
+    "period": "{{period}} (UTC)",
+    "flowCap": "Luồng này",
+    "ownerCap": "Tất cả luồng của chủ sở hữu này",
+    "count": "{{used}} / {{cap}}",
+    "limitsLink": "Giới hạn luồng",
+    "refused": {
+      "flow_queue_full": "Quá nhiều lượt chạy đang chờ.",
+      "flow_monthly_cap_reached": "Luồng này đã đạt giới hạn chạy hàng tháng.",
+      "owner_monthly_cap_reached": "Chủ sở hữu đã đạt giới hạn chạy hàng tháng cho tất cả luồng."
+    },
+    "refusedBanner": "Các lượt chạy đang bị từ chối. {{reason}} Lần từ chối gần nhất {{time}}. Luồng vẫn được bật và sẽ chạy lại khi sang tháng mới hoặc khi giới hạn được nâng lên.",
+    "refusedBadge": "Lượt chạy bị từ chối"
+  },
+  "limits": {
+    "title": "Giới hạn luồng",
+    "subtitle": "Giới hạn chạy hàng tháng và giới hạn token AI cho mỗi lượt chạy. Đặt mặc định cho đối tác của bạn, và hạ thấp xuống cho một tổ chức khi cần.",
+    "level": {
+      "label": "Cấp",
+      "partner": "Mặc định của đối tác",
+      "org": "Tổ chức"
+    },
+    "selectOrg": "Chọn một tổ chức",
+    "fields": {
+      "monthlyRunsPerOwner": {
+        "label": "Lượt chạy mỗi tháng, tất cả luồng",
+        "help": "Số lượt chạy tối đa mà tất cả luồng của một chủ sở hữu có thể bắt đầu trong một tháng dương lịch (UTC)."
+      },
+      "monthlyRunsPerFlow": {
+        "label": "Lượt chạy mỗi tháng, mỗi luồng",
+        "help": "Số lượt chạy tối đa mà một luồng có thể bắt đầu trong một tháng dương lịch (UTC). Một luồng có thể tự đặt giới hạn thấp hơn."
+      },
+      "aiTokensPerRun": {
+        "label": "Token AI mỗi lượt chạy",
+        "help": "Số token AI tối đa mà các bước AI của một lượt chạy có thể sử dụng."
+      }
+    },
+    "inherited": "Được kế thừa: {{value}} ({{source}})",
+    "source": {
+      "default": "mặc định nền tảng",
+      "partner": "mặc định đối tác",
+      "org": "tổ chức này"
+    },
+    "ceilingNote": "Tổ chức chỉ có thể giảm giá trị này. Giá trị của đối tác là {{value}}.",
+    "aboveCeiling": "Giá trị đã lưu {{value}} cao hơn giá trị của đối tác, nên không được áp dụng.",
+    "aboveCeilingError": "Phải từ {{value}} trở xuống (giá trị của đối tác).",
+    "range": "Nhập số nguyên từ 1 đến {{max}}.",
+    "placeholder": "Kế thừa",
+    "save": "Lưu",
+    "saving": "Đang lưu...",
+    "saved": "Đã lưu giới hạn luồng",
+    "saveFailed": "Không thể lưu giới hạn luồng.",
+    "loadFailed": "Không thể tải giới hạn luồng.",
+    "orgNotFound": "Không tìm thấy tổ chức này hoặc bạn không còn quyền truy cập.",
+    "readOnly": "Bạn có thể xem các giới hạn này nhưng không thể thay đổi.",
+    "partnerWideForbidden": "Thay đổi mặc định của đối tác cần quyền truy cập vào tất cả các tổ chức.",
+    "orgScopeReadOnly": "Giới hạn tổ chức được thiết lập bởi nhà cung cấp dịch vụ của bạn."
+  },
+  "conversion": {
+    "fidelity": {
+      "exact": "Chính xác",
+      "needs_review": "Cần xem lại",
+      "unconvertible": "Chưa thể di chuyển"
+    },
+    "fidelityBlocked": "Chưa thể di chuyển: {{blocker}}",
+    "severity": {
+      "blocker": "Nguyên nhân chặn",
+      "review": "Xem lại",
+      "info": "Ghi chú"
+    },
+    "state": {
+      "shadow": "Đang chạy thử nghiệm",
+      "switched": "Đã chuyển sang Flows",
+      "reverted": "Đã chuyển lại"
+    },
+    "actionNumber": "Hành động {{n}}",
+    "noFindings": "Không có gì cần xem lại: tác vụ này di chuyển chính xác.",
+    "finding": {
+      "flows_disabled": {
+        "title": "Flows đang tắt tại đây",
+        "line": "Cài đặt này chạy với FLOWS_ENABLED=false, vì vậy các tác vụ được giữ nguyên."
+      },
+      "managed_row": {
+        "title": "Được quản lý bởi Breeze",
+        "line": "Một tác nhân AI hoặc màn hình sở hữu tác vụ này; nó di chuyển cùng chủ sở hữu, không tự di chuyển."
+      },
+      "policy_workflow": {
+        "title": "Là một phần của quy trình chính sách",
+        "line": "Các chính sách cấu hình chạy tác vụ này; nó di chuyển khi quy trình chính sách di chuyển."
+      },
+      "already_retired": {
+        "title": "Đã tắt",
+        "line": "Tác vụ này đã ngừng hoạt động và không còn chạy."
+      },
+      "compliance_remediation_target": {
+        "title": "Được sử dụng để khắc phục tuân thủ",
+        "line": "Một chính sách tuân thủ chạy tác vụ này để sửa chữa thiết bị; hiện tại nó vẫn giữ nguyên là tác vụ."
+      },
+      "event_dispatch_not_durable": {
+        "title": "Việc phân phối sự kiện không bền vững ở đây",
+        "line": "Các tác vụ sự kiện chỉ di chuyển khi EVENT_DISPATCH_MODE=enforce và đã đăng ký flow-event-trigger."
+      },
+      "event_filter_not_strict": {
+        "title": "Bộ lọc sự kiện không thể sao chép chính xác",
+        "line": "Bộ lọc sử dụng danh sách, đối tượng, quá nhiều khóa hoặc khóa mà flows không thể khớp."
+      },
+      "event_filter_null": {
+        "title": "Bộ lọc sự kiện kiểm tra giá trị trống",
+        "line": "Tác vụ phân biệt giá trị trống và giá trị bị thiếu; flows thì không."
+      },
+      "cron_semantics_differ": {
+        "title": "Lịch trình sẽ chạy vào các thời điểm khác nhau",
+        "line": "Biểu thức cron này không khớp với bộ lập lịch flow khi thay đổi giờ tiết kiệm ánh sáng ban ngày."
+      },
+      "condition_unknown_type": {
+        "title": "Điều kiện mục tiêu không xác định",
+        "line": "Loại điều kiện mà trình chạy tác vụ bỏ qua; flow không thể sao chép an toàn."
+      },
+      "targets_over_cap": {
+        "title": "Quá nhiều thiết bị",
+        "line": "Tác vụ này nhắm mục tiêu hơn 400 thiết bị; một bước flow chạy tối đa 500."
+      },
+      "partner_wide_group_target": {
+        "title": "Tác vụ toàn tổ chức nhắm mục tiêu các nhóm",
+        "line": "Nhóm thiết bị thuộc về một tổ chức, vì vậy tác vụ toàn tổ chức không thể nhắm mục tiêu chúng."
+      },
+      "run_as_elevated": {
+        "title": "Chạy với quyền nâng cao",
+        "line": "Một tập lệnh đã di chuyển không bao giờ chạy với quyền nâng cao mà không có người giám sát."
+      },
+      "restart_service_monitor_only": {
+        "title": "Khởi động lại dịch vụ",
+        "line": "Khởi động lại dịch vụ chỉ chạy từ các màn hình."
+      },
+      "command_mixed_os": {
+        "title": "Lệnh không có shell trên các thiết bị hỗn hợp",
+        "line": "Chọn shell hoặc thu hẹp mục tiêu về một hệ điều hành."
+      },
+      "notify_per_run_cap": {
+        "title": "Quá nhiều thông báo mỗi lần chạy",
+        "line": "Flows gửi tối đa 20 thông báo mỗi lần chạy."
+      },
+      "channel_type_not_supported": {
+        "title": "Kênh thông báo không được hỗ trợ",
+        "line": "Flow chưa thể gửi đến loại kênh này."
+      },
+      "deploy_software_unmapped": {
+        "title": "Triển khai phần mềm",
+        "line": "Việc triển khai phần mềm chưa chuyển sang Flows."
+      },
+      "monthly_cap_exceeded": {
+        "title": "Chạy thường xuyên hơn giới hạn hàng tháng",
+        "line": "Số lần chạy hàng tháng ước tính vượt quá giới hạn flow của chủ sở hữu này."
+      },
+      "reference_not_owned": {
+        "title": "Sử dụng thứ mà chủ sở hữu này không sở hữu",
+        "line": "Tập lệnh, kênh hoặc nhóm thuộc về một chủ sở hữu khác."
+      },
+      "partner_wide_webhook": {
+        "title": "Tác vụ webhook toàn tổ chức",
+        "line": "Webhook flow cần một tổ chức để chạy."
+      },
+      "text_template_unsupported": {
+        "title": "Văn bản chứa dấu ngoặc mẫu",
+        "line": "Flow sẽ đọc dấu ngoặc kép trong văn bản như một mẫu."
+      },
+      "event_filter_string_coercion": {
+        "title": "Giá trị bộ lọc văn bản",
+        "line": "Tác vụ so sánh dạng văn bản, flows so sánh chính xác; hãy xác nhận trường luôn là văn bản."
+      },
+      "approval_each_run": {
+        "title": "Phê duyệt cho mọi lần chạy webhook",
+        "line": "Phê duyệt trước không áp dụng cho các lần chạy webhook, vì vậy mỗi lần chạy đều phải chờ người phê duyệt."
+      },
+      "command_becomes_script": {
+        "title": "Lệnh trở thành tập lệnh",
+        "line": "Lệnh được lưu dưới dạng tập lệnh thư viện mà bạn xem xét trước khi chuyển đổi."
+      },
+      "partner_wide_org_set_differs": {
+        "title": "Chạy một lần cho mỗi tổ chức",
+        "line": "Flow bỏ qua các tổ chức bị tạm ngưng và chạy ở tối đa 500 tổ chức trong số đó."
+      },
+      "failure_notice_cap": {
+        "title": "Thông báo lỗi có thể bị giới hạn",
+        "line": "Hơn 20 thông báo lỗi trong một lần chạy sẽ không được gửi."
+      },
+      "owner_cap_pressure": {
+        "title": "Gần đạt giới hạn hàng tháng",
+        "line": "Flow này sẽ sử dụng hơn 80% số lần chạy hàng tháng của chủ sở hữu."
+      },
+      "site_ceiling_removed": {
+        "title": "Phạm vi thiết bị rộng hơn",
+        "line": "Tác vụ bị giới hạn ở các chi nhánh của người tạo; flow thì không."
+      },
+      "webhook_body_shape": {
+        "title": "Nội dung webhook phải là một đối tượng JSON",
+        "line": "Flow bỏ qua các thông điệp không phải đối tượng JSON."
+      },
+      "legacy_secret_header_possible": {
+        "title": "Tiêu đề bí mật dạng văn bản thuần túy",
+        "line": "Người gửi sử dụng bí mật dạng thuần túy phải chuyển sang X-Breeze-Webhook-Token."
+      },
+      "name_truncated": {
+        "title": "Tên đã được rút ngắn",
+        "line": "Tên flow có tối đa 120 ký tự."
+      },
+      "duration_minutes_ignored": {
+        "title": "Thời lượng bị bỏ qua",
+        "line": "Cài đặt thời lượng sự kiện chưa từng có tác dụng và đã bị loại bỏ."
+      },
+      "schedule_outage_catch_up": {
+        "title": "Bắt kịp sau thời gian ngừng hoạt động",
+        "line": "Sau thời gian ngừng hoạt động, flow chạy lần bỏ lỡ mới nhất một lần; tác vụ không chạy lần nào."
+      },
+      "queued_is_success": {
+        "title": "Được đưa vào hàng đợi được tính là hoàn thành",
+        "line": "Như trước đây, tập lệnh được đưa vào hàng đợi cho thiết bị ngoại tuyến được tính là đã gửi."
+      },
+      "severity_mapped": {
+        "title": "Mức độ nghiêm trọng đã được ánh xạ",
+        "line": "Mức cao và trung bình thành cảnh báo; mức thấp và thông tin thành thông tin."
+      },
+      "notification_emails_unused": {
+        "title": "Danh sách email bị loại bỏ",
+        "line": "Danh sách email của tác vụ chưa từng được sử dụng và đã bị loại bỏ."
+      },
+      "webhook_url_changes": {
+        "title": "Địa chỉ webhook",
+        "line": "Người gửi giữ nguyên địa chỉ cũ; nó sẽ chuyển tiếp đến flow."
+      },
+      "delegator_pause": {
+        "title": "Tạm dừng nếu bạn mất quyền truy cập",
+        "line": "Flow chạy dưới danh nghĩa của bạn và tạm dừng nếu tài khoản của bạn bị tắt hoặc bị thu hẹp."
+      }
+    },
+    "column": {
+      "heading": "Chuyển sang Flows",
+      "move": "Chuyển sang Flows",
+      "view": "Xem"
+    },
+    "panel": {
+      "title": "Chuyển \"{{name}}\" sang Flows",
+      "subtitle": "Xem những gì được giữ lại, theo dõi flow chạy thử tác vụ, sau đó chuyển đổi.",
+      "close": "Đóng",
+      "loading": "Đang kiểm tra tác vụ này…",
+      "openFlow": "Mở flow",
+      "findingsHeading": "Những gì được giữ lại",
+      "stepsHeading": "Các bước flow",
+      "startShadow": "Bắt đầu chạy thử",
+      "switch": "Chuyển đổi…",
+      "switchedNote": "Flow hiện đang chạy tác vụ này. Tác vụ ở chế độ chỉ đọc cho đến khi bạn chuyển nó lại.",
+      "flowUnavailable": "Không thể tải flow. Bạn vẫn có thể chuyển tác vụ lại."
+    },
+    "shadow": {
+      "heading": "Chạy thử",
+      "explain": "Flow kiểm tra từng lần chạy của tác vụ mà không thực thi bất kỳ điều gì.",
+      "runs": "Số lần chạy đã kiểm tra",
+      "divergences": "Điểm khác biệt",
+      "startedAt": "Đã bắt đầu",
+      "divergence": {
+        "trigger_mismatch": "Điểm khác biệt cuối cùng: flow và tác vụ không thống nhất về việc có nên chạy hay không.",
+        "target_set_mismatch": "Điểm khác biệt cuối cùng: flow sẽ chọn các thiết bị khác.",
+        "would_park": "Điểm khác biệt cuối cùng: một bước sẽ phải chờ phê duyệt.",
+        "over_cap": "Điểm khác biệt cuối cùng: lần chạy sẽ vượt quá giới hạn flow."
+      }
+    },
+    "switch": {
+      "title": "Chuyển \"{{name}}\" sang flow của nó",
+      "body": "Từ một phút sau khi bạn chuyển đổi, flow sẽ chạy mọi lần xuất hiện và tác vụ sẽ dừng lại. Không có gì chạy hai lần.",
+      "blocked": {
+        "shadow_too_new": "Nút chuyển đổi sẽ mở khi chế độ chạy thử hoạt động được 10 phút.",
+        "shadow_too_short": "Chế độ chạy thử đã kiểm tra ít hơn 3 lần chạy hoặc hoạt động chưa được 7 ngày.",
+        "shadow_divergent": "Chế độ chạy thử phát hiện sự khác biệt giữa flow và tác vụ.",
+        "source_changed": "Công việc đã thay đổi kể từ khi được chuyển đổi. Hãy bắt đầu bản chạy ngầm mới.",
+        "unconvertible": "Công việc này chưa thể di chuyển."
+      },
+      "acknowledge": "Vẫn chuyển; tôi chấp nhận các bằng chứng hiển thị.",
+      "preApprovalsHeading": "Chạy không cần chờ phê duyệt",
+      "preApprovalsHelp": "Tắt theo mặc định. Nếu không có tính năng này, mỗi lần chạy bước tập lệnh sẽ chờ người phê duyệt.",
+      "noPreApprovals": "Không có bước tập lệnh nào có thể chạy mà không cần phê duyệt.",
+      "preApprove": "Phê duyệt trước bước tập lệnh",
+      "currentTargets_one": "Mục tiêu {{count}} thiết bị hôm nay.",
+      "currentTargets_other": "Mục tiêu {{count}} thiết bị hôm nay.",
+      "maxTargets": "Số thiết bị tối đa mỗi lần chạy (1–{{max}})",
+      "maxTargetsInvalid": "Nhập số nguyên từ 1 đến {{max}}.",
+      "liveMembership": "Thiết bị được tính toán lại mới trong mỗi lần chạy. Bất kỳ ai có quyền thay đổi thành viên nhóm đều có thể thay đổi vị trí chạy này; số lần chạy vượt quá giới hạn sẽ tạm dừng luồng.",
+      "frozenDevices": "Nếu một lần chạy chờ phê duyệt, người phê duyệt sẽ thấy chính xác các thiết bị đó và chỉ các thiết bị đó mới chạy.",
+      "perOrgMultiplies": "Đây là luồng toàn tổ chức: giới hạn được áp dụng cho từng tổ chức, do đó tổng số có thể bằng số lần nhân với số lượng tổ chức.",
+      "webhookApprovalEachRun": "Luồng webhook luôn phải chờ phê duyệt, ngay cả khi đã được phê duyệt trước.",
+      "generatedScriptsHeading": "Các tập lệnh được tạo khi chuyển đổi",
+      "generatedScriptsHelp": "Mỗi lệnh trở thành một tập lệnh thư viện thuộc quyền sở hữu của công việc.",
+      "acceptScripts": "Tôi đã xem xét các tập lệnh này.",
+      "acceptScopeWidening": "Tôi chấp nhận rằng luồng không bị giới hạn trong các chi nhánh của người tạo công việc.",
+      "webhookChange": "Người gửi giữ nguyên địa chỉ webhook cũ; nó sẽ chuyển tiếp đến luồng. Luồng chỉ chấp nhận các đối tượng JSON và người gửi mã bí mật thuần túy phải sử dụng X-Breeze-Webhook-Token.",
+      "acceptDelegatorLifecycle": "Luồng chạy dưới danh nghĩa của tôi. Nếu tài khoản của tôi bị tắt hoặc mất quyền truy cập, luồng sẽ tạm dừng (công việc thì không).",
+      "confirm": "Chuyển đổi",
+      "switching": "Đang chuyển đổi…"
+    },
+    "revert": {
+      "action": "Chuyển lại về công việc…",
+      "title": "Chuyển \"{{name}}\" lại về công việc?",
+      "body": "Công việc bật lại và luồng không khởi chạy cái mới nào. Các lần chạy đã bắt đầu trên luồng vẫn sẽ hoàn tất.",
+      "confirm": "Chuyển lại"
+    },
+    "toast": {
+      "created": "Đã bắt đầu chạy ngầm.",
+      "bulkCreated_one": "Đã bắt đầu chạy ngầm cho {{count}} công việc.",
+      "bulkCreated_other": "Đã bắt đầu chạy ngầm cho {{count}} công việc.",
+      "switched": "Đã chuyển đổi. Luồng sẽ chạy công việc này kể từ bây giờ.",
+      "reverted": "Đã chuyển lại. Công việc chạy lại."
+    },
+    "errors": {
+      "loadFailed": "Không thể tải quá trình di chuyển của công việc này.",
+      "createFailed": "Không thể bắt đầu chạy ngầm.",
+      "bulkFailed": "Không thể bắt đầu chạy ngầm.",
+      "switchFailed": "Không thể chuyển đổi.",
+      "revertFailed": "Không thể chuyển lại.",
+      "automation_not_found": "Công việc này không còn tồn tại.",
+      "conversion_not_found": "Quá trình di chuyển này không còn tồn tại.",
+      "conversion_exists": "Công việc này đang được di chuyển.",
+      "source_changed": "Công việc đã thay đổi kể từ khi bạn mở nó. Tải lại và thử lại.",
+      "unconvertible": "Công việc này chưa thể di chuyển.",
+      "draft_rejected": "Bản nháp luồng không được chấp nhận.",
+      "partner_wide_forbidden": "Di chuyển công việc toàn tổ chức yêu cầu quyền đối tác đầy đủ.",
+      "owner_forbidden": "Chọn một tổ chức trước.",
+      "interactive_session_required": "Đăng nhập bằng tài khoản cá nhân để thực hiện việc này.",
+      "delegation_scope_restricted": "Quyền của bạn bị giới hạn ở một số chi nhánh, vì vậy bạn không thể chuyển đổi hoặc chuyển lại.",
+      "not_shadow": "Chỉ công việc ở chế độ chạy ngầm mới có thể chuyển đổi.",
+      "not_switched": "Chỉ công việc đã chuyển đổi mới có thể chuyển lại.",
+      "version_conflict": "Luồng đã thay đổi. Tải lại và thử lại.",
+      "already_enabled": "Luồng đã được bật.",
+      "slug_unavailable": "Đã có một luồng khác sử dụng tên này.",
+      "shadow_too_new": "Nút chuyển đổi sẽ mở sau khi chế độ chạy ngầm hoạt động được 10 phút.",
+      "shadow_too_short": "Chưa đủ dữ liệu chạy ngầm. Hãy xác nhận để vẫn chuyển đổi.",
+      "shadow_divergent": "Chế độ chạy ngầm phát hiện các điểm khác biệt. Hãy xác nhận chúng để vẫn chuyển đổi.",
+      "scope_widening_not_accepted": "Chấp nhận phạm vi thiết bị rộng hơn để chuyển đổi.",
+      "automation_disabled": "Bật công việc trước khi chuyển đổi.",
+      "automation_converted": "Công việc này đã được chuyển đến phần Luồng. Hãy thay đổi ở đó.",
+      "automations_moved_to_flows": "Các công việc mới được tạo trong phần Luồng.",
+      "flow_not_found": "Luồng của công việc không còn tồn tại.",
+      "revert_closed": "Tính năng chuyển lại đã bị khóa trên hệ thống này.",
+      "generated_script_rejected": "Không thể tạo tập lệnh cho công việc này.",
+      "permission_missing": "Bạn không có đủ mọi quyền mà luồng yêu cầu.",
+      "pre_approval_not_eligible": "Một bước không thể được phê duyệt trước.",
+      "invalid": "Luồng không hợp lệ.",
+      "event_dispatch_not_durable": "Việc phân phối sự kiện ở đây không có tính bền vững.",
+      "webhook_secret_missing": "Thiếu mã bí mật webhook."
+    }
+  },
+  "jobs": {
+    "migration": {
+      "banner": {
+        "r1": "Các công việc đang được chuyển sang Luồng.",
+        "r1Body": "Các công việc mới được tạo trong phần Luồng. Di chuyển từng công việc khi bản chạy ngầm khớp; bạn có thể chuyển nó lại."
+      },
+      "convertAll": "Bắt đầu chạy ngầm cho tất cả các mục có thể chuyển đổi",
+      "converting": "Đang bắt đầu…",
+      "bulkSummary": "Đã tạo {{created}}, bỏ qua {{skipped}}.",
+      "newJobOpensFlows": "Luồng mới"
+    }
+  }
+}

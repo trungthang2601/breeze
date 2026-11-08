@@ -1,0 +1,368 @@
+{
+  "vulnerabilityLandingPage": {
+    "title": "Lỗ hổng",
+    "subtitle": "Mức độ phơi nhiễm CVE của toàn bộ thiết bị được nhóm để xử lý — vá lỗi, chấp nhận rủi ro hoặc tạo phiếu."
+  },
+  "createVulnTicketModal": {
+    "title": "Tạo phiếu hỗ trợ",
+    "heading": "Tạo phiếu — {{count}} phát hiện",
+    "heading_one": "Tạo phiếu — {{count}} phát hiện",
+    "heading_other": "Tạo phiếu — {{count}} phát hiện",
+    "crossOrgNote": "Phạm vi lựa chọn gồm {{count}} tổ chức — sẽ tạo một phiếu cho mỗi tổ chức.",
+    "crossOrgNote_one": "Phạm vi lựa chọn gồm {{count}} tổ chức — sẽ tạo một phiếu cho mỗi tổ chức.",
+    "crossOrgNote_other": "Phạm vi lựa chọn gồm {{count}} tổ chức — sẽ tạo một phiếu cho mỗi tổ chức.",
+    "autoDetailNote": "Chi tiết thiết bị và CVE được thêm tự động theo từng tổ chức.",
+    "fields": {
+      "title": "Tiêu đề",
+      "note": "Ghi chú (tùy chọn)",
+      "notePlaceholder": "Thêm ngữ cảnh cho kỹ thuật viên (tùy chọn)",
+      "priority": "Độ ưu tiên"
+    },
+    "priorities": {
+      "low": "Thấp",
+      "normal": "Bình thường",
+      "high": "Cao",
+      "urgent": "Khẩn cấp"
+    },
+    "actions": {
+      "create": "Tạo phiếu hỗ trợ"
+    }
+  },
+  "cveDrawer": {
+    "errors": {
+      "load": "Không thể tải CVE",
+      "reopen": "Không thể mở lại phát hiện",
+      "scheduleRemediation": "Không thể lên lịch vá lỗi",
+      "acceptRisk": "Không thể chấp nhận rủi ro",
+      "mitigate": "Không thể giảm thiểu",
+      "createTicket": "Không thể tạo phiếu"
+    },
+    "meta": {
+      "cvss": "CVSS {{version}}",
+      "vector": "Vector",
+      "epss": "EPSS",
+      "knownExploited": "Đã biết khai thác",
+      "published": "Đã công bố",
+      "modified": "Đã sửa đổi"
+    },
+    "sections": {
+      "devices": "Thiết bị ({{count}} phát hiện)",
+      "devices_one": "Thiết bị ({{count}} phát hiện)",
+      "devices_other": "Thiết bị ({{count}} phát hiện)"
+    },
+    "selection": {
+      "selectAll": "Chọn tất cả",
+      "selectAllAria": "Chọn tất cả phát hiện",
+      "deselectAllAria": "Bỏ chọn tất cả phát hiện",
+      "selectFindingAria": "Chọn phát hiện trên {{deviceName}}",
+      "selected": "Đã chọn {{count}}",
+      "selected_one": "Đã chọn {{count}}",
+      "selected_other": "Đã chọn {{count}}"
+    },
+    "empty": {
+      "noFindings": "Không có thiết bị nào trong hệ thống bị ảnh hưởng bởi CVE này lúc này — không có thao tác nào cần thực hiện."
+    },
+    "findings": {
+      "patch": "Bản vá",
+      "ticket": "Phiếu hỗ trợ"
+    },
+    "actions": {
+      "reopen": "Mở lại",
+      "remediate": "Vá lỗi",
+      "acceptRisk": "Chấp nhận rủi ro",
+      "mitigate": "Giảm thiểu",
+      "createTicket": "Tạo phiếu hỗ trợ"
+    },
+    "ticket": {
+      "defaultTitle": "Vá lỗi {{cveId}}"
+    }
+  },
+  "findingStatus": {
+    "acceptedUntil": "Chấp nhận đến {{date}}",
+    "status": {
+      "open": "đang mở",
+      "accepted": "đã chấp nhận",
+      "mitigated": "đã giảm thiểu",
+      "patched": "đã vá"
+    }
+  },
+  "kevBadge": {
+    "label": "KEV",
+    "title": "Lỗ hổng đã biết bị khai thác (Danh mục CISA KEV)"
+  },
+  "severityBadge": {
+    "critical": "Nghiêm trọng",
+    "high": "Cao",
+    "medium": "Trung bình",
+    "low": "Thấp",
+    "unknown": "Không rõ",
+    "unscored": "Chưa chấm điểm",
+    "unscoredTitle": "Chưa có điểm mức độ nghiêm trọng NVD nào được công bố cho CVE này."
+  },
+  "softwareGroupDrawer": {
+    "titleFallback": "Nhóm phần mềm",
+    "errors": {
+      "load": "Không thể tải nhóm phần mềm",
+      "reopen": "Không thể mở lại phát hiện",
+      "scheduleRemediation": "Không thể lên lịch vá lỗi",
+      "acceptRisk": "Không thể chấp nhận rủi ro",
+      "mitigate": "Không thể giảm thiểu",
+      "createTicket": "Không thể tạo phiếu"
+    },
+    "summary": {
+      "maxRisk": "rủi ro tối đa {{risk}}"
+    },
+    "tickets": {
+      "number": "Phiếu {{number}}",
+      "view": "Xem phiếu"
+    },
+    "sections": {
+      "cves": "CVE ({{count}})",
+      "devicesHeading": "Thiết bị ({{count}})",
+      "versions": "Phiên bản đã cài đặt"
+    },
+    "cveMeta": {
+      "cvss": "CVSS {{score}}",
+      "epss": "EPSS {{score}}",
+      "devicesOpen_one": "{{open}} / {{count}} thiết bị mở",
+      "devicesOpen_other": "{{open}} / {{count}} thiết bị mở"
+    },
+    "selection": {
+      "selectAll": "Chọn tất cả",
+      "selectAllAria": "Chọn tất cả thiết bị",
+      "deselectAllAria": "Bỏ chọn tất cả thiết bị",
+      "selectDeviceAria": "Chọn {{deviceName}}",
+      "selectedDevices_one": "Đã chọn {{count}} thiết bị · {{findings}} phát hiện đang mở",
+      "selectedDevices_other": "Đã chọn {{count}} thiết bị · {{findings}} phát hiện đang mở"
+    },
+    "empty": {
+      "noFindings": "Không còn phát hiện thiết bị nào trong nhóm này — không có thao tác nào cần thực hiện."
+    },
+    "findings": {
+      "patch": "Bản vá",
+      "ticket": "Phiếu hỗ trợ"
+    },
+    "actions": {
+      "reopen": "Mở lại",
+      "remediate": "Vá lỗi",
+      "acceptRisk": "Chấp nhận rủi ro",
+      "mitigate": "Giảm thiểu",
+      "createTicket": "Tạo phiếu hỗ trợ"
+    },
+    "ticket": {
+      "defaultTitle": "Vá lỗi {{name}}"
+    },
+    "headline": {
+      "needUpdating_one": "{{count}} thiết bị cần cập nhật",
+      "needUpdating_other": "{{count}} thiết bị cần cập nhật",
+      "nothingOpen": "Không có thiết bị nào có phát hiện đang mở",
+      "scope_one": "{{count}} CVE trên {{devices}} thiết bị",
+      "scope_other": "{{count}} CVE trên {{devices}} thiết bị",
+      "scopeSingleDevice_one": "{{count}} CVE trên 1 thiết bị",
+      "scopeSingleDevice_other": "{{count}} CVE trên 1 thiết bị"
+    },
+    "versions": {
+      "deviceCount_one": "{{count}} thiết bị",
+      "deviceCount_other": "{{count}} thiết bị"
+    },
+    "device": {
+      "openOf_one": "{{open}} / {{count}} CVE đang mở",
+      "openOf_other": "{{open}} / {{count}} CVE đang mở",
+      "accepted": "Đã chấp nhận {{count}}",
+      "mitigated": "Đã giảm thiểu {{count}}",
+      "patched": "Đã vá {{count}}",
+      "patchReady": "{{count}} sẵn sàng vá",
+      "show": "Phát hiện",
+      "hide": "Ẩn",
+      "expandAria": "Hiển thị phát hiện trên {{deviceName}}",
+      "collapseAria": "Ẩn phát hiện trên {{deviceName}}",
+      "loading": "Đang tải phát hiện…",
+      "loadError": "Không thể tải phát hiện của thiết bị"
+    }
+  },
+  "softwareGroupTable": {
+    "errors": {
+      "load": "Không thể tải nhóm phần mềm"
+    },
+    "table": {
+      "software": "Phần mềm",
+      "severity": "Mức độ nghiêm trọng",
+      "risk": "Rủi ro",
+      "devices": "Thiết bị bị ảnh hưởng",
+      "patch": "Bản vá"
+    },
+    "help": {
+      "riskAria": "Giới thiệu về điểm rủi ro",
+      "patchAria": "Giới thiệu về cột Bản vá"
+    },
+    "actions": {
+      "openDetailsAria": "Mở chi tiết lỗ hổng {{name}}"
+    },
+    "patch": {
+      "ready": "Sẵn sàng · {{ready}}/{{total}} thiết bị",
+      "ready_one": "Sẵn sàng · {{ready}}/{{total}} thiết bị",
+      "ready_other": "Sẵn sàng · {{ready}}/{{total}} thiết bị"
+    },
+    "target": {
+      "version": "Cập nhật lên {{version}}",
+      "latest": "Cập nhật lên bản mới nhất"
+    },
+    "hasMore": "Hiển thị 500 nhóm hàng đầu theo rủi ro — hãy thu hẹp bộ lọc để xem phần còn lại.",
+    "devices_one": "{{count}} thiết bị",
+    "devices_other": "{{count}} thiết bị",
+    "cves_one": "{{count}} CVE",
+    "cves_other": "{{count}} CVE"
+  },
+  "vulnBulkActionModal": {
+    "headings": {
+      "remediate": "Khắc phục kết quả",
+      "accept": "Chấp nhận rủi ro",
+      "mitigate": "Đánh dấu đã giảm thiểu"
+    },
+    "headingWithCount": "{{heading}} — {{count}} kết quả",
+    "headingWithCount_one": "{{heading}} — {{count}} kết quả",
+    "headingWithCount_other": "{{heading}} — {{count}} kết quả",
+    "counts": {
+      "devices": "{{count}} thiết bị",
+      "devices_one": "{{count}} thiết bị",
+      "devices_other": "{{count}} thiết bị",
+      "findings": "{{count}} kết quả",
+      "findings_one": "{{count}} kết quả",
+      "findings_other": "{{count}} kết quả"
+    },
+    "selection": {
+      "more": "và {{count}} mục khác"
+    },
+    "consequence": {
+      "remediate": "Cài đặt bản vá đã duyệt cho từng CVE trên {{deviceText}} ({{findingText}}). Các kết quả không có bản vá áp dụng được duyệt sẽ bị bỏ qua.",
+      "accept": "Ẩn {{findingText}} trên {{deviceText}} khỏi hàng đợi mở cho đến ngày bạn đặt. Chúng không tự động mở lại — các mục chấp nhận sắp hết hạn sẽ xuất hiện trong thẻ “Đã chấp nhận, sắp hết hạn”.",
+      "mitigate": "Đánh dấu {{findingText}} trên {{deviceText}} là đã giảm thiểu, kèm theo ghi chú của bạn được ghi nhận là biện pháp kiểm soát bù đắp. Breeze không thay đổi các thiết bị."
+    },
+    "fields": {
+      "reason": "Lý do",
+      "mitigationNote": "Ghi chú giảm thiểu",
+      "acceptedUntil": "Chấp nhận đến"
+    },
+    "actions": {
+      "working": "Đang xử lý…",
+      "remediate": "Khắc phục",
+      "accept": "Chấp nhận rủi ro",
+      "mitigate": "Đánh dấu đã giảm thiểu"
+    }
+  },
+  "vulnEmptyState": {
+    "filtered": {
+      "message": "Không có lỗ hổng nào khớp với bộ lọc hiện tại.",
+      "clearFilters": "Xóa bộ lọc"
+    },
+    "clean": {
+      "title": "Không có lỗ hổng mở trên toàn hệ thống",
+      "description": "Mọi kết quả phát hiện đã được vá, giảm thiểu hoặc chấp nhận. Các kết quả mới sẽ xuất hiện ở đây khi quá trình quét chạy.",
+      "lastDetected": "Kết quả phát hiện lần cuối vào {{date}}"
+    },
+    "unscanned": {
+      "title": "Chưa có kết quả lỗ hổng nào",
+      "description": "Breeze kiểm tra phần mềm và kho hệ điều hành của từng thiết bị so với các CVE đã biết và đưa vào hàng đợi bất kỳ thứ gì cần vá, giảm thiểu hoặc chấp nhận rủi ro.",
+      "setupHint": "Quá trình quét bị tắt theo mặc định — hãy bật tính năng này trên tab Lỗ hổng (Vulnerability) của chính sách cấu hình.",
+      "setupAction": "Thiết lập quét lỗ hổng"
+    },
+    "unknown": {
+      "message": "Không có lỗ hổng nào để hiển thị."
+    }
+  },
+  "vulnFilterBar": {
+    "searchPlaceholder": {
+      "software": "Tìm kiếm phần mềm hoặc CVE…",
+      "cves": "Tìm kiếm mã CVE…"
+    },
+    "labels": {
+      "severity": "Mức độ nghiêm trọng"
+    },
+    "statusOptions": {
+      "open": "Mở",
+      "accepted": "Đã chấp nhận",
+      "mitigated": "Đã giảm thiểu",
+      "patched": "Đã vá",
+      "all": "Tất cả trạng thái"
+    },
+    "filters": {
+      "kevOnly": "Chỉ KEV",
+      "patchAvailable": "Có sẵn bản vá"
+    },
+    "expiring": {
+      "clearAria": "Xóa bộ lọc sắp hết hạn trong {{count}} ngày",
+      "clearAria_one": "Xóa bộ lọc sắp hết hạn trong {{count}} ngày",
+      "clearAria_other": "Xóa bộ lọc sắp hết hạn trong {{count}} ngày",
+      "label": "Sắp hết hạn trong {{count}} ngày",
+      "label_one": "Sắp hết hạn trong {{count}} ngày",
+      "label_other": "Sắp hết hạn trong {{count}} ngày"
+    }
+  },
+  "vulnerabilityFleetPage": {
+    "stats": {
+      "critical": {
+        "label": "Nghiêm trọng đang mở",
+        "detail": "{{count}} kết quả mở được đánh giá là nghiêm trọng",
+        "detail_one": "{{count}} kết quả mở được đánh giá là nghiêm trọng",
+        "detail_other": "{{count}} kết quả mở được đánh giá là nghiêm trọng"
+      },
+      "kev": {
+        "label": "Phơi nhiễm KEV",
+        "detail": "{{count}} CVE bị khai thác đã biết · {{deviceText}}",
+        "detail_one": "{{count}} CVE bị khai thác đã biết · {{deviceText}}",
+        "detail_other": "{{count}} CVE bị khai thác đã biết · {{deviceText}}",
+        "devices": "{{count}} thiết bị",
+        "devices_one": "{{count}} thiết bị",
+        "devices_other": "{{count}} thiết bị"
+      },
+      "patchReady": {
+        "label": "Đã có bản vá",
+        "detail": "{{count}} kết quả mở có bản vá đã duyệt sẵn sàng cài đặt",
+        "detail_one": "{{count}} kết quả mở có bản vá đã duyệt sẵn sàng cài đặt",
+        "detail_other": "{{count}} kết quả mở có bản vá đã duyệt sẵn sàng cài đặt"
+      },
+      "acceptedExpiring": {
+        "label": "Đã chấp nhận, sắp hết hạn",
+        "detail": "{{count}} kết quả đã chấp nhận sắp hết hạn trong vòng {{days}} ngày",
+        "detail_one": "{{count}} kết quả đã chấp nhận sắp hết hạn trong vòng {{days}} ngày",
+        "detail_other": "{{count}} kết quả đã chấp nhận sắp hết hạn trong vòng {{days}} ngày"
+      }
+    },
+    "tabs": {
+      "ariaLabel": "Chế độ xem lỗ hổng",
+      "software": "Theo phần mềm",
+      "cves": "Theo CVE"
+    }
+  },
+  "vulnerabilityTable": {
+    "errors": {
+      "load": "Không thể tải danh sách lỗ hổng"
+    },
+    "table": {
+      "cve": "CVE",
+      "severity": "Mức độ nghiêm trọng",
+      "cvss": "CVSS",
+      "risk": "Rủi ro",
+      "epss": "EPSS",
+      "patch": "Bản vá",
+      "affectedDevices": "Thiết bị bị ảnh hưởng",
+      "kev": "KEV",
+      "knownExploited": "Bị khai thác đã biết"
+    },
+    "help": {
+      "cvssAria": "Giới thiệu về điểm CVSS",
+      "riskAria": "Giới thiệu về điểm rủi ro",
+      "epssAria": "Giới thiệu về điểm EPSS",
+      "kevAria": "Giới thiệu về cờ KEV",
+      "patchAria": "Giới thiệu về cột Bản vá"
+    },
+    "actions": {
+      "openDetailsAria": "Mở chi tiết {{cveId}}"
+    },
+    "patch": {
+      "ready": "Sẵn sàng",
+      "update": "Cập nhật lên bản mới nhất"
+    },
+    "hasMore": "Hiển thị 500 CVE hàng đầu theo rủi ro — hãy thu hẹp bộ lọc để xem phần còn lại."
+  }
+}

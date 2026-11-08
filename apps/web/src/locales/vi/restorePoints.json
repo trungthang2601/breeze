@@ -1,0 +1,42 @@
+{
+  "badge": {
+    "requested": "Đang chờ thiết bị",
+    "created": "Đã xác nhận tạo điểm khôi phục {{time}}",
+    "createdNoTime": "Đã xác nhận tạo điểm khôi phục",
+    "existingAccepted": "Dùng lại điểm hiện có — được tạo cách đây {{age}} (giới hạn của Windows: mỗi {{limit}})",
+    "existingAcceptedAgeOnly": "Dùng lại điểm hiện có — được tạo cách đây {{age}}",
+    "existingAcceptedNoDetail": "Dùng lại điểm hiện có",
+    "skippedDisabled": "Đã bỏ qua — System Restore đã tắt trên thiết bị này",
+    "skippedDefinitionOnly": "Đã bỏ qua — chỉ cập nhật định nghĩa",
+    "skippedNoMutation": "Không cần — không có thay đổi nào được thực hiện nên không tạo điểm khôi phục",
+    "unsupported": "Không khả dụng trên thiết bị này",
+    "busy": "Đã bỏ qua — dịch vụ chụp nhanh ổ đĩa đang được sử dụng",
+    "insufficientPrivileges": "Đã bỏ qua — không đủ quyền",
+    "verificationFailed": "Không thể xác minh",
+    "failed": "Thất bại — {{message}}",
+    "failedNoMessage": "Thất bại",
+    "unknown": "Kết quả không được nhận dạng bởi phiên bản console này"
+  },
+  "list": {
+    "title": "System Restore",
+    "disclaimer": "System Restore không phải là bản sao lưu. Danh sách này ghi lại thời điểm Breeze yêu cầu Windows tạo điểm khôi phục và phản hồi từ thiết bị; điều này không đảm bảo điểm khôi phục tồn tại hoặc có thể khôi phục được.",
+    "loading": "Đang tải lịch sử System Restore…",
+    "loadError": "Không thể tải lịch sử System Restore.",
+    "retry": "Thử lại",
+    "empty": "Không có yêu cầu System Restore nào được ghi lại cho thiết bị này.",
+    "loadMore": "Tải thêm",
+    "loadingMore": "Đang tải…",
+    "loadMoreError": "Không thể tải thêm mục.",
+    "columns": {
+      "requested": "Đã yêu cầu",
+      "trigger": "Kích hoạt bởi",
+      "outcome": "Kết quả"
+    },
+    "trigger": {
+      "patch": "Cài đặt bản vá",
+      "script": "Chạy tập lệnh",
+      "software_install": "Cài đặt phần mềm"
+    },
+    "viewScriptRun": "Xem chạy tập lệnh"
+  }
+}

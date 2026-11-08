@@ -1,0 +1,24 @@
+{
+  "title": "Liên hệ phụ trách",
+  "subtitle": "Đã giải quyết cho bản ghi này. Các phân công cụ thể hơn sẽ được ưu tiên.",
+  "loading": "Đang tải liên hệ phụ trách…",
+  "loadFailed": "Không thể tải liên hệ phụ trách.",
+  "empty": "Chưa có liên hệ phụ trách nào được gán.",
+  "primary": "Chính",
+  "roles": {
+    "billing": "Thanh toán",
+    "technical": "Kỹ thuật",
+    "escalation": "Leo thang",
+    "admin": "Quản trị",
+    "site": "Liên hệ tại chỗ",
+    "after_hours": "Ngoài giờ",
+    "portal": "Cổng thông tin"
+  },
+  "scope": {
+    "organization": "Toàn bộ tổ chức",
+    "site": "Chi nhánh này",
+    "device_group": "Nhóm thiết bị"
+  },
+  "emptyCompact": "Không có liên hệ phụ trách",
+  "assign": "Gán"
+}

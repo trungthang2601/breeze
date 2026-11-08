@@ -1,0 +1,180 @@
+{
+  "title": "Phê duyệt",
+  "description": "Xem xét các hành động có tác động lớn đang chờ bạn quyết định.",
+  "loading": "Đang tải phê duyệt…",
+  "loadError": "Không thể tải phê duyệt. Thử lại.",
+  "retry": "Thử lại",
+  "empty": {
+    "title": "Không có phê duyệt nào đang chờ",
+    "description": "Các yêu cầu mới sẽ xuất hiện ở đây khi cần bạn quyết định."
+  },
+  "requestedBy": "Yêu cầu bởi {{client}}",
+  "proposedByAgent": "Đề xuất bởi {{agent}} (AI agent)",
+  "proposedByAgentExecuteNotice": "Phê duyệt việc này sẽ chạy ngay — không phải chạy thử, ngay cả ở chế độ ẩn.",
+  "targetDevice": "Thiết bị đích: {{hostname}}",
+  "batch": {
+    "approveAll": "Phê duyệt tất cả ({{count}})",
+    "declineAll": "Từ chối tất cả ({{count}})",
+    "groupTitle": "{{count}} yêu cầu tương tự · {{tool}}",
+    "moreHostnames": "+{{count}} mục khác",
+    "denyConfirmSummary": "Thao tác này từ chối {{count}} yêu cầu cho {{org}}."
+  },
+  "filters": {
+    "orgLabel": "Tổ chức",
+    "allOrganizations": "Tất cả tổ chức ({{count}})",
+    "orgOption": "{{name}} ({{count}} đang chờ)",
+    "searchLabel": "Tìm kiếm",
+    "searchPlaceholder": "Tìm theo hành động, máy tính hoặc agent…",
+    "sortLabel": "Sắp xếp theo",
+    "sortExpiringSoonest": "Hết hạn sớm nhất",
+    "sortNewest": "Mới nhất",
+    "showingLoaded": "Hiển thị {{shown}} trên tổng số {{loaded}} đã tải",
+    "clearFilters": "Xóa bộ lọc",
+    "noMatches": {
+      "title": "Không có phê duyệt nào khớp với bộ lọc của bạn",
+      "description": "Thử tổ chức hoặc từ khóa tìm kiếm khác, hoặc xóa bộ lọc của bạn."
+    }
+  },
+  "risk": {
+    "low": "Rủi ro thấp",
+    "medium": "Rủi ro trung bình",
+    "high": "Rủi ro cao",
+    "critical": "Rủi ro nghiêm trọng"
+  },
+  "denyPrompt": "Tại sao bạn từ chối yêu cầu này? Lý do là tùy chọn.",
+  "denyReasonPlaceholder": "Tùy chọn — chia sẻ với người yêu cầu",
+  "denyReasonShownToUserHint": "Người dùng cuối nhìn thấy nội dung này trong thông báo của họ (500 ký tự đầu).",
+  "confirmDeny": "Xác nhận từ chối",
+  "cancel": "Hủy",
+  "deny": "Từ chối",
+  "approve": "Phê duyệt",
+  "deciding": "Đang gửi…",
+  "expiresIn": "Hết hạn sau {{minutes}} phút",
+  "expiresSoon": "Hết hạn trong vòng chưa đầy một phút",
+  "expiresInHours": "Hết hạn sau {{hours}} giờ",
+  "expiresInDays": "Hết hạn sau {{days}} ngày",
+  "expired": "Đã hết hạn",
+  "unknownOrganization": "Tổ chức không xác định",
+  "intentNoLongerPending": "Phê duyệt đó không còn ở trạng thái chờ.",
+  "dismiss": "Bỏ qua",
+  "charCount": "{{count}}/{{max}}",
+  "approveToast": "Đã phê duyệt {{action}} cho {{org}}",
+  "pagination": {
+    "showing": "Hiển thị {{shown}} / {{total}}",
+    "showingCount": "Hiển thị {{shown}}",
+    "loadMore": "Tải thêm",
+    "loadMoreError": "Không thể tải thêm. Thử lại."
+  },
+  "errors": {
+    "noApproverDevice": "Đăng ký thiết bị phê duyệt trong hồ sơ của bạn, sau đó thử lại.",
+    "notSoleApprover": "Người phê duyệt đủ điều kiện khác phải quyết định yêu cầu này.",
+    "siteCeiling": "Phê duyệt này cấp quyền trên toàn tổ chức. Quyền của bạn chỉ giới hạn ở các chi nhánh cụ thể, vì vậy cần người phê duyệt khác quyết định.",
+    "verificationFailed": "Quá trình xác minh đã bị hủy hoặc thất bại. Thử lại.",
+    "alreadyDecided": "Yêu cầu này đã được quyết định.",
+    "expired": "Yêu cầu này đã hết hạn trước khi có thể được quyết định.",
+    "decisionFailed": "Không thể gửi quyết định. Thử lại.",
+    "batchStepUp": "Lô này cần đăng nhập bảo mật hơn. Phê duyệt từng yêu cầu một.",
+    "batchNotHomogeneous": "Các yêu cầu này không thể được quyết định cùng nhau nữa.",
+    "batchTooLarge": "Lô này có quá nhiều yêu cầu để quyết định cùng lúc. Hãy phê duyệt theo nhóm nhỏ hơn.",
+    "driftedFromBatch": "Yêu cầu này đã thay đổi và phải được quyết định riêng."
+  },
+  "registerDevice": "Đăng ký thiết bị",
+  "alwaysAllow": {
+    "button": "Phê duyệt và luôn cho phép",
+    "confirm": {
+      "title": "Phê duyệt và yêu cầu ủy quyền trước",
+      "message": "Thao tác này phê duyệt yêu cầu bạn đang xem ngay bây giờ. Thao tác này cũng yêu cầu người phê duyệt thứ hai ủy quyền trước {{opKey}} cho agent của tổ chức này, do đó nó chỉ áp dụng cho các lần chạy sau và không bao giờ ủy quyền cho yêu cầu này hoặc bất kỳ thứ gì đang chờ quyết định.",
+      "action": "Phê duyệt và yêu cầu"
+    },
+    "toasts": {
+      "requested": "Đã phê duyệt. Người phê duyệt thứ hai phải phê duyệt ủy quyền trước trước khi thao tác này chạy tự động và nó chỉ áp dụng cho các lần chạy trong tương lai."
+    },
+    "errors": {
+      "approvedPromoteFailed": "Đã phê duyệt, nhưng không thể gửi yêu cầu ủy quyền trước. Thử lại từ cài đặt của agent.",
+      "policyDecideDisabled": "Đã phê duyệt. Không thể yêu cầu ủy quyền trước vì tính năng này đã bị tắt đối với bản triển khai này."
+    }
+  },
+  "recent": {
+    "title": "Gần đây",
+    "subtitle": "Đã quyết định hoặc hoàn thành",
+    "loading": "Đang tải phê duyệt gần đây…",
+    "error": "Không thể tải các phê duyệt gần đây.",
+    "retry": "Thử lại",
+    "decisionReasonLabel": "Lý do từ người phê duyệt",
+    "empty": "Không có gì hoàn thành gần đây.",
+    "status": {
+      "failed": "Thất bại",
+      "rejected": "Đã từ chối",
+      "expired": "Đã hết hạn",
+      "cancelled": "Đã hủy",
+      "completed": "Đã hoàn thành",
+      "denied": "Đã từ chối",
+      "refused": "Đã phê duyệt, sau đó bị chặn",
+      "approved": "Đã phê duyệt",
+      "reported": "Đã báo cáo",
+      "unknown": "Không xác định"
+    }
+  },
+  "assuranceDefaultNotice": {
+    "upcomingTitle": "Thiết bị phê duyệt sẽ bắt buộc từ {{date}}",
+    "upcomingBody": "Chưa có lựa chọn bảo mật phê duyệt nào được lưu cho tài khoản đối tác của bạn, vì vậy áp dụng mặc định của nền tảng: từ {{date}}, việc phê duyệt yêu cầu rủi ro cao hoặc nghiêm trọng cần có thiết bị phê duyệt đã đăng ký thay vì chỉ một cú nhấp chuột. Hãy đăng ký thiết bị trước thời điểm đó để các phê duyệt không bị trì hoãn.",
+    "activeTitle": "Phê duyệt rủi ro cao cần thiết bị phê duyệt",
+    "activeBody": "Kể từ {{date}}, mặc định của nền tảng yêu cầu thiết bị phê duyệt đã đăng ký để phê duyệt các yêu cầu rủi ro cao và nghiêm trọng, do chưa có lựa chọn bảo mật phê duyệt nào được lưu cho tài khoản đối tác của bạn. Đó là lý do các phê duyệt này yêu cầu thiết bị của bạn.",
+    "settingsLink": "Xem xét bảo mật phê duyệt",
+    "registerLink": "Đăng ký thiết bị phê duyệt"
+  },
+  "diagnosticAccess": {
+    "title": "Truy cập chẩn đoán chỉ đọc",
+    "organization": "Tổ chức",
+    "device": "Thiết bị",
+    "access": "Truy cập",
+    "readOnlyOps": "Chỉ đọc: {{operations}}. Không ghi, xóa, đổi tên, chạy tập lệnh hoặc thay đổi registry.",
+    "duration": "Thời lượng",
+    "durationValue": "{{minutes}} phút kể từ khi phê duyệt",
+    "purpose": "Mục đích",
+    "requestedBy": "Yêu cầu bởi",
+    "principalUser": "Breeze AI",
+    "principalApiKey": "Khóa API MCP",
+    "principalOauth": "Kết nối OAuth MCP",
+    "paths": "Đường dẫn",
+    "recursive": "Toàn bộ nhánh con",
+    "thisFolderOnly": "Thư mục này và các tệp nằm trực tiếp bên trong",
+    "sensitiveHeading": "Các kho lưu trữ nhạy cảm được yêu cầu rõ ràng",
+    "noSensitive": "Các vị trí đã biết của mật khẩu và cookie trình duyệt, kho lưu trữ thông tin đăng nhập, khóa riêng tư và token được lưu trữ sẽ bị giữ lại, ngay cả bên trong các đường dẫn này. Đây là danh sách cố định; bất kỳ thứ gì khác bên trong các đường dẫn này đều có thể đọc được.",
+    "opList": "danh sách",
+    "opRead": "đọc",
+    "classes": {
+      "browser_secrets": "Mật khẩu trình duyệt, cookie và khóa mã hóa của chúng",
+      "credential_store": "Kho lưu trữ thông tin đăng nhập hệ điều hành",
+      "private_keys": "Khóa riêng tư (SSH, GnuPG, TLS)",
+      "session_tokens": "Token phiên và thông tin đăng nhập đám mây đã lưu"
+    }
+  },
+  "operatorPlan": {
+    "title": "Kế hoạch cho tác vụ AI",
+    "summary_one": "{{count}} hiệu ứng, bản sửa đổi kế hoạch {{revision}}",
+    "summary_other": "{{count}} tác động, bản sửa đổi kế hoạch {{revision}}",
+    "groupBreeze": "Thiết bị Breeze",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Bước {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Các tác động chạy theo thứ tự này. Việc đăng nhập bị vô hiệu hóa cuối cùng, do đó việc dừng sớm không bao giờ để lại thư chưa được định tuyến.",
+    "empty": "Kế hoạch này không chứa tác động nào.",
+    "invalid": "Không thể hiển thị đầy đủ kế hoạch này. Không phê duyệt."
+  },
+  "intentStatus": {
+    "title": "Trạng thái phê duyệt",
+    "waitingForApprovers": "Đang chờ người phê duyệt",
+    "notFound": "Không tìm thấy lượt phê duyệt đó.",
+    "status": {
+      "pending_approval": "Chờ phê duyệt",
+      "in_progress": "Đang thực hiện",
+      "completed": "Đã hoàn thành",
+      "failed": "Thất bại",
+      "rejected": "Đã từ chối",
+      "expired": "Đã hết hạn",
+      "cancelled": "Đã hủy"
+    }
+  }
+}
