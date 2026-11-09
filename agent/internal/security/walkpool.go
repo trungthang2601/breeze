@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 
 	"github.com/breeze-rmm/agent/internal/yarascan"
 )
@@ -90,7 +91,7 @@ type errCollector struct {
 func (c *errCollector) file(path string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.fatal {
+	if c.fatal && !isSkippableFileError(err) {
 		c.errs = append(c.errs, err)
 		return
 	}
@@ -413,4 +414,26 @@ func WalkAndMatch(ctx context.Context, paths []string, m yarascan.Matcher, o Wal
 	}
 	res, err := walkAndMatch(ctx, paths, options, m, cfg)
 	return WalkResult(res), err
+}
+
+// isSkippableFileError reports per-file errors that are expected on a live
+// system and must not fail the whole scan even under FileErrorsFatal: files
+// another process holds open with an exclusive share mode (Windows
+// ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION, e.g. the agent's own
+// agent.lock, Defender and search-index databases) and permission denials.
+// They are still counted in FilesFailed and logged like non-fatal errors.
+func isSkippableFileError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		var errno syscall.Errno
+		if errors.As(err, &errno) && (errno == 32 || errno == 33) {
+			return true
+		}
+	}
+	return false
 }
