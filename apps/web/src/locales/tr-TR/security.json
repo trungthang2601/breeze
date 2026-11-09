@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} tarama sıraya alındı",
     "securityScanManager": "Güvenlik Tarama Yöneticisi",
     "singleSelect": "Tek seçim",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} / {{total}} tarama isteği başarısız oldu",
     "startAScan": "Tarama Başlat",
     "startScan": "Taramayı başlat",

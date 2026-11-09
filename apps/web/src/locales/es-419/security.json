@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} escaneos en cola",
     "securityScanManager": "Administrador de escaneo de seguridad",
     "singleSelect": "selección única",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} de las solicitudes de escaneo {{total}} fallaron",
     "startAScan": "Iniciar un escaneo",
     "startScan": "Iniciar escaneo",

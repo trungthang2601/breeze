@@ -212,6 +212,19 @@ export default function SecurityScanManager() {
       setSelectedIds(first ? new Set([first]) : new Set());
     }
   };
+  const allIds = useMemo(() => devices.map((d) => d.deviceId), [devices]);
+  const onlineIds = useMemo(
+    () => devices.filter((d) => d.status !== "offline").map((d) => d.deviceId),
+    [devices],
+  );
+  const isSameSelection = (ids: string[]) =>
+    ids.length > 0 && ids.length === selectedIds.size && ids.every((id) => selectedIds.has(id));
+  // Shortcut buttons: switch to multi-select and pick the whole set; clicking the
+  // active shortcut again clears the selection.
+  const handleSelectGroup = (ids: string[]) => {
+    setSelectionMode("multi");
+    setSelectedIds(isSameSelection(ids) ? new Set() : new Set(ids));
+  };
   const startScan = async () => {
     if (selectedDevices.length === 0) return;
     setRunningScan(true);
@@ -446,7 +459,28 @@ export default function SecurityScanManager() {
                 {t("securitySecurityScanManager.loadingDevices")}
               </div>
             ) : (
-              <div className="mt-3 space-y-2">
+              <>
+              {devices.length > 1 && (
+                <div className="mt-3 flex flex-wrap gap-2" data-testid="scan-select-shortcuts">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectGroup(allIds)}
+                    disabled={runningScan}
+                    className={`rounded-md border px-2 py-1 text-xs disabled:opacity-50 ${isSameSelection(allIds) ? "border-primary bg-primary/10 text-primary" : "bg-background hover:bg-muted"}`}
+                  >
+                    {t("securitySecurityScanManager.selectAll", { count: allIds.length })}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectGroup(onlineIds)}
+                    disabled={runningScan || onlineIds.length === 0}
+                    className={`rounded-md border px-2 py-1 text-xs disabled:opacity-50 ${isSameSelection(onlineIds) ? "border-primary bg-primary/10 text-primary" : "bg-background hover:bg-muted"}`}
+                  >
+                    {t("securitySecurityScanManager.selectOnline", { count: onlineIds.length })}
+                  </button>
+                </div>
+              )}
+              <div className="mt-3 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
                 {devices.map((device) => (
                   <label
                     key={device.deviceId}
@@ -467,6 +501,7 @@ export default function SecurityScanManager() {
                   </label>
                 ))}
               </div>
+              </>
             )}
           </div>
 

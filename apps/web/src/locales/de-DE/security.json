@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} Scans in Warteschlange",
     "securityScanManager": "Sicherheitsscan-Manager",
     "singleSelect": "Einzelauswahl",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} von {{total}} Scan-Anfragen sind fehlgeschlagen",
     "startAScan": "Starten Sie einen Scan",
     "startScan": "Scan starten",

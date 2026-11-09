@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} scans queued",
     "securityScanManager": "Security Scan Manager",
     "singleSelect": "Single select",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} of {{total}} scan requests failed",
     "startAScan": "Start a Scan",
     "startScan": "Start scan",

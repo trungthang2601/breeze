@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} yêu cầu quét trong hàng đợi",
     "securityScanManager": "Trình quản lý quét bảo mật",
     "singleSelect": "Chọn đơn",
+    "selectAll": "Chọn tất cả ({{count}})",
+    "selectOnline": "Chỉ máy online ({{count}})",
     "someScanRequestsFailed": "{{failed}} trong tổng số {{total}} yêu cầu quét đã thất bại",
     "startAScan": "Bắt đầu quét",
     "startScan": "Bắt đầu quét",

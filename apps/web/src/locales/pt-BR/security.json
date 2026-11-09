@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} varreduras enfileiradas",
     "securityScanManager": "Gerenciador de varreduras de segurança",
     "singleSelect": "Seleção única",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} de {{total}} solicitações de varredura falharam",
     "startAScan": "Iniciar uma varredura",
     "startScan": "Iniciar varredura",

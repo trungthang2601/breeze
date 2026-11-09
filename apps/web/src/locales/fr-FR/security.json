@@ -743,6 +743,8 @@
     "scansQueuedCount_other": "{{count}} analyses mises en file d'attente",
     "securityScanManager": "Gestionnaire de balayage de sécurité",
     "singleSelect": "Sélection simple",
+    "selectAll": "Select all ({{count}})",
+    "selectOnline": "Online only ({{count}})",
     "someScanRequestsFailed": "{{failed}} demandes d’analyse sur {{total}} ont échoué",
     "startAScan": "Démarrez un scan",
     "startScan": "Démarrer le scan",
