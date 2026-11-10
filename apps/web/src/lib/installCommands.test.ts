@@ -79,23 +79,28 @@ describe('buildInstallCommands', () => {
       expect(windows.indexOf('SecurityProtocol')).toBeLessThan(windows.indexOf('Invoke-WebRequest'));
     });
 
-    it('downloads the agent from ghBase (our signed release), not the API route', () => {
-      // Fork override of upstream #4441: the API download route 302s to the
-      // UPSTREAM unsigned Windows binary, but our fleet needs the KResLab-signed
-      // one, so Windows downloads directly from our GitHub release (ghBase). The
-      // trust cert installed earlier in the one-liner covers SmartScreen.
+    it('downloads the agent from this server\'s API route', () => {
+      // Fork: the server runs BINARY_SOURCE=local with the KResLab binaries
+      // image, so the API route serves our signed binary, and branch sites
+      // reach the server more reliably than GitHub.
       const { windows } = buildInstallCommands(base);
       expect(windows).toContain(
-        `Invoke-WebRequest -Uri "${base.ghBase}/breeze-agent-windows-amd64.exe" -OutFile $exe`
+        `Invoke-WebRequest -Uri "${base.apiUrl}/api/v1/agents/download/windows/amd64" -OutFile $exe`
       );
-      expect(windows).not.toContain('/api/v1/agents/download/windows/amd64');
+      expect(windows).not.toContain('breeze-agent-windows-amd64.exe"');
+    });
+
+    it('only starts the service when it is not already running', () => {
+      const { windows } = buildInstallCommands(base);
+      expect(windows).toContain("if((Get-Service BreezeAgent -ErrorAction SilentlyContinue).Status -ne 'Running'){& $exe service start;");
+      expect(windows).toContain('throw "Breeze: service start failed (exit code $LASTEXITCODE)"');
     });
 
     it('checks $LASTEXITCODE after every agent invocation', () => {
       const { windows } = buildInstallCommands(base);
-      // Native exe failures do not throw in PowerShell — each of the three
-      // agent steps (service install, enroll, service start) needs a check.
-      expect(windows.match(/if\(\$LASTEXITCODE\)\{throw/g)).toHaveLength(3);
+      // Native exe failures do not throw in PowerShell — service install and
+      // enroll each need a check (service start has its own, see above).
+      expect(windows.match(/if\(\$LASTEXITCODE\)\{throw/g)).toHaveLength(2);
       expect(windows).toContain('enroll "enroll_abc123" --server "https://rmm.example.com"');
     });
 
@@ -272,8 +277,7 @@ describe('buildInstallCommands', () => {
     });
     expect(cmds.macos).toContain('https://rmm.example.com/api/v1/agents/install.sh');
     expect(cmds.macos).not.toContain('com//');
-    // Windows downloads our signed binary from ghBase, not the API route.
-    expect(cmds.windows).toContain('https://gh.example.com/dl/breeze-agent-windows-amd64.exe');
-    expect(cmds.windows).not.toContain('dl//');
+    expect(cmds.windows).toContain('"https://rmm.example.com/api/v1/agents/download/windows/amd64"');
+    expect(cmds.windows).not.toContain('com//');
   });
 });

@@ -704,6 +704,11 @@
   },
   "securitySecurityScanManager": {
     "scanStatus": {
+      "queued": "Queued",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "timed_out": "Timed out",
       "cancelled": "Cancelled",
       "expired": "Expired"
     },

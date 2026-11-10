@@ -233,17 +233,20 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `${winOsFloorCheck}; ` +
     `${winTlsCheck}; ` +
     `${winStageDir}; ` +
-    // Fork: our signed GitHub release, not upstream's API-route download (see
-    // ghBase's doc comment) — everything else adopts upstream's safe stage-dir
+    // Fork: download from this server's API route, which serves the signed
+    // kreslab binaries from the local binaries image (branch sites cannot
+    // always reach GitHub). Everything else adopts upstream's safe stage-dir
     // fix (#5898) so this never runs from a Defender-ASR-blocked cwd.
-    `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile $exe; ` +
+    `Invoke-WebRequest -Uri "${apiUrl}/api/v1/agents/download/windows/amd64" -OutFile $exe; ` +
     `${winMzCheck}; ` +
     `${winTrustCert}` +
     `${winWatchdog}` +
     `& $exe service install; ${winThrow('service install')}; ` +
     `${winUserHelper}` +
     `& $exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
-    `& $exe service start; ${winThrow('service start')}`;
+    // Fork: re-running the command on an enrolled machine must not fail just
+    // because the service is already running.
+    `if((Get-Service BreezeAgent -ErrorAction SilentlyContinue).Status -ne 'Running'){& $exe service start; if($LASTEXITCODE -and (Get-Service BreezeAgent).Status -ne 'Running'){throw "Breeze: service start failed (exit code $LASTEXITCODE)"}}`;
 
   return { windows, macos: unixCmd, linux: linuxBinaryUrl ? linuxUserCmd : unixCmd };
 }

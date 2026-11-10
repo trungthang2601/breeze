@@ -704,6 +704,11 @@
   },
   "securitySecurityScanManager": {
     "scanStatus": {
+      "queued": "Sırada",
+      "running": "Çalışıyor",
+      "completed": "Tamamlandı",
+      "failed": "Başarısız",
+      "timed_out": "Zaman aşımı",
       "cancelled": "İptal edildi",
       "expired": "Süresi doldu"
     },

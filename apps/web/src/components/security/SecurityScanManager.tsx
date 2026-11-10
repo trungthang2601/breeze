@@ -628,9 +628,7 @@ export default function SecurityScanManager() {
                   <div className="flex items-center justify-between text-sm font-medium">
                     <span>{scan.deviceName}</span>
                     <span className="capitalize">
-                      {t("securitySecurityScanManager.scanTypeLabel", {
-                        type: scan.scanType,
-                      })}
+                      {t(/* i18n-dynamic */ `securitySecurityScanManager.${scan.scanType}Scan`)}
                     </span>
                   </div>
                   <div className="mt-2 text-xs text-muted-foreground">
@@ -640,7 +638,7 @@ export default function SecurityScanManager() {
                   </div>
                   <div className="mt-2 text-xs text-muted-foreground capitalize">
                     {t("securitySecurityScanManager.status", {
-                      status: scan.status,
+                      status: t(/* i18n-dynamic */ `securitySecurityScanManager.scanStatus.${scan.status}`, { defaultValue: scan.status }),
                     })}
                   </div>
                 </div>

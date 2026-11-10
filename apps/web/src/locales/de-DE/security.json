@@ -704,6 +704,11 @@
   },
   "securitySecurityScanManager": {
     "scanStatus": {
+      "queued": "In Warteschlange",
+      "running": "Wird ausgeführt",
+      "completed": "Abgeschlossen",
+      "failed": "Fehlgeschlagen",
+      "timed_out": "Zeitüberschreitung",
       "cancelled": "Abgebrochen",
       "expired": "Abgelaufen"
     },

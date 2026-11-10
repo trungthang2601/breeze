@@ -704,6 +704,11 @@
   },
   "securitySecurityScanManager": {
     "scanStatus": {
+      "queued": "Đang chờ",
+      "running": "Đang chạy",
+      "completed": "Hoàn thành",
+      "failed": "Thất bại",
+      "timed_out": "Hết thời gian",
       "cancelled": "Đã hủy",
       "expired": "Đã hết hạn"
     },
