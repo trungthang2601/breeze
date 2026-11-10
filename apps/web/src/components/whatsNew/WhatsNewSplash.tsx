@@ -12,11 +12,12 @@ import {
   LAST_SEEN_KEY,
 } from '../../lib/whatsNewState';
 import type { WhatsNewEntry } from '../../lib/whatsNew';
+import { localizeWhatsNew } from '../../lib/whatsNewTranslations';
 
 export const REOPEN_EVENT = 'breeze:whats-new:open';
 
 export default function WhatsNewSplash() {
-  const { t } = useTranslation('common');
+  const { t, i18n } = useTranslation('common');
   const [entry, setEntry] = useState<WhatsNewEntry | null>(null);
   const [open, setOpen] = useState(false);
 
@@ -47,6 +48,8 @@ export default function WhatsNewSplash() {
   }, []);
 
   if (!entry) return null;
+  // Fork: show the release notes in the UI language when translated.
+  const shown = localizeWhatsNew(entry, i18n?.resolvedLanguage ?? i18n?.language);
 
   const gotIt = () => {
     markSeen(window.localStorage, entry.version);
@@ -67,9 +70,9 @@ export default function WhatsNewSplash() {
       <h2 id="whats-new-heading" className="text-lg font-semibold">
         {t('whatsNew.title', { version: entry.version })}
       </h2>
-      <p className="mt-1 text-sm text-muted-foreground">{entry.title}</p>
+      <p className="mt-1 text-sm text-muted-foreground">{shown.title}</p>
       <ul className="mt-4 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-        {entry.highlights.map((h, i) => (
+        {shown.highlights.map((h, i) => (
           <li key={i}>{h}</li>
         ))}
       </ul>
