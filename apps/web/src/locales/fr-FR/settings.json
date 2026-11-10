@@ -870,6 +870,7 @@
     "countries": {
       "select": "— Pays sélectionné —",
       "US": "États-Unis",
+      "VN": "Viêt Nam",
       "CA": "Canada",
       "MX": "Mexique",
       "GB": "Royaume-Uni",

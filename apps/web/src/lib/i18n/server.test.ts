@@ -38,7 +38,7 @@ describe('tServer', () => {
 
   it('discovers every supported locale bundle', () => {
     expect(serverBundleLocales).toEqual(
-      ['de-DE', 'en', 'es-419', 'fr-CA', 'fr-FR', 'it-IT', 'pt-BR', 'tr-TR'].sort(),
+      ['de-DE', 'en', 'es-419', 'fr-CA', 'fr-FR', 'it-IT', 'pt-BR', 'tr-TR', 'vi'].sort(),
     );
   });
 });

@@ -1910,7 +1910,7 @@
     "unknown": "không xác định"
   },
   "cisHardeningCisHardeningPage": {
-    "title": "Tiêu chuẩn CIS",
+    "title": "CIS Benchmarks",
     "description": "Cơ sở cấu hình, chấm điểm tuân thủ và theo dõi khắc phục.",
     "messages": {
       "loadFailed": "Không thể tải dữ liệu CIS"
@@ -2430,10 +2430,14 @@
       "installPending": "Cài đặt đang chờ",
       "awaitingVendorReport": "Đang chờ báo cáo từ nhà cung cấp",
       "awaitingEvaluation": "Đang chờ đánh giá",
-      "vendorOrgMismatch": "Nhà cung cấp báo cáo một tổ chức khác"
+      "vendorOrgMismatch": "Nhà cung cấp báo cáo một tổ chức khác",
+      "tenantAmbiguous": "Organization maps to more than one {{vendor}} company",
+      "installerLinkMissing": "Bitdefender GravityZone installer link not available yet — run Sync in Integrations"
     },
     "setupLink": {
       "installerMissing": "Tải lên trình cài đặt",
+      "tenantAmbiguous": "Fix the mapping",
+      "installerLinkMissing": "Open integrations",
       "default": "Mở thiết lập"
     }
   },

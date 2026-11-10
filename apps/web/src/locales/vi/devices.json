@@ -318,6 +318,10 @@
     "generatingToken": "Đang tạo mã thông báo...",
     "multiFactorAuthenticationIsRequiredTo3": "Yêu cầu xác thực đa yếu tố để tạo mã thông báo cài đặt.",
     "generateNewToken": "Tạo mã thông báo mới",
+    "generateNewLink": "Generate new link",
+    "cliTokenReuse": "Generated earlier. Valid until {{date}}, unless its device enrollments have all been used.",
+    "cliTokenReuseVerified": "Generated earlier. Valid until {{date}}.",
+    "linkReuse": "Generated earlier for {{platform}}. Valid until {{date}}.",
     "generateToken": "Tạo mã thông báo",
     "cliTokenNotGenerated": "Chưa có mã thông báo. Chọn chi nhánh, số lượng thiết bị và thời hạn, sau đó tạo mã thông báo. Mỗi mã thông báo là một khóa đăng ký trực tiếp.",
     "cliCommandNeedsToken": "Hãy tạo mã thông báo trước. Lệnh cài đặt sẽ xuất hiện ở đây khi có mã thông báo — cho đến lúc đó sẽ không có gì để chạy.",
@@ -430,6 +434,18 @@
         "message": "Xóa {{hostname}}? Thiết bị này sẽ bị đưa ra khỏi danh sách quản lý hoạt động và dừng giám sát. Lịch sử vẫn được giữ lại và bạn có thể khôi phục sau.",
         "confirm": "Xóa"
       },
+      "forcePermanentDelete": {
+        "confirm": "Delete anyway",
+        "reason": {
+          "agentReturned": "An uninstall completed earlier, but the agent has checked in since (it was reinstalled).",
+          "cancelled": "The agent uninstall was cancelled before it ran.",
+          "expired": "The agent never came back to collect the uninstall before it expired.",
+          "failed": "The uninstall command ran on the device but reported a failure.",
+          "none": "No agent uninstall was queued for this device (it was removed with the agent left installed)."
+        },
+        "risk": "Deleting {{hostname}} now can leave the agent installed and running with nobody managing it. This cannot be undone.",
+        "title": "The agent did not confirm removal"
+      },
       "permanentDelete": {
         "title": "Xóa vĩnh viễn {{hostname}}?",
         "message": "Thao tác này sẽ xóa toàn bộ lịch sử của thiết bị này — phiếu hỗ trợ, cảnh báo, bản vá và bản ghi sao lưu. Không thể hoàn tác.",
@@ -505,7 +521,10 @@
     "shutdown": "Tắt máy",
     "deviceSettings": "Cài đặt thiết bị",
     "installHomebrew": "Cài đặt Homebrew",
-    "restartAgent": "Khởi động lại tác nhân"
+    "restartAgent": "Khởi động lại tác nhân",
+    "runVendorUpdates": "Run vendor updates",
+    "runVendorUpdatesHint": "Run the manufacturer's update tool on this device.",
+    "runVendorUpdatesAgentUpgradeRequired": "Agent upgrade required: vendor updates need agent {{version}} or later"
   },
   "deviceActivityFeed": {
     "activity": "Hoạt động",
@@ -942,6 +961,8 @@
     "backupStatusJobsSnapshotsAndVerification": "Trạng thái sao lưu, tác vụ, bản chụp và xác minh",
     "theOsReportsAPendingReboot": "HĐH báo cáo trạng thái chờ khởi động lại (đăng ký Windows / cờ yêu cầu khởi động lại trên Linux).",
     "rebootPending": "Đang chờ khởi động lại",
+    "backupRunning": "Backup running",
+    "backupRunningTooltip": "A backup is running on this device. Open the Backup tab to see its progress.",
     "restartScheduled": "Đã lên lịch khởi động lại",
     "restartInProgress": "Đang khởi động lại",
     "restartScheduledFor": "Đã lên lịch khởi động lại vào {{time}}",
@@ -952,6 +973,7 @@
     "restartCannotBePostponed": "Không thể hoãn",
     "restartSourcePatchJob": "Được yêu cầu bởi bản cài đặt bản vá",
     "restartSourceMaintenanceWindow": "Được yêu cầu bởi cửa sổ bảo trì",
+    "restartSourceOemUpdates": "Requested by a vendor update run",
     "restartSourceManual": "Được yêu cầu bởi kỹ thuật viên",
     "restartSourceUnknown": "Khởi động lại theo lịch",
     "agentV": "Agent v",
@@ -1037,6 +1059,10 @@
       "label": "phê duyệt",
       "byRing": "được đặt bởi vòng cập nhật liên kết",
       "manualOnly": "chỉ phê duyệt thủ công (không liên kết vòng cập nhật)"
+    },
+    "containment": {
+      "extraDestinations": "Extra destinations while isolated",
+      "invalid": "This policy’s containment settings are not valid, so isolation uses the fixed defaults with no extra destinations."
     },
     "chainResolutionRule": "Cấp độ quyết định trước: Thiết bị vượt qua Nhóm thiết bị, sau đó đến Chi nhánh, Tổ chức và Đối tác. Ưu tiên (số nhỏ hơn thắng) chỉ dùng để phân định giữa các chính sách ở cùng cấp độ. Các tính năng bị gạch ngang đã bị ghi đè bởi chính sách gần hơn.",
     "featureOverriddenBy": "Bị ghi đè bởi {{policy}}"
@@ -1487,6 +1513,7 @@
     "cancel": "Hủy",
     "editDisplayName": "Sửa tên hiển thị",
     "serialNumber": "Số sê-ri",
+    "productSku": "Product Number",
     "manufacturer": "Nhà sản xuất",
     "model": "Model",
     "deviceRole": "Vai trò thiết bị",
@@ -1659,6 +1686,7 @@
       "ram": "RAM %",
       "lastSeen": "Hoạt động lần cuối",
       "serial": "Số Serial",
+      "productSku": "Product Number",
       "assetTag": "Thẻ tài sản",
       "location": "Vị trí",
       "source": "Nguồn"
@@ -1676,6 +1704,7 @@
       "ram": "Sắp xếp theo mức sử dụng RAM",
       "lastSeen": "Sắp xếp theo thời gian thấy gần nhất",
       "serial": "Sắp xếp theo số sê-ri",
+      "productSku": "Sort by product number",
       "assetTag": "Sắp xếp theo thẻ tài sản",
       "location": "Sắp xếp theo vị trí",
       "source": "Sắp xếp theo nguồn"
@@ -2121,6 +2150,8 @@
       "deferredUntil": "Tự động phê duyệt vào {{date}}",
       "deferredUntilTitle": "Vòng cập nhật {{ring}} giữ các bản vá mới trong thời gian hoãn. Bản vá này được phê duyệt vào {{date}} và sẽ cài đặt trong lần chạy bản vá theo lịch tiếp theo sau đó.",
       "excluded": "Đã bị loại trừ bởi chính sách",
+      "managedByVendorUpdates": "Managed by Vendor updates",
+      "managedByVendorUpdatesTitle": "The manufacturer's update tool delivers this on this device, so scheduled patch runs skip it.",
       "excludedSourceTitle": "Các nguồn của chính sách bản vá không bao gồm bản vá này, do đó các lần chạy theo lịch sẽ bỏ qua nó.",
       "excludedCategoryTitle": "Vòng cập nhật {{ring}} loại trừ danh mục của bản vá này, do đó các lần chạy theo lịch sẽ bỏ qua nó.",
       "excludedAppRuleTitle": "Quy tắc chặn hoặc ghim ứng dụng trên Vòng Cập Nhật liên kết đang giữ bản vá này, do đó các lần chạy theo lịch sẽ bỏ qua nó.",
@@ -2693,6 +2724,10 @@
       "bulkMaintenanceSuccess_other": "{{count}} thiết bị {{verb}} chế độ bảo trì",
       "bulkPurgeFailed": "Xóa vĩnh viễn thất bại: {{reason}}",
       "bulkPurgeNoneDeleted": "Không có thiết bị nào bị xóa: {{reasons}}",
+      "bulkPurgeSkipOther_one": "{{count}} skipped with reason {{code}}.",
+      "bulkPurgeSkipOther_other": "{{count}} skipped with reason {{code}}.",
+      "bulkPurgeSkipUninstallNotConfirmed_one": "{{count}} skipped because its agent never confirmed the uninstall. Delete it on its own from the device page.",
+      "bulkPurgeSkipUninstallNotConfirmed_other": "{{count}} skipped because their agents never confirmed the uninstall. Delete them one at a time from the device page.",
       "bulkWakeAllFailed": "Đánh thức hàng loạt tất cả thất bại",
       "bulkWakeSent": "Đã gửi đánh thức hàng loạt",
       "bulkWakeSomeFailed": "Đánh thức hàng loạt một số thất bại",
@@ -2759,8 +2794,8 @@
       "bulkMaintenanceSomeFailed_other": "{{count}} thiết bị {{verb}} chế độ bảo trì; thất bại {{failed}}: {{devices}}",
       "bulkPurgeDone_one": "Đã xóa vĩnh viễn {{count}} thiết bị",
       "bulkPurgeDone_other": "Đã xóa vĩnh viễn {{count}} thiết bị",
-      "bulkPurgeDoneWithSkips_one": "Đã xóa vĩnh viễn {{count}} thiết bị; đã bỏ qua {{skipped}} ({{reasons}})",
-      "bulkPurgeDoneWithSkips_other": "Đã xóa vĩnh viễn {{count}} thiết bị; đã bỏ qua {{skipped}} ({{reasons}})",
+      "bulkPurgeDoneWithSkips_one": "{{count}} device permanently deleted; {{reasons}}",
+      "bulkPurgeDoneWithSkips_other": "{{count}} devices permanently deleted; {{reasons}}",
       "bulkPurgeStarted_one": "Đang xóa vĩnh viễn {{count}} thiết bị…",
       "bulkPurgeStarted_other": "Đang xóa vĩnh viễn {{count}} thiết bị…",
       "bulkRestoreAllFailed_one": "Không thể khôi phục {{count}} thiết bị",
@@ -2780,7 +2815,8 @@
       "bulkMoveSiteNotMovedForbidden": "{{devices}} (bạn không có quyền truy cập vào chi nhánh của thiết bị hoặc chi nhánh đích)",
       "bulkMoveSiteNotMovedNotFound": "{{devices}} (không còn tìm thấy; thiết bị có thể đã bị xóa)",
       "bulkMoveSiteNotMovedError": "{{devices}} (đã xảy ra lỗi không mong muốn; vui lòng thử lại)",
-      "deviceMovedToSite": "{{hostname}} đã được chuyển đến chi nhánh mới"
+      "deviceMovedToSite": "{{hostname}} đã được chuyển đến chi nhánh mới",
+      "bulkWakeResult": "Sent to {{sent}}, skipped {{skipped}}"
     },
     "tryAgain": "Thử lại",
     "unknownDevice": "Không xác định",
@@ -2818,7 +2854,18 @@
     "emptyOrgTitleUnnamed": "Chưa có thiết bị nào trong tổ chức này",
     "emptyOrgDescription": "Cài đặt agent trên một máy trong tổ chức này để bắt đầu giám sát hoặc chuyển sang tất cả tổ chức để xem phần còn lại của hệ thống.",
     "viewAllOrganizations": "Xem tất cả tổ chức",
-    "importFromRmmShort": "Nhập"
+    "importFromRmmShort": "Nhập",
+    "wakeSkipReasons": {
+      "online": "already online",
+      "relayUnavailable": "with no online peer at their site",
+      "missingMac": "with no MAC on file (agent has not checked in)",
+      "missingSubnet": "with no usable IPv4 history",
+      "ipv6": "with IPv6 history only",
+      "relayDisconnected": "had relay disconnect mid-dispatch — retry",
+      "missingTarget": "not found or access denied",
+      "removed": "removed",
+      "invalidRelay": "with invalid relay override"
+    }
   },
   "filterAddDropdown": {
     "addFilter": "Thêm bộ lọc",
@@ -3832,7 +3879,7 @@
     "freshOf": "{{fresh}} mới trong tổng số {{total}}",
     "zeroCaveat": "Không phát hiện gì, nhưng có {{unknown}} thiết bị chưa quét gần đây — hãy kiểm tra lại trước khi coi như đã hoàn tất di chuyển.",
     "securityTitle": "Agent truy cập từ xa mồ côi",
-    "securityBody": "Các công cụ truy cập từ xa này cài đặt tách biệt khỏi RMM và vẫn tồn tại sau khi gỡ cài đặt RMM đó. Agent truy cập từ xa không có người giám sát là một mối nguy hiểm tiềm ẩn — hãy xem xét từng agent trước khi kết thúc quá trình chuyển đổi.",
+    "securityBody": "These remote-access tools install separately from an RMM and survive its uninstall. An unattended remote-access agent that nobody monitors is a standing exposure — review each one before closing out a migration.",
     "deviceCount_one": "{{count}} thiết bị",
     "deviceCount_other": "{{count}} thiết bị",
     "progressEnrolled_one": "{{count}} đã đăng ký trong Breeze",
@@ -4866,6 +4913,11 @@
       "isolation_not_found": "Không tìm thấy phiên cô lập này.",
       "relay_unavailable": "Không có sẵn máy chuyển tiếp máy tính từ xa. Hãy tắt tùy chọn chuyển tiếp hoặc cấu hình TURN.",
       "invalid_allowlist": "Danh sách cho phép cô lập của máy chủ không hợp lệ. Hãy liên hệ quản trị viên.",
+      "invalid_allowlist_server_url_missing": "This device has no agent server URL and AGENT_SERVER_URL is not set on the server. Set AGENT_SERVER_URL, then try again.",
+      "invalid_allowlist_server_url_invalid": "The agent server URL for this device is not a valid http(s) URL. Check the device’s server URL or AGENT_SERVER_URL.",
+      "invalid_allowlist_backup_url_invalid": "AGENT_BACKUP_SERVER_URL is not a valid http(s) URL. Correct it and try again.",
+      "invalid_allowlist_relay_config_invalid": "The TURN relay settings (TURN_HOST, TURN_TLS_HOST, TURN_PORT, TURN_TLS_PORT) are invalid. Correct them or turn off the relay option.",
+      "invalid_allowlist_policy_invalid": "The saved containment policy has an invalid or oversized allowlist entry. Review the policy’s allowed destinations.",
       "isolation_conflict": "Phiên cô lập đã thay đổi. Làm mới trạng thái và thử lại.",
       "isolation_secret_unavailable": "Mã khôi phục tạm thời không khả dụng. Hãy liên hệ quản trị viên.",
       "approval_mismatch": "Phê duyệt không khớp với yêu cầu cô lập này.",
@@ -4873,6 +4925,123 @@
       "device_decommissioned": "Thiết bị đã ngừng hoạt động không thể bắt đầu cô lập mới.",
       "device_pending_assignment": "Gán thiết bị này cho một tổ chức trước khi bắt đầu cô lập.",
       "backup_helper_update_required": "Cập nhật trình hỗ trợ sao lưu trước khi bắt đầu cô lập."
+    }
+  },
+  "runVendorUpdatesDialog": {
+    "title": "Run vendor updates",
+    "description": "Runs the {{vendor}} update tool on {{hostname}} now. It can install drivers and applications, and flash BIOS and firmware.",
+    "rebootLegend": "If the updates need a restart",
+    "whenFinishedLabel": "Reboot when finished",
+    "whenFinishedDescription": "Breeze restarts the device after the run, with the warning its patch policy sets. BIOS and firmware updates are included.",
+    "leaveToMeLabel": "Leave reboot to me",
+    "leaveToMeDescription": "Breeze does not restart the device. Someone restarts it later to finish the updates.",
+    "skippedNote": "BIOS and firmware updates are skipped with this choice, because they need a restart Breeze controls. Drivers and applications still run.",
+    "confirm": "Run updates",
+    "submitting": "Starting...",
+    "cancel": "Cancel",
+    "genericError": "Could not start vendor updates on this device.",
+    "queued": "Vendor updates started on {{hostname}}.",
+    "queuedSkipped": "Vendor updates started on {{hostname}}. BIOS and firmware were skipped.",
+    "refusal": {
+      "flagOff": "Vendor updates are not turned on for this organization.",
+      "laneClosed": "Vendor updates are not available yet for this device's manufacturer.",
+      "killSwitch": "Vendor updates are paused for this device's manufacturer.",
+      "agentTooOld": "This device's agent is too old for vendor updates. Update the agent to {{version}} or later.",
+      "notApplicable": "Vendor updates do not apply to this device.",
+      "notSupported": "The vendor's tool does not support this model.",
+      "ephemeral": "Vendor updates do not run on Quick Support devices.",
+      "parked": "Assign this device to an organization before running vendor updates.",
+      "offline": "The device is not online. Vendor updates only start on a device that is online now.",
+      "runInFlight": "A vendor update run is already in progress on this device.",
+      "noOpenCategories": "Nothing can run with this choice. BIOS and firmware are all that is available here: choose Reboot when finished.",
+      "decommissioned": "This device is decommissioned, so nothing can be sent to it.",
+      "cancelledAtClaim": "The run was cancelled before it reached the device. Try again."
+    }
+  },
+  "vendorUpdates": {
+    "title": "Vendor updates",
+    "refreshState": "Refresh",
+    "loadError": "Could not load vendor updates for this device.",
+    "retryLoad": "Try again",
+    "empty": "No vendor update has run on this device yet.",
+    "state": {
+      "upToDate": "Up to date",
+      "overdue": "Overdue",
+      "failing": "Failing",
+      "notSupported": "Not supported",
+      "notManaged": "Not managed",
+      "waitingForReboot": "Waiting for restart",
+      "rebootOverdue": "Restart overdue"
+    },
+    "stateDescription": {
+      "upToDate": "The last scheduled run finished.",
+      "overdue": "No run has finished since the schedule came due.",
+      "failing": "The last run did not finish. See below for what to do.",
+      "notSupported": "The vendor's tool does not support this model.",
+      "notManaged": "No policy schedules vendor updates here. You can still run them on demand.",
+      "notOffered": "Vendor updates are not available on this device right now.",
+      "waitingForReboot": "Updates are installed and take effect after the next restart.",
+      "rebootOverdue": "A restart has been waiting for more than three days."
+    },
+    "lastRunHeading": "Last run",
+    "outcomeLabel": "Outcome",
+    "noOutcomeYet": "Waiting for the device to report",
+    "errorCodeLabel": "Error code",
+    "toolVersionLabel": "Tool version",
+    "lastAttemptLabel": "Started",
+    "installedLabel": "Installed",
+    "failedLabel": "Failed",
+    "rebootLabel": "Restart",
+    "rebootPendingSince": "Restart needed since {{date}}",
+    "rebootNotNeeded": "No restart needed",
+    "outcome": {
+      "success": "Success",
+      "successRebootRequired": "Success, restart needed",
+      "noUpdates": "No updates found",
+      "partial": "Partly installed",
+      "failed": "Did not finish",
+      "notSupported": "Model not supported",
+      "toolUnavailable": "Tool unavailable",
+      "blockedOnBattery": "Blocked: on battery",
+      "blockedRebootPending": "Blocked: restart pending",
+      "blockedNoRecoveryKey": "Blocked: no recovery key",
+      "retryLater": "Will try again",
+      "interrupted": "Interrupted"
+    },
+    "outcomeHelp": {
+      "partial": "Some updates installed and some did not. Check the failed items below, then run vendor updates again.",
+      "failed": "The vendor's tool did not finish. Check the error code, then run vendor updates again.",
+      "notSupported": "The vendor's tool does not support this model, so Breeze stops asking until the tool version or the model changes.",
+      "toolUnavailable": "The vendor's update tool is not installed and could not be fetched. Check that the device can reach the vendor's download site.",
+      "blockedOnBattery": "BIOS and firmware only run on AC power with enough battery. Plug the device in, then run vendor updates again.",
+      "blockedRebootPending": "The device already has a restart waiting. Once it has restarted, run vendor updates again.",
+      "blockedNoRecoveryKey": "BIOS and firmware stay blocked until Breeze holds this device's current BitLocker recovery key. Back up the key to Breeze, then run vendor updates again.",
+      "retryLater": "The vendor's tool asked to try again later. Breeze did not change anything on the device.",
+      "interrupted": "The run stopped before it finished, usually because the device restarted or the agent stopped. Run vendor updates again."
+    },
+    "categoriesHeading": "What can run on this device",
+    "category": {
+      "bios": "BIOS",
+      "firmware": "Firmware",
+      "driver": "Drivers",
+      "application": "Applications"
+    },
+    "gateOpen": "Available",
+    "gateClosed": "Not available yet on {{vendor}}. Breeze turns on each update type only after testing it on real hardware.",
+    "itemResult": {
+      "installed": "installed",
+      "failed": "failed",
+      "skipped": "skipped"
+    },
+    "history": {
+      "heading": "Run history",
+      "loadError": "Could not load the run history.",
+      "noResult": "No readable result",
+      "bySchedule": "Schedule",
+      "byUnknown": "Unknown",
+      "range": "{{from}}-{{to}} of {{total}}",
+      "previousPage": "Previous",
+      "nextPage": "Next"
     }
   },
   "exportDeviceDetail": {

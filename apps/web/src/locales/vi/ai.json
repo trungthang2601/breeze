@@ -35,6 +35,7 @@
     "expired": "Yêu cầu đã hết hạn trước khi được quyết định.",
     "notSoleApprover": "Cần có người phê duyệt khác — bạn không thể tự phê duyệt yêu cầu của chính mình.",
     "siteCeiling": "Phê duyệt này cấp quyền trên toàn tổ chức. Quyền của bạn chỉ giới hạn ở các chi nhánh cụ thể, do đó cần người phê duyệt khác quyết định.",
+    "approverScopeRequired": "This approval affects every organization under the partner, so it needs a partner-level approver with access to all organizations.",
     "noApproverDevice": "Tự phê duyệt yêu cầu đòi hỏi Touch ID / Windows Hello.",
     "freshFactorRequired": "Kiểm tra này cần xác nhận passkey mới (Touch ID, Windows Hello hoặc khóa phần cứng) dành riêng cho lần phê duyệt này. Thử lại.",
     "registerDevice": "Đăng ký thiết bị này",
@@ -544,7 +545,26 @@
     "promoteDescription": "Mô tả (tùy chọn)",
     "ownerScopeOrganization": "Chỉ tổ chức này",
     "ownerScopePartner": "Tất cả tổ chức thuộc đối tác này",
-    "nameRequired": "Bắt buộc phải có tên."
+    "nameRequired": "Bắt buộc phải có tên.",
+    "reviewFailedTitle": "AI kiểm duyệt thất bại",
+    "reviewFailureUnknown": "Không có lý do nào được ghi lại.",
+    "overrideApproved": "Đã duyệt mà không qua kiểm duyệt AI",
+    "overrideExplain": "Trình kiểm duyệt không đưa ra kết luận nên chưa có gì kiểm tra script này. Bạn có thể đọc script ở trên và tự phê duyệt.",
+    "overrideRun": "Chạy không cần AI kiểm duyệt",
+    "overrideRunNotice": "Bạn đang phê duyệt script này chạy trên các thiết bị của nó mà không qua kiểm duyệt AI. Nhật ký kiểm toán sẽ ghi nhận việc này dưới tên bạn.",
+    "overrideRunConfirm": "Phê duyệt và chạy",
+    "overrideRunSuccess": "Đã gửi script tới các thiết bị",
+    "overrideRunUndelivered": "Số thiết bị không nhận script: {{count}}",
+    "overrideSave": "Lưu vào thư viện không cần AI kiểm duyệt",
+    "overrideSaveNotice": "Bạn đang lưu script này khi chưa có lần chạy được xác minh hay kiểm duyệt AI đạt yêu cầu. Nhật ký kiểm toán sẽ ghi nhận việc này dưới tên bạn.",
+    "overrideErrorExpired": "Đề xuất này đã hết hạn. Hãy yêu cầu đề xuất mới.",
+    "overrideErrorState": "Đề xuất này đã thay đổi. Hãy kiểm tra trạng thái hiện tại.",
+    "overrideErrorNotSoleApprover": "Script này cần một người khác với người yêu cầu phê duyệt.",
+    "overrideErrorStepUp": "Đối tác của bạn yêu cầu mức phê duyệt cao hơn mức màn hình này hỗ trợ.",
+    "overrideErrorNoDevice": "Không có thiết bị đích nào nhận script nên chưa có gì được chạy. Bạn có thể thử lại.",
+    "overrideErrorPolicy": "Chính sách dữ liệu AI không cho phép script này vì nó đọc đường dẫn hồ sơ người dùng.",
+    "overrideErrorStrict": "Để xác nhận các mẫu nguy hiểm này cần quyền ghi script và MFA, đồng thời phải đánh dấu tất cả các mẫu.",
+    "savedToLibrary": "Đã lưu vào thư viện script"
   },
   "aiRunCard": {
     "title": "Đã chạy phân tích",
@@ -557,8 +577,24 @@
       "failed": "thất bại",
       "cancelled": "đã hủy",
       "expired": "đã hết hạn",
-      "skipped": "đã bỏ qua"
-    }
+      "skipped": "đã bỏ qua",
+      "awaiting_approval": "awaiting approval"
+    },
+    "approvals": {
+      "pending_one": "{{count}} step is waiting for your approval",
+      "pending_other": "{{count}} steps are waiting for your approval",
+      "waiting": "Steps are waiting for your approval",
+      "review": "Review in Approvals"
+    },
+    "stepApprovals": {
+      "title": "Waiting for your approval",
+      "wispFor": "Wisp for {{name}}",
+      "approve": "Approve",
+      "deny": "Deny",
+      "waitingForApprover": "Waiting for an approver"
+    },
+    "continue": "Continue",
+    "continueMessage": "Continue troubleshooting run {{runId}}."
   },
   "aiModelPicker": {
     "chooseModel": "Chọn một mô hình",
@@ -581,7 +617,11 @@
     "thinking": "Đang suy nghĩ"
   },
   "aiThinking": {
-    "label": "Đang suy nghĩ… {{seconds}}s"
+    "label": "Đang suy nghĩ… {{seconds}}s",
+    "waitingApproval": "Waiting for your approval",
+    "waitingApprovalPhone": "Waiting for your approval (sent to your phone)",
+    "waitingOthers": "Waiting for another approver",
+    "openApprovals": "Open approvals"
   },
   "aiTurnModel": {
     "answeredBy": "Được trả lời bởi {{model}}",
@@ -634,7 +674,8 @@
       "alreadyOnPartner": "Wisp đã được bật cho tất cả các tổ chức.",
       "open": "Mở",
       "opening": "Đang mở…",
-      "grantEnded": "Wisp không còn bật cho phạm vi này. Xác nhận đó là bạn để bật lại."
+      "grantEnded": "Wisp không còn bật cho phạm vi này. Xác nhận đó là bạn để bật lại.",
+      "unattendedReadsTitle": "Turn on unattended reads"
     },
     "header": {
       "scopeAll": "Tất cả tổ chức",
@@ -657,8 +698,22 @@
     "settings": {
       "title": "Hạn mức và kiểm tra",
       "budget": "Hạn mức hàng ngày",
+      "budgetHelp": "Includes chat. When it is spent, background checks pause until 00:00 UTC and chat keeps working with a warning. The org AI budget still applies to chat.",
       "tick": "Kiểm tra sau mỗi (phút)",
-      "save": "Lưu"
+      "save": "Lưu",
+      "unattendedReads": {
+        "title": "Unattended reads",
+        "description": "When on, Wisp and its background runs do these without asking:",
+        "registryKey": "Read a registry key",
+        "registryValue": "Read a registry value",
+        "securityLog": "Search the Security event log",
+        "deviceNote": "Save a note about a device",
+        "applies": "Applies to new conversations and new background runs."
+      },
+      "summaryRefine": {
+        "title": "Model-written session notes",
+        "description": "When a conversation ends, the model writes what was concluded and what is still open. Each note is one model call and counts against Wisp's daily budget. When off, Wisp keeps a plain digest instead."
+      }
     },
     "focus": {
       "label": "Đang làm việc với",
@@ -699,10 +754,18 @@
       "paused": "Đã tạm dừng Wisp",
       "resumed": "Đã tiếp tục Wisp",
       "pauseFailed": "Không thể tạm dừng Wisp",
-      "resumeFailed": "Không thể tiếp tục Wisp"
+      "resumeFailed": "Không thể tiếp tục Wisp",
+      "unattendedReadsOn": "Unattended reads turned on",
+      "unattendedReadsOnFailed": "Couldn't turn on unattended reads",
+      "unattendedReadsOff": "Unattended reads turned off",
+      "unattendedReadsOffFailed": "Couldn't turn off unattended reads",
+      "summaryRefineOn": "Session notes turned on",
+      "summaryRefineOff": "Session notes turned off",
+      "summaryRefineFailed": "Couldn't change session notes"
     },
     "spend": {
       "meter": "{{spent}} / {{budget}} hôm nay",
+      "breakdown": "Background {{background}} · Chat {{chat}} · {{spent}} of {{budget}} today",
       "resets": "đặt lại sau {{hours}} giờ",
       "raise": "Tăng hạn mức hôm nay",
       "atCeiling": "Hạn mức hôm nay đã đạt giới hạn của gói.",
@@ -715,7 +778,7 @@
       "byYou": "Bạn đã tạm dừng Wisp. Wisp sẽ không kiểm tra hay nhắc nhở bạn cho đến khi bạn tiếp tục.",
       "partnerDisabled": "Wisp đã bị tắt đối với đối tác của bạn. Quản trị viên có thể bật lại.",
       "system": {
-        "budgetExhausted": "Đã tạm dừng bởi Breeze: đã dùng hết hạn mức hôm nay. Hạn mức sẽ đặt lại sau {{hours}} giờ.",
+        "budgetExhausted": "Over today's Wisp budget: background checks are paused until {{time}} UTC. Chat keeps working.",
         "budgetExhaustedNoTime": "Đã tạm dừng bởi Breeze: đã dùng hết hạn mức hôm nay.",
         "grantorAccessLost": "Đã tạm dừng bởi Breeze: quyền truy cập của bạn không còn bao gồm quyền này. Wisp sẽ tự động tiếp tục khi quyền truy cập của bạn được khôi phục.",
         "grantorSuspended": "Đã tạm dừng bởi Breeze: tài khoản của bạn bị đình chỉ. Wisp sẽ tự động tiếp tục khi việc đình chỉ được gỡ bỏ.",
@@ -839,14 +902,37 @@
     "post": {
       "brief": "Tóm tắt buổi sáng",
       "nudge": "Nhắc nhở",
+      "nudgeResolved": "Resolved",
       "digest": "Bản tin tổng hợp",
+      "checkIn": "Check-in",
       "summary": "Tóm tắt",
       "open": "Mở",
-      "unread": "Chưa đọc"
+      "unread": "Chưa đọc",
+      "specialistResult": "Specialist report",
+      "firstLook": "First look",
+      "couldntLook": "Couldn't look yet"
+    },
+    "checkIn": {
+      "runNow": "Run now",
+      "runNowMessage": "Go ahead with the check-in",
+      "scheduledAt": "Wisp will check back at {{time}}",
+      "cancel": "Cancel check-in",
+      "cancelled": "Check-in cancelled",
+      "cancelFailed": "Could not cancel the check-in."
     },
     "welcome": {
       "title": "Tôi đang xem xét {{scope}}.",
       "body": "Bản tóm tắt đầu tiên của bạn sẽ đến vào mỗi buổi sáng sau khi tôi xem qua. Hãy hỏi tôi bất cứ điều gì trong lúc chờ đợi.",
+      "firstLookTitle": "I've had a first look at {{scope}}.",
+      "firstLookBody": "What I found is in the post above. Ask me anything about it.",
+      "couldntLookTitle": "I couldn't look at {{scope}} yet.",
+      "couldntLookBody": "The post above says why and when I'll try again. Ask me anything in the meantime.",
+      "couldntLookChat": "The Wisp home says why and when I'll try again.",
+      "progress_one": "{{lookedAt}} of {{count}} organization looked at",
+      "progress_other": "{{lookedAt}} of {{count}} organizations looked at",
+      "progressQueued": "{{count}} queued",
+      "progressFailed": "{{count}} failed",
+      "briefAt": "Your morning brief goes out at {{time}} ({{timezone}}).",
       "suggestions": {
         "needsMe": {
           "label": "Hôm nay có việc gì cần tôi?",
@@ -871,7 +957,14 @@
       "workersEmpty": "Không có chuyên gia nào đang chạy.",
       "allRuns": "Tất cả các lần chạy",
       "details": "Chi tiết",
-      "ended": "Ủy quyền này đã kết thúc, do đó các vấn đề, tác vụ và hoạt động của nó không còn được hiển thị nữa."
+      "ended": "Ủy quyền này đã kết thúc, do đó các vấn đề, tác vụ và hoạt động của nó không còn được hiển thị nữa.",
+      "workerStatus": {
+        "queued": "Queued",
+        "running": "Running",
+        "awaiting_approval": "Awaiting approval",
+        "completed": "Completed",
+        "failed": "Failed"
+      }
     },
     "composer": {
       "placeholder": "Nhắn tin cho Wisp",
@@ -883,6 +976,33 @@
       "buttonPlain": "Hỏi AI về việc này",
       "draft": "Giới thiệu về {{label}}: ",
       "switchFocus": "Wisp đang tập trung vào {{from}}. Chuyển sang {{to}}?"
+    },
+    "plainChat": {
+      "new": "New plain chat",
+      "newDescription": "Breeze AI with every tool you have access to. Not Wisp.",
+      "wispDescription": "Wisp, under your grant",
+      "label": "Breeze AI · not Wisp"
+    },
+    "instruction": {
+      "remembered": "Remembered: {{text}}",
+      "conflictBanner": "Conflicts with a remembered instruction: “{{text}}”",
+      "enforcedForm": "Wisp will not propose: {{verb}} · {{targets}} · {{until}}",
+      "noEnd": "no end date",
+      "keep": "Keep",
+      "keepForOrg": "Keep for everyone at {{org}}",
+      "forget": "Forget",
+      "unmatched": "Saved as a note: I couldn't match every device name.",
+      "kept": "Kept",
+      "keptForOrg": "Kept for everyone at {{org}}",
+      "crossOrg": "These devices are in more than one organization, so this can only be kept for you.",
+      "actionFailed": "That didn't work. Try again.",
+      "verb": {
+        "reboot": "reboot",
+        "shutdown": "shut down",
+        "run_script": "run a script",
+        "patch_install": "install patches",
+        "any_change": "make any change"
+      }
     }
   },
   "wispConcerns": {

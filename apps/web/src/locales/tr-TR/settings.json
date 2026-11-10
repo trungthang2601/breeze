@@ -870,6 +870,7 @@
     "countries": {
       "select": "— Ülkeyi seçin —",
       "US": "Amerika Birleşik Devletleri",
+      "VN": "Vietnam",
       "CA": "Kanada",
       "MX": "Meksika",
       "GB": "Birleşik Krallık",

@@ -137,7 +137,7 @@ export default function FileEgressEventsTable({ deviceId, timezone }: Props) {
                   <td className="px-4 py-3">
                     <span className="inline-flex items-center gap-1.5 text-foreground">
                       {TYPE_ICON[e.egressType]}
-                      {t(`eventsTable.types.${e.egressType}`)}
+                      {t(/* i18n-dynamic */ `eventsTable.types.${e.egressType}`)}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-foreground" title={e.details?.filePath ?? undefined}>

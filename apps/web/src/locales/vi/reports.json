@@ -380,6 +380,7 @@
         "mrr_renewals": "MRR & gia hạn",
         "quote_win_rate": "Tỷ lệ chốt báo giá",
         "client_profitability": "Lợi nhuận khách hàng",
+        "ticket_sla_performance": "SLA performance",
         "backup_status": "Trạng thái sao lưu"
       },
       "threatDetection": {
@@ -409,6 +410,29 @@
         "noncompliant": "Không tuân thủ",
         "notMeasured": "N/A",
         "staleEnrolments": "Đăng ký cũ"
+      },
+      "slaPerformance": {
+        "priority": "Priority",
+        "ticketsOpened": "Tickets opened",
+        "firstResponse": "First response",
+        "resolution": "Resolution",
+        "target": "Target",
+        "measured": "Measured",
+        "withinSla": "% within SLA",
+        "median": "Median",
+        "mean": "Mean",
+        "varies": "varies",
+        "breaches": "Breaches",
+        "breachCount_one": "{{count}} breach",
+        "breachCount_other": "{{count}} breaches",
+        "unavailable": "This run’s SLA summary could not be read, so it cannot be shown here. Generate the report again.",
+        "notes": "What this measures",
+        "priorities": {
+          "urgent": "Urgent",
+          "high": "High",
+          "normal": "Normal",
+          "low": "Low"
+        }
       },
       "identityAccess": {
         "notMeasured": "N/A",
@@ -486,6 +510,7 @@
         "mrr_renewals": "MRR & gia hạn",
         "quote_win_rate": "Tỷ lệ chốt báo giá",
         "client_profitability": "Lợi nhuận khách hàng",
+        "ticket_sla_performance": "SLA performance",
         "backup_status": "Trạng thái sao lưu"
       },
       "runsTable": {
@@ -827,18 +852,19 @@
         },
         "devices": {
           "cpu": "CPU",
-          "gpu": "GPU",
-          "motherboard": "Bo mạch chủ",
           "hostname": "Tên máy",
           "last_seen": "Lần thấy cuối",
-          "ram": "RAM",
-          "disks": "Ổ đĩa",
           "os": "HĐH",
           "owner": "Chủ sở hữu",
           "patch_level": "Phiên bản Agent",
+          "product_number": "Product Number",
           "serial": "Số sê-ri",
           "site": "Chi nhánh",
-          "status": "Trạng thái"
+          "status": "Trạng thái",
+          "gpu": "GPU",
+          "motherboard": "Bo mạch chủ",
+          "ram": "RAM",
+          "disks": "Ổ đĩa"
         },
         "patches": {
           "approved_at": "Đã duyệt lúc",
@@ -1070,6 +1096,7 @@
         "mrr_renewals": "MRR & gia hạn",
         "quote_win_rate": "Tỷ lệ thắng báo giá",
         "client_profitability": "Khả năng sinh lời của khách hàng",
+        "ticket_sla_performance": "SLA performance",
         "backup_status": "Trạng thái sao lưu"
       },
       "schedules": {
@@ -1150,6 +1177,10 @@
         "quote_win_rate": {
           "name": "Tỷ lệ thắng báo giá",
           "description": "Tỷ lệ báo giá đã gửi được chốt thành công, tính trên mỗi cơ hội để báo giá được sửa đổi và gửi lại chỉ tính một lần. Tỷ lệ chính chỉ bao gồm các cơ hội đã chốt, đi kèm số lượng vẫn đang mở. Giá trị trước thuế, một bộ cho mỗi tiền tệ, không quy đổi."
+        },
+        "ticket_sla_performance": {
+          "name": "SLA performance",
+          "description": "Customer-ready response and resolution times against SLA, by priority, with breaches."
         },
         "client_profitability": {
           "name": "Khả năng sinh lời của khách hàng",
@@ -1309,6 +1340,12 @@
       "cancel": "Hủy",
       "createReport": "Tạo báo cáo"
     },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Include ticket subjects",
+      "includeSubjectsHelp": "Delivered reports are visible to every portal user of this organization. Leave off unless every user may see every ticket subject.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
     "clientProfitabilityOptions": {
       "groupBy": "Nhóm theo",
       "groupByDefault": "Mặc định cho phạm vi của báo cáo",
@@ -1349,8 +1386,7 @@
         "series": "Một báo cáo cho mỗi tổ chức",
         "seriesHint": "Một định nghĩa, với một bản sao riêng cho mọi tổ chức mà nó bao gồm, mỗi bản được gửi đến các liên hệ của tổ chức đó.",
         "combined": "Tất cả tổ chức kết hợp",
-        "combinedHint": "Một báo cáo kết hợp trên tất cả tổ chức của bạn, dành cho đội ngũ của bạn.",
-        "seriesUnavailableType": "Loại báo cáo này không thể được gửi dưới dạng mỗi tổ chức một báo cáo."
+        "combinedHint": "Một báo cáo kết hợp trên tất cả tổ chức của bạn, dành cho đội ngũ của bạn."
       },
       "schedule": {
         "label": "Tần suất gửi bản sao của mỗi tổ chức",

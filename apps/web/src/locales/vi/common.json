@@ -28,7 +28,7 @@
     "patches": "Bản vá",
     "vulnerabilities": "Lỗ hổng",
     "oneDrive": "OneDrive",
-    "aiForOffice": "Breeze AI cho Office",
+    "aiForOffice": "Breeze AI for Office",
     "networkMonitor": "Mạng",
     "jobs": "Tác vụ",
     "flows": "Quy trình",
@@ -41,7 +41,7 @@
     "sensitiveData": "Dữ liệu nhạy cảm",
     "peripherals": "Thiết bị ngoại vi",
     "fileEgress": "Truyền dữ liệu ra ngoài",
-    "cisBenchmarks": "Chuẩn CIS",
+    "cisBenchmarks": "CIS Benchmarks",
     "complianceBaselines": "Đường cơ sở tuân thủ",
     "quotes": "Báo giá",
     "invoices": "Hóa đơn",
@@ -904,7 +904,19 @@
       },
       "charKeysOn": "Phím tắt ký tự đang bật.",
       "charKeysOff": "Phím tắt ký tự đang tắt. Chỉ phím tắt Ctrl/Cmd hoạt động.",
-      "charKeysManage": "Thay đổi trong cài đặt hồ sơ"
+      "charKeysManage": "Thay đổi trong cài đặt hồ sơ",
+      "queueTitle": "Tickets queue",
+      "queueHint": "On the Tickets page, outside a text field.",
+      "queue": {
+        "next": "Next ticket",
+        "previous": "Previous ticket",
+        "open": "Open the ticket's full page",
+        "toggleBulk": "Add to or remove from the bulk selection",
+        "assignMe": "Assign to me",
+        "reply": "Write a reply",
+        "internal": "Write an internal note",
+        "resolve": "Resolve with a note"
+      }
     }
   },
   "migrationBanner": {
@@ -2866,6 +2878,9 @@
     "noneConfigured": "Chưa cấu hình {{source}}",
     "overriding": "Ghi đè {{source}}",
     "overridingWithValue": "Ghi đè {{source}} ({{value}})"
+  },
+  "inheritChoice": {
+    "inherit": "Inherit — {{value}} ({{source}})"
   },
   "fixMemoryPage": {
     "title": "Khắc phục bộ nhớ",

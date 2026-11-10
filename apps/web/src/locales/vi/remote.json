@@ -49,7 +49,8 @@
       "securityCheckToast": "Khởi chạy từ xa không khả dụng: kiểm tra bảo mật thất bại. Vui lòng liên hệ quản trị viên.",
       "securityPolicy": "Khởi chạy từ xa bị chặn bởi chính sách bảo mật",
       "server": "Khởi chạy từ xa thất bại: lỗi máy chủ. Vui lòng liên hệ quản trị viên.",
-      "vncTunnelFailed": "Không thể mở đường hầm VNC"
+      "vncTunnelFailed": "Không thể mở đường hầm VNC",
+      "providerUnavailable": "That remote tool is no longer available for this device. Refresh and try again."
     },
     "fallback": {
       "linuxFirstRun": "Trên Linux, hãy đặt tệp tải xuống thành tệp thực thi (chmod +x) và chạy một lần. Thao tác đó sẽ đăng ký trình xem để các phiên tự động mở từ lần sau trở đi.",
@@ -110,7 +111,14 @@
       "x11AuthFailed": "Không thể xác thực với máy chủ hiển thị (X authority)",
       "x11ConnectFailed": "Không thể kết nối với máy chủ hiển thị trên thiết bị này"
     },
-    "opensNewWindow": "(mở trong cửa sổ mới)"
+    "opensNewWindow": "(mở trong cửa sổ mới)",
+    "split": {
+      "builtInViewer": "Built-in viewer",
+      "connectWith": "Connect with {{name}}",
+      "connectWithBuiltIn": "Connect with the built-in viewer",
+      "menuLabel": "Choose how to connect",
+      "opensInBrowser": "Opens in a new browser tab"
+    }
   },
   "connectVncButton": {
     "creatingTunnel": "Đang tạo đường hầm...",
@@ -209,6 +217,7 @@
       "copy": "Sao chép",
       "delete": "Xóa",
       "download": "Tải xuống",
+      "mkdir": "New folder",
       "move": "Di chuyển",
       "purge": "Dọn dẹp",
       "restore": "Khôi phục",
@@ -250,6 +259,7 @@
     "emptyDirectory": "Thư mục Trống",
     "errors": {
       "copy": "Không thể sao chép",
+      "createFolder": "Failed to create folder",
       "delete": "Không thể xóa",
       "download": "Không thể tải xuống",
       "downloadTooLarge": "Tệp quá lớn để tải xuống ({{size}}). Trình duyệt tệp hỗ trợ truyền tệp tối đa {{max}}.",
@@ -264,6 +274,15 @@
     "home": "Trang chủ",
     "modified": "Đã sửa đổi",
     "moveTo": "Di chuyển Đến",
+    "newFolder": {
+      "action": "New folder",
+      "title": "New folder",
+      "nameLabel": "Folder name",
+      "location": "Will be created in {{path}}",
+      "created": "Created folder {{name}}",
+      "invalidName": "Folder names can't contain path separators or characters this device's file system doesn't allow.",
+      "nameExists": "A file or folder with this name already exists here."
+    },
     "selectedCount": "Số lượng Đã chọn",
     "size": "Kích thước",
     "title": "Trình quản lý Tệp",
@@ -318,7 +337,8 @@
     "title": "Trình quản lý Tiến trình",
     "totalCpu": "Tổng CPU",
     "pid": "PID",
-    "cpu": "CPU"
+    "cpu": "CPU",
+    "monitorThis": "Monitor this"
   },
   "proxyTunnelPage": {
     "errors": {
@@ -645,7 +665,8 @@
     "summary": "{{shown}} / {{total}} dịch vụ trên {{device}}",
     "title": "Tiêu đề",
     "windowsOnlyDescription": "Trình quản lý dịch vụ chỉ khả dụng trên thiết bị Windows. {{device}} đang chạy {{os}}.",
-    "windowsOnlyTitle": "Chỉ dành cho Windows"
+    "windowsOnlyTitle": "Chỉ dành cho Windows",
+    "monitorThis": "Monitor this"
   },
   "sessionHistory": {
     "columns": {

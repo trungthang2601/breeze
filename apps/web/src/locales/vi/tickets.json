@@ -139,7 +139,8 @@
       "tooLarge": "{{name}} lớn hơn 10 MB.",
       "sentWithoutAttachment_one": "Đã đăng ghi chú nhưng không thể thêm tệp đính kèm. Hãy thử lại hoặc xóa đi.",
       "sentWithoutAttachment_other": "Đã đăng ghi chú nhưng không thể thêm {{count}} tệp đính kèm. Hãy thử lại hoặc xóa đi."
-    }
+    },
+    "modeLabel": "Comment visibility"
   },
   "ticketFeed": {
     "empty": "Chưa có hoạt động nào.",
@@ -416,7 +417,18 @@
     },
     "filterByType": "Lọc theo loại",
     "allTypes": "Tất cả loại",
-    "showMerged": "Hiển thị đã gộp"
+    "showMerged": "Hiển thị đã gộp",
+    "shortcutsButton": "Shortcuts",
+    "announce": {
+      "ticket": "{{number}} {{subject}}, {{priority}} priority",
+      "ticketWithSla": "{{number}} {{subject}}, {{priority}} priority, {{sla}}",
+      "sla": {
+        "ok": "SLA {{relative}} left",
+        "atRisk": "SLA at risk, {{relative}} left",
+        "paused": "SLA paused, {{relative}} left",
+        "breached": "SLA breached"
+      }
+    }
   },
   "ticketWorkbench": {
     "notFound": "Không tìm thấy phiếu. Có thể phiếu đã bị xóa hoặc bạn không có quyền truy cập.",

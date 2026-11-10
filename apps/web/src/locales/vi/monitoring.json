@@ -43,6 +43,43 @@
       "description": "Gắn các bộ giám sát có sẵn vào chính sách."
     }
   },
+  "lifecycle": {
+    "autoResolveOn": "On",
+    "autoResolveOff": "Off",
+    "rearmLabel": "Re-arm",
+    "rearmNewEvidence": "New evidence",
+    "rearmAfterDelay": "After N minutes",
+    "rearmAfterMinutes_one": "After {{count}} minute",
+    "rearmAfterMinutes_other": "After {{count}} minutes",
+    "rearmDelayLabel": "Re-arm after (minutes)",
+    "rearmHelp": "New evidence: only an event the closed alert has not seen re-opens it. After N minutes: older events can also re-open it once N minutes have passed since it closed.",
+    "inheritOption": "Inherit ({{value}}, {{source}})",
+    "inheritOptionPlain": "Inherit",
+    "sources": {
+      "org": "Org default",
+      "partner": "Partner default",
+      "builtin": "Built-in default"
+    },
+    "errors": {
+      "cooldown": "Enter a whole number from 0 to 1440.",
+      "cooldownOrInherit": "Enter a whole number from 0 to 1440, or leave it blank to inherit.",
+      "rearmDelay": "Enter a whole number of minutes from 1 to 1440."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Lifecycle defaults",
+    "descriptionPartner": "The default for every organization's monitors. An organization can override it, and a monitor's own setting beats both.",
+    "descriptionOrg": "Overrides the partner default for this organization. Leave a field blank to inherit it. A monitor's own setting beats this.",
+    "readOnly": "You do not have permission to change the partner default.",
+    "saved": "Lifecycle defaults saved",
+    "saveAction": "Save defaults",
+    "overrideCount_one": "{{count}} monitor overrides this",
+    "overrideCount_other": "{{count}} monitors override this",
+    "errors": {
+      "load": "Could not load the lifecycle defaults.",
+      "save": "Could not save the lifecycle defaults."
+    }
+  },
   "editor": {
     "attachedToPolicy": "Đã tạo và gắn bộ giám sát vào chính sách",
     "titleNew": "Bộ giám sát mới",
@@ -53,11 +90,22 @@
     },
     "sections": {
       "watch": "Nội dung theo dõi",
-      "noise": "Mức độ & nhiễu",
+      "lifecycle": "Alert lifecycle",
       "respond": "Phản hồi",
       "notify": "Thông báo",
       "escalate": "Leo thang cho con người",
       "deployed": "Đã triển khai đến"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "This monitor overrides the org default ({{value}})",
+        "partner": "This monitor overrides the partner default ({{value}})",
+        "builtin": "This monitor overrides the built-in default ({{value}})",
+        "unknown": "This monitor overrides the inherited default."
+      },
+      "partnerWideHint": "An organization with its own default uses that instead of the inherited value shown here.",
+      "inheritedUnavailable": "Could not load the inherited values. You can still save.",
+      "windowWarning": "The event window ({{window}} min) is shorter than the cooldown ({{cooldown}} min). A new event during the cooldown can age out of the window before the alert re-opens."
     },
     "tabs": {
       "settings": "Cài đặt",
@@ -175,7 +223,20 @@
     "psaBoardDefault": "Sử dụng bảng của kết nối mặc định",
     "psaBoardHelp": "Phiếu cảnh báo cho màn hình này được tạo trên bảng này thay vì bảng mặc định của kết nối.",
     "psaBoardReadOnly": "Phiếu cảnh báo chuyển đến bảng PSA #{{id}}",
-    "psaBoardUnavailable": "Không thể tải bảng PSA, vì vậy tính năng ghi đè bảng tạm thời không khả dụng."
+    "psaBoardUnavailable": "Không thể tải bảng PSA, vì vậy tính năng ghi đè bảng tạm thời không khả dụng.",
+    "clearsWhen": {
+      "title": "Clears when",
+      "hint": "Clears only on an event logged after the alert's trigger event.",
+      "noneHint": "No recovery condition is set, so the alert clears once the trigger stops matching.",
+      "add": "Add a recovery condition",
+      "removeCondition": "Remove",
+      "keepCustom": "Keep the custom condition",
+      "customTitle": "Custom recovery condition (API)",
+      "customHint": "This condition was set through the API and can't be edited here. Saving keeps it as it is.",
+      "replaceCustom": "Replace",
+      "invalid": "One of the recovery condition's values isn't valid.",
+      "customUnusable": "This condition can't be evaluated, so this monitor's alerts won't auto-resolve. Replace it to fix this."
+    }
   },
   "kinds": {
     "composite": "Tổng hợp (tất cả hoặc bất kỳ phần nào)",

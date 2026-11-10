@@ -41,6 +41,7 @@
     "stalledTooltip": "Không nhận được dữ liệu trong {{minutes}} phút",
     "filesProgress": "{{done}} / {{total}} tệp",
     "speedValue": "{{value}}/s",
+    "etaValue": "about {{value}} left",
     "created": "Đã tạo",
     "updated": "Đã cập nhật",
     "files": "Tệp",
@@ -48,7 +49,6 @@
     "policyId": "ID Chính sách",
     "featureLinkId": "ID Liên kết tính năng",
     "errorLog": "Nhật ký lỗi",
-    "savings": "{{protected}} đã bảo vệ — {{uploaded}} đã tải lên",
     "errorCount_one": "{{count}} lỗi",
     "errorCount_other": "{{count}} lỗi",
     "failedCount_one": "{{count}} thất bại",
@@ -179,6 +179,7 @@
     "oneOrMoreVssWritersAreNotStable": "Một hoặc nhiều trình ghi VSS không ổn định. Xem xét trạng thái trình ghi mới nhất trước lần chạy tiếp theo.",
     "vssUnprotectedVolumes": "Đọc từ phân vùng trực tiếp, không phải bản sao ẩn VSS: {{volumes}}. Các tệp đang sử dụng trên các phân vùng này có thể đã bị bỏ qua hoặc được ghi nhận ở trạng thái không nhất quán.",
     "lastBackupFailed": "Sao lưu gần nhất thất bại",
+    "lastBackupFailedWithCategory": "Last backup failed: {{category}}",
     "lastBackupCompletedWithWarnings": "Sao lưu gần nhất hoàn thành với cảnh báo",
     "lastBackupCompletedWithErrors": "Sao lưu gần nhất hoàn thành với lỗi",
     "writer": "Trình ghi",
@@ -223,7 +224,26 @@
     "hold": "Giữ",
     "standard": "Tiêu chuẩn",
     "restorePointCount_one": "{{count}} điểm khôi phục",
-    "restorePointCount_other": "{{count}} điểm khôi phục"
+    "restorePointCount_other": "{{count}} điểm khôi phục",
+    "activePhase": {
+      "waiting_for_device": "Sent to the device, waiting for it to start",
+      "queued_on_device": "Waiting for another backup on this device to finish",
+      "resuming": "Resuming an interrupted backup",
+      "scanning": "Scanning files",
+      "backing_up": "Backing up"
+    },
+    "activeJobs": {
+      "title": "Backup in progress",
+      "processedOfTotal": "{{done}} of {{total}} processed",
+      "processed": "{{done}} processed",
+      "lastHeard": "Last heard from the device {{relative}}",
+      "mode": {
+        "file": "File backup",
+        "system_image": "System image backup",
+        "mssql": "SQL Server backup",
+        "hyperv": "Hyper-V backup"
+      }
+    }
   },
   "deviceVaultStatus": {
     "loadingVaultStatus": "Đang tải trạng thái vault...",
@@ -651,7 +671,19 @@
     "providerEnforcedImmutabilityCannotBeReleasedFromBreeze": "Tính bất biến do nhà cung cấp thực thi không thể gỡ bỏ từ Breeze.",
     "fileTree": "Cây tệp",
     "noFileTreeAvailable": "Không có cây tệp nào.",
+    "fileIndexBuilding": "Preparing this snapshot's file list. This can take a few minutes for large backups.",
     "fileIndexUnavailable": "Bản chụp này có các tệp, nhưng chỉ mục tệp không khả dụng nên không thể liệt kê ở đây.",
+    "fileIndexIntegrityFailed": "This snapshot failed its integrity check, so its files can't be listed.",
+    "fileIndexDeviceLocal": "This snapshot is stored on the device, and Breeze can't read its file list from there yet.",
+    "fileIndexRetry": "Try again",
+    "searchPlaceholder": "Search files in this snapshot",
+    "searchEmpty": "No files match",
+    "searchTimeout": "Searching took too long. Try again.",
+    "browseTimeout": "Listing this folder took too long. Try again.",
+    "searchLoadMore": "Load more",
+    "searchRestoreFile": "Restore this file",
+    "searchMinLength": "Type at least 2 characters",
+    "searchLoading": "Searching…",
     "path": "Đường dẫn:",
     "useTheRestoreWorkflowToRecoverOrExport": "Sử dụng quy trình khôi phục để phục hồi hoặc xuất tệp từ bản chụp này.",
     "select": "Chọn",
@@ -1068,7 +1100,8 @@
       "over_quota": "Vượt hạn mức",
       "no_selection": "Chưa chọn gì",
       "not_started": "Chưa bắt đầu",
-      "unknown": "Không rõ"
+      "unknown": "Không rõ",
+      "paused": "Paused"
     },
     "recency": {
       "never": "Không bao giờ",
@@ -1101,7 +1134,14 @@
       "used": "Đã dùng",
       "history": "28 ngày qua",
       "errors": "Lỗi",
+      "verifiedBootable": "Verified bootable",
       "agent": "Agent"
+    },
+    "verifiedBootable": {
+      "passed": "Passed",
+      "failed": "Failed",
+      "never_run": "Never run",
+      "not_applicable": "n/a"
     },
     "dataSource": {
       "files": "Tệp & thư mục",
@@ -1110,6 +1150,7 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare metal",
+      "image": "Disk image",
       "m365_mail": "Thư điện tử Microsoft 365",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
@@ -1130,6 +1171,7 @@
       "customer": "Khách hàng của nhà cung cấp",
       "lastSuccess": "Sao lưu thành công gần nhất",
       "lastSession": "Phiên gần nhất",
+      "bootCheck": "Last boot check",
       "unlink": "Hủy liên kết",
       "unlinkConfirm": "Hủy liên kết thiết bị nhà cung cấp này khỏi thiết bị Breeze? Thiết bị vẫn nằm trong sản phẩm sao lưu và có thể được liên kết lại.",
       "unlinkedToast": "Đã hủy liên kết thiết bị nhà cung cấp",
@@ -1184,5 +1226,71 @@
     "summary_one": "Đã bỏ qua {{count}} điểm phân tích cú pháp (reparse point): các điểm liên kết và điểm gắn kết không được theo dõi và không được khôi phục. Đây là hành vi bình thường, không phải lỗi.",
     "summary_other": "Đã bỏ qua {{count}} điểm phân tích cú pháp (reparse points): các điểm liên kết và điểm gắn kết không được theo dõi và không được khôi phục. Đây là hành vi bình thường, không phải lỗi.",
     "showDetails": "Hiện đường dẫn đã bỏ qua"
+  },
+  "failureCategory": {
+    "device_offline": {
+      "label": "Device offline",
+      "hint": "The device lost its connection to Breeze during the backup. Keep it powered on and online through the backup window."
+    },
+    "timeout": {
+      "label": "Stalled or timed out",
+      "hint": "The backup stopped making progress or ran past its time limit. Very large backups can need more than one window. Check the device's load and the size of the backup selection."
+    },
+    "storage": {
+      "label": "Storage problem",
+      "hint": "Breeze could not write to the backup destination, or the upload authorization expired. Test the storage configuration and check its credentials and free space."
+    },
+    "agent": {
+      "label": "Agent problem",
+      "hint": "The backup component on the device stopped unexpectedly. Update the agent and run the backup again. If it keeps happening, check the device's agent logs."
+    },
+    "configuration": {
+      "label": "Configuration problem",
+      "hint": "There was nothing valid to back up, or the backup configuration changed while the job was starting. Review the device's backup profile."
+    },
+    "source_access": {
+      "label": "Files could not be read",
+      "hint": "Some files were locked, in use, or not readable by the agent. Check the files listed below and the VSS status."
+    },
+    "cancelled": {
+      "label": "Cancelled",
+      "hint": "Stopped by a user, or by Breeze, before it finished."
+    },
+    "unknown": {
+      "label": "Other error",
+      "hint": "Breeze does not recognise this error yet. The full message is shown below."
+    },
+    "troubleshootingLink": "Troubleshooting guide"
+  },
+  "fullRunReason": {
+    "no_prior_snapshot": "First backup for this device and destination",
+    "base_expired": "The previous backup had expired under retention",
+    "storage_identity_changed": "The backup destination changed",
+    "backup_type_mismatch": "The previous backup was a different type",
+    "base_job_not_completed": "No earlier backup finished successfully",
+    "base_retired": "The previous backup was removed by retention",
+    "base_retired_race": "The previous backup was removed by retention",
+    "base_deleted_race": "The previous backup was removed by retention",
+    "no_verified_base": "No earlier backup passed integrity verification",
+    "key_root_changed": "The destination folder (prefix) changed",
+    "base_key_root_unreadable": "The previous backup's storage location could not be read",
+    "invalid_destination_prefix": "The destination prefix is invalid",
+    "nothing_reused": "An earlier backup was available, but no unchanged files could be reused",
+    "unrecorded": "Reason not recorded (this backup ran before Breeze tracked it)"
+  },
+  "jobDataSummary": {
+    "uploadedAndReused": "{{uploaded}} uploaded · {{reused}} reused",
+    "processedBeforeStopped": "{{processed}} processed before it stopped",
+    "full": "Full",
+    "heading": "What this run stored",
+    "protected": "Protected",
+    "uploadedThisRun": "Uploaded this run",
+    "reusedFromEarlier": "Reused from earlier backups",
+    "backupType": "Backup type",
+    "incremental": "Incremental",
+    "fullWithReason": "Full — {{reason}}",
+    "explainer": "Only new or changed files are uploaded. Unchanged files are reused from earlier backups made by this device to the same destination.",
+    "learnMore": "How incremental backups work",
+    "resumedAt": "This run resumed an interrupted backup at {{time}}."
   }
 }

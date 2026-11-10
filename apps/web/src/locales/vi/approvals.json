@@ -69,6 +69,7 @@
     "noApproverDevice": "Đăng ký thiết bị phê duyệt trong hồ sơ của bạn, sau đó thử lại.",
     "notSoleApprover": "Người phê duyệt đủ điều kiện khác phải quyết định yêu cầu này.",
     "siteCeiling": "Phê duyệt này cấp quyền trên toàn tổ chức. Quyền của bạn chỉ giới hạn ở các chi nhánh cụ thể, vì vậy cần người phê duyệt khác quyết định.",
+    "approverScopeRequired": "This approval affects every organization under the partner, so it needs a partner-level approver with access to all organizations.",
     "verificationFailed": "Quá trình xác minh đã bị hủy hoặc thất bại. Thử lại.",
     "alreadyDecided": "Yêu cầu này đã được quyết định.",
     "expired": "Yêu cầu này đã hết hạn trước khi có thể được quyết định.",

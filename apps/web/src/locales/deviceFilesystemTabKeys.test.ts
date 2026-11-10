@@ -15,8 +15,8 @@ const locales = readdirSync(localesDir, { withFileTypes: true })
   .map((entry) => entry.name);
 
 describe('deviceFilesystemTab locale hygiene', () => {
-  it('covers all eight locales', () => {
-    expect(locales.length).toBe(8);
+  it('covers all nine locales (fork adds vi)', () => {
+    expect(locales.length).toBe(9);
   });
 
   for (const locale of locales) {

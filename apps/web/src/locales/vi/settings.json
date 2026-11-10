@@ -266,7 +266,17 @@
     }
   },
   "partnerAiBudgets": {
-    "enable": "Bật thực thi ngân sách AI",
+    "aiAccess": "AI for all organizations",
+    "aiAccessOptions": {
+      "notSet": "Not set, each organization decides",
+      "on": "On for every organization",
+      "off": "Off for every organization"
+    },
+    "aiAccessHelp": "This is the AI on/off switch for your clients, not a budget setting. When set, it replaces each organization's own AI switch. The budget fields below apply either way.",
+    "offWarning": "AI is off for every organization under this partner. Chat, the helper, Office add-ins, AI agents and enrichment are refused until you change this.",
+    "offConfirmTitle": "Turn off AI for every organization?",
+    "offConfirmMessage": "Every organization under this partner loses AI: chat, the helper, Office add-ins, AI agents and enrichment are refused, and organizations can't turn it back on themselves. Nothing changes until you save.",
+    "offConfirmAction": "Turn off AI",
     "monthlyBudget": "Ngân sách hàng tháng ($)",
     "dailyBudget": "Ngân sách hàng ngày ($)",
     "approvalMode": "Chế độ phê duyệt",
@@ -1122,6 +1132,10 @@
       "knownGuests": {
         "label": "Khách quen",
         "description": "Thiết bị khách và kỹ thuật viên được phê duyệt theo địa chỉ MAC"
+      },
+      "customerPortal": {
+        "label": "Customer portal",
+        "description": "Default sign-in and registration rules for your customers' portals, and access requests waiting for a decision"
       }
     },
     "saved": "Đã lưu cài đặt đối tác",
@@ -1191,6 +1205,7 @@
       "badge": {
         "locks": "Khóa tổ chức",
         "locksConditional": "Khóa tổ chức khi được bật",
+        "locksWhenSet": "Locks orgs when set",
         "overridable": "Tổ chức có thể ghi đè",
         "overridableCap": "Tổ chức có thể ghi đè, tối đa {{limit}}",
         "partnerOnly": "Trên toàn đối tác"
@@ -1198,6 +1213,7 @@
       "badgeHelp": {
         "locks": "Khi được đặt, mọi tổ chức đều sử dụng giá trị của bạn. Giá trị riêng của tổ chức sẽ bị bỏ qua.",
         "locksConditional": "Khi bật, mọi tổ chức sử dụng giá trị của bạn thay vì giá trị của chính họ. Khi tắt, các tổ chức sử dụng giá trị riêng.",
+        "locksWhenSet": "Once you set a value, every organization uses it and its own value is ignored. While empty, each organization configures its own.",
         "overridable": "Giá trị của bạn là mặc định. Tổ chức tự đặt giá trị sẽ sử dụng giá trị đó thay thế.",
         "overridableCap": "Giá trị của bạn là mặc định. Tổ chức có thể tự đặt giá trị, tối đa {{limit}}.",
         "partnerOnly": "Các tổ chức không có cài đặt riêng. Giá trị của bạn áp dụng cho tất cả."
@@ -1733,7 +1749,20 @@
     "scopeMailbox": "Giới hạn phạm vi hộp thư này (Chính sách Truy cập Ứng dụng)",
     "reauthRequired": "Quản trị viên cần đồng thuận lại trước khi quá trình lấy thư và trả lời của Microsoft 365 tiếp tục.",
     "pollFailing": "{{failures}} lần kiểm tra gần đây nhất của hộp thư này đã thất bại với lỗi Microsoft 365 tạm thời. Breeze tiếp tục thử lại; thư mới sẽ được nhận khi Microsoft 365 phản hồi trở lại.",
+    "baselineRunning": "Reading this inbox to set a starting point. Mail already in it will not be imported; only mail received after you connected becomes tickets.",
+    "baselineSkipped_one": "{{count}} message already in this inbox will not be imported. Only mail received after you connected becomes tickets.",
+    "baselineSkipped_other": "{{count}} messages already in this inbox will not be imported. Only mail received after you connected becomes tickets.",
     "retest": "Kiểm tra lại",
+    "gatewayTitle": "Mail gateway (optional)",
+    "gatewayHint": "If mail reaches this mailbox through an inline gateway such as Avanan, Mimecast, Proofpoint or Barracuda, Microsoft's own check may fail legitimate mail. List the gateway's ARC sealing domain, the d= value in the ARC-Seal header of a message it delivered, and Breeze uses the gateway's verdict instead. Leave this empty if you have no gateway.",
+    "gatewayWarning": "Only add a gateway that all of this tenant's inbound mail is forced through: first restrict inbound delivery in Exchange to the gateway with a connector. Otherwise Breeze can't tell mail the gateway delivered from mail sent directly to Exchange.",
+    "gatewayLabel": "Trusted ARC sealing domains",
+    "gatewayPlaceholder": "gateway.example.com",
+    "gatewaySave": "Save gateway list",
+    "gatewaySaved": "Mail gateway list saved",
+    "gatewaySaveFailed": "Could not save the mail gateway list.",
+    "gatewayInvalid": "\"{{value}}\" is not a domain name.",
+    "gatewayTooMany": "Enter at most {{max}} domains.",
     "reconnect": "Kết nối lại",
     "disconnect": "Ngắt kết nối",
     "empty": "Chưa kết nối hộp thư nào.",
@@ -1831,7 +1860,8 @@
       "load": "Không thể tải chính sách bảo mật phê duyệt.",
       "save": "Không thể lưu chính sách bảo mật phê duyệt.",
       "unavailable": "Không có chính sách khả dụng."
-    }
+    },
+    "scopeNote": "These settings apply to every organization under your partner account."
   },
   "orgAuditRetentionSettings": {
     "title": "Thời gian lưu trữ nhật ký kiểm toán",
@@ -1860,13 +1890,18 @@
     "description": "Tùy chỉnh trải nghiệm cổng thông tin cho {{organization}}.",
     "save": "Lưu thương hiệu",
     "saved": "Đã lưu cài đặt thương hiệu.",
+    "saveError": "Failed to save branding.",
     "managedByPartner": "Quản lý bởi đối tác",
     "logo": {
       "title": "Logo",
       "previewAlt": "Xem trước logo tổ chức",
       "uploadNew": "Tải lên logo mới",
-      "recommendation": "SVG hoặc PNG, khuyên dùng 512x512",
-      "selected": "Đã chọn: {{name}}"
+      "selected": "Đã chọn: {{name}}",
+      "help": "Shown in this organization's customer portal and on its quotes, invoices and reports. Leave empty to use the partner's logo.",
+      "inheritedSource": "Partner logo",
+      "remove": "Remove",
+      "loadError": "Could not load the saved logo. Uploading is disabled until this loads.",
+      "legacyNotice": "This logo was saved earlier but was never shown to customers. Save to start using it, or remove it."
     },
     "colors": {
       "primary": "Màu chính",
@@ -1874,42 +1909,16 @@
       "primaryInheritedSource": "Màu thương hiệu đối tác",
       "primaryHelp": "Màu điểm nhấn trên báo giá, hóa đơn và tài liệu khách hàng khác của tổ chức này. Để trống để sử dụng màu thương hiệu của đối tác.",
       "primaryInvalid": "Nhập mã màu hex như #2563eb.",
-      "primaryLoadError": "Không thể tải màu chính đã lưu. Tính năng chỉnh sửa bị vô hiệu hóa cho đến khi tải xong."
-    },
-    "theme": {
-      "title": "Giao diện",
-      "description": "Hệ thống tuân theo tùy chọn hệ điều hành của người dùng khi có.",
-      "options": {
-        "light": "Sáng",
-        "dark": "Tối",
-        "system": "Hệ thống"
-      }
-    },
-    "subdomain": {
-      "title": "Subdomain của cổng thông tin",
-      "previewUrl": "URL xem trước khả dụng: {{url}}"
+      "primaryLoadError": "Không thể tải màu chính đã lưu. Tính năng chỉnh sửa bị vô hiệu hóa cho đến khi tải xong.",
+      "secondaryInheritedSource": "Partner secondary color",
+      "secondaryHelp": "Heading color on this organization's quote PDFs, when dark enough to read, and accent color on its report PDFs. Leave blank to use the partner's secondary color.",
+      "secondaryLoadError": "Could not load the saved secondary color. Editing is disabled until this loads."
     },
     "customCss": {
       "title": "CSS tùy chỉnh (nâng cao)",
       "description": "Sử dụng kiểu tùy chỉnh để tinh chỉnh khoảng cách, phông chữ hoặc bố cục.",
-      "saveError": "Không thể lưu CSS tùy chỉnh.",
       "loadError": "Không thể tải CSS tùy chỉnh hiện được lưu của bạn. Tính năng chỉnh sửa bị vô hiệu hóa cho đến khi tải xong.",
       "saveBlockedByLoadError": "CSS tùy chỉnh chưa được lưu: không thể xác minh giá trị hiện tại. Tải lại trang và thử lại."
-    },
-    "preview": {
-      "action": "Xem trước",
-      "title": "Xem trước cổng thông tin",
-      "description": "Bản nháp trực tiếp dựa trên các đầu vào thương hiệu hiện tại",
-      "close": "Đóng xem trước",
-      "logoAlt": "Xem trước logo",
-      "portalName": "Cổng thông tin {{organization}}",
-      "welcome": "Chào mừng trở lại",
-      "body": "Bản xem trước này phản ánh bản nháp thương hiệu cổng thông tin hiện tại của bạn, bao gồm màu sắc và lựa chọn logo.",
-      "openTicket": "Mở phiếu hỗ trợ",
-      "viewDevices": "Xem danh sách thiết bị",
-      "urlLabel": "URL xem trước",
-      "cssPayload": "Dữ liệu CSS tùy chỉnh",
-      "noCustomCss": "/* Không có CSS tùy chỉnh */"
     }
   },
   "orgDefaultsEditor": {
@@ -2322,7 +2331,8 @@
     "actions": {
       "resend": "Gửi lại",
       "reactivate": "Kích hoạt lại",
-      "sendInvite": "Gửi lời mời"
+      "sendInvite": "Gửi lời mời",
+      "grantBrowserAccess": "Give browser access"
     },
     "fields": {
       "nameOptional": "Tên (tùy chọn)",
@@ -2344,13 +2354,19 @@
       "inviteResent": "Đã gửi lại lời mời",
       "reactivated": "Đã kích hoạt lại người dùng",
       "disabled": "Đã vô hiệu hóa người dùng",
-      "removed": "Đã xóa người dùng"
+      "removed": "Đã xóa người dùng",
+      "browserAccessGranted": "Browser access granted"
     },
     "errors": {
       "load": "Không thể tải người dùng cổng thông tin.",
       "sendInvite": "Gửi lời mời thất bại",
       "action": "Thao tác thất bại",
       "invalidEmail": "Nhập địa chỉ email hợp lệ"
+    },
+    "badges": {
+      "noBrowserAccess": "No browser access",
+      "microsoft": "Microsoft sign-in",
+      "google": "Google sign-in"
     }
   },
   "orgRemoteAccessSettings": {
@@ -2748,6 +2764,7 @@
       "helpdesk": "Tiếp nhận phiếu hỗ trợ và đề xuất phản hồi cùng các bước tiếp theo.",
       "designer": "Đọc toàn bộ thiết bị và viết thiết kế giám sát hợp lý để kỹ thuật viên phê duyệt.",
       "research": "Tích hợp sẵn. Nghiên cứu một sự cố trên một thiết bị khi kỹ thuật viên yêu cầu và đề xuất các bản sửa lỗi an toàn. Không bao giờ chạy bất kỳ lệnh nào.",
+      "troubleshoot": "Built in. Works one device in the background when Wisp hands it off. Every change it wants is a request a person approves.",
       "researchLink": "Mở bộ nhớ sửa lỗi",
       "designerLink": "Mở thiết kế thiết bị"
     },
@@ -2896,7 +2913,8 @@
       "patch": "Quản lý bản vá",
       "helpdesk": "Hỗ trợ kỹ thuật",
       "designer": "Trình thiết kế đội thiết bị",
-      "research": "Nghiên cứu khắc phục"
+      "research": "Nghiên cứu khắc phục",
+      "troubleshoot": "Device troubleshooting"
     },
     "modes": {
       "off": "Tắt",
@@ -2967,7 +2985,8 @@
       "enabledHint": "Bật và chế độ là hai công tắc riêng biệt và một lần chạy cần cả hai: nếu tắt tính năng này thì không có gì chạy bất kể chế độ là gì, và ở chế độ Tắt thì không gì chạy ngay cả khi công tắc này đang bật.",
       "enabledCreateHint": "Tác vụ mới được tạo ở trạng thái tắt. Hãy xem lại danh sách công cụ cho phép và giới hạn bên dưới, sau đó bật khi bạn muốn tác vụ bắt đầu chạy.",
       "actKeysCleared": "Quyền ở chế độ thực thi được giữ lại nhưng sẽ không được lưu trừ khi tác vụ này chuyển về Chế độ thực thi.",
-      "recipientRoleNoMembers": "không có thành viên hoạt động"
+      "recipientRoleNoMembers": "không có thành viên hoạt động",
+      "enabledHintNoMode": "When this is off, the agent does not run."
     },
     "policyKeys": {
       "tools": {
@@ -3164,6 +3183,7 @@
           "blocked_by_source": "Đã bị loại trừ bởi nguồn cập nhật của chính sách",
           "held_by_deferral": "Đang bị giữ lại bởi cửa sổ hoãn",
           "blocked_by_category": "Đã bị loại trừ bởi quy tắc danh mục của vòng",
+          "managed_by_vendor_updates": "Managed by Vendor updates",
           "blocked_by_app_rule": "Bị chặn bởi quy tắc ứng dụng",
           "blocked_by_feature_update_policy": "Đã bị loại trừ bởi chính sách cập nhật tính năng Windows của vòng",
           "awaiting_manual_approval": "Đang chờ phê duyệt thủ công",
@@ -3701,6 +3721,7 @@
         "assign_security_training": "Giao đào tạo bảo mật",
         "browse_device_event_log": "Xem nhật ký sự kiện của thiết bị",
         "browse_snapshots": "Bản chụp sao lưu",
+        "cancel_check_in": "Cancel a Wisp check-in",
         "cancel_script_execution": "Hủy chạy tập lệnh",
         "capture_agent_pprof": "Thu thập chẩn đoán agent",
         "collect_evidence": "Thu thập bằng chứng sự cố",
@@ -3729,6 +3750,8 @@
         "get_active_users": "Người dùng hoạt động",
         "get_ai_agent_run": "Chi tiết chạy AI agent",
         "get_alert_correlations": "Tương quan cảnh báo",
+        "get_audit_retention": "Read audit-log retention",
+        "get_backup_health": "Backup health",
         "get_backup_status": "Trạng thái sao lưu",
         "get_browser_security": "Bảo mật trình duyệt",
         "get_catalog_item": "Tra cứu mục danh mục",
@@ -3811,13 +3834,16 @@
         "get_user_experience_metrics": "Số liệu trải nghiệm người dùng",
         "get_vault_status": "Trạng thái kho lưu trữ",
         "get_vm_restore_estimate": "Ước tính khôi phục VM",
+        "get_vss_status": "VSS writer status",
         "get_vulnerability_report": "Báo cáo lỗ hổng",
         "instant_boot_vm": "Khởi động nhanh bản sao lưu thành VM",
         "link_entity": "Liên kết mục với luồng Wisp",
         "list_ai_agent_runs": "Tác vụ AI chạy",
         "list_ai_agent_schedules": "Lịch chạy tác vụ AI",
         "list_ai_agents": "Danh sách tác vụ AI",
+        "list_bmr_recoveries": "Bare-metal recoveries",
         "list_business_calendars": "Lịch giờ làm việc",
+        "list_check_ins": "Wisp check-ins",
         "list_concerns": "Vấn đề Wisp",
         "list_configuration_policies": "Danh sách chính sách cấu hình",
         "list_contracts": "Danh sách hợp đồng",
@@ -3860,6 +3886,7 @@
         "manage_automations": "Quản lý tự động hóa",
         "manage_backup_configs": "Quản lý cấu hình sao lưu",
         "manage_backup_profiles": "Quản lý cấu hình sao lưu",
+        "manage_backup_verification": "Backup verification",
         "manage_billing_catalog": "Quản lý biểu giá thanh toán",
         "manage_billing_profiles": "Quản lý bảng giá cước",
         "manage_billing_settings": "Quản lý cài đặt thanh toán",
@@ -3973,6 +4000,7 @@
         "run_script": "Chạy tập lệnh",
         "s1_isolate_device": "SentinelOne: cách ly thiết bị",
         "s1_threat_action": "Hành động mối đe dọa SentinelOne",
+        "schedule_check_in": "Schedule a Wisp check-in",
         "search_agent_logs": "Tìm kiếm nhật ký agent",
         "search_catalog": "Tìm kiếm danh mục sản phẩm",
         "search_documentation": "Tìm kiếm tài liệu",
@@ -4107,6 +4135,10 @@
           "dashboard": "Tổng quan SNMP",
           "history": "Lịch sử chỉ số SNMP"
         },
+        "list_bmr_recoveries": {
+          "get": "Bare-metal recovery details",
+          "list": "List bare-metal recoveries"
+        },
         "manage_accounting_sync": {
           "customers": "Liệt kê khách hàng kế toán",
           "income_accounts": "Liệt kê tài khoản thu nhập",
@@ -4161,6 +4193,12 @@
           "get": "Chi tiết hồ sơ sao lưu",
           "list": "Liệt kê hồ sơ sao lưu",
           "update": "Cập nhật hồ sơ sao lưu"
+        },
+        "manage_backup_verification": {
+          "health": "Verification health",
+          "list": "List backup verifications",
+          "readiness": "Recovery readiness",
+          "run": "Run a backup verification"
         },
         "manage_billing_catalog": {
           "archive_item": "Lưu trữ mục bảng giá",
@@ -5149,7 +5187,9 @@
   "stepUpPrompt": {
     "youWillConfirmWithYourPasskey": "Bạn sẽ xác nhận bằng khóa thông hành (Touch ID / Windows Hello) khi đăng ký.",
     "authenticatorCode": "Mã xác thực",
-    "confirmYourPassword": "Xác nhận mật khẩu của bạn"
+    "confirmYourPassword": "Xác nhận mật khẩu của bạn",
+    "switchToAuthenticatorCode": "Use authenticator app instead",
+    "usePasskeyInstead": "Use your passkey instead"
   },
   "cannedResponsesCard": {
     "cannedResponses": "Câu trả lời mẫu",
@@ -5492,7 +5532,21 @@
     "verifyWithYourIdentityProvider": "Xác thực với nhà cung cấp danh tính",
     "ssoReauthProofExpired": "Xác thực từ nhà cung cấp danh tính của bạn đã hết hạn. Xác thực lại để hoàn tất thiết lập ứng dụng xác thực.",
     "ssoReauthManageHint": "Tài khoản này đăng nhập qua nhà cung cấp danh tính và không có mật khẩu. Xác thực với nhà cung cấp để xác nhận thay đổi này.",
-    "ssoReauthManageVerified": "Đã xác thực danh tính với nhà cung cấp. Hoàn tất bước bên dưới để xác nhận thay đổi này."
+    "ssoReauthManageVerified": "Đã xác thực danh tính với nhà cung cấp. Hoàn tất bước bên dưới để xác nhận thay đổi này.",
+    "notSetUp": "Not set up",
+    "notAvailable": "Not available",
+    "backup": "Backup",
+    "addBackup": "Add backup",
+    "totpBackupAddHint": "Add an authenticator app as a backup, so you can still sign in if your passkey isn't available.",
+    "totpPolicyDisallowed": "Your organization's policy doesn't allow authenticator apps.",
+    "totpBackupActiveHint": "Use a code from your authenticator app if your passkey isn't available.",
+    "totpBackupVerifyNote": "When you press Verify, you'll confirm with your passkey.",
+    "confirmBackupButton": "Verify and add backup",
+    "removeTotpTitle": "Remove authenticator app",
+    "removeTotpBackupDescription": "You'll keep signing in with your passkey. Your recovery codes stay the same.",
+    "removeTotpPrimaryDescription": "Your passkey becomes your primary sign-in method. Your recovery codes stay the same.",
+    "removeTotpConfirmWithPasskey": "You'll confirm with your passkey.",
+    "removing": "Removing..."
   },
   "pax8CatalogDrawer": {
     "importFromPax8": "Nhập từ Pax8",
@@ -5507,15 +5561,17 @@
     "factorProofLabel": "Mã MFA hoặc mã khôi phục hiện tại",
     "passkeyRecoveryCodeHint": "Nhập mã khôi phục chưa sử dụng.",
     "recoveryCode": "Mã khôi phục",
-    "nameMustBeAtLeast2Characters": "Tên phải có ít nhất 2 ký tự",
+    "nameIsRequired": "Name is required.",
+    "nameMustBeAtMost255Characters": "Name must be at most 255 characters",
     "loadingProfile": "Đang tải hồ sơ...",
     "profileSettings": "Cài đặt hồ sơ",
     "manageYourAccountSettingsAndSecurityPreferences": "Quản lý cài đặt tài khoản và tùy chọn bảo mật của bạn.",
     "profileInformation": "Thông tin hồ sơ",
     "updateYourPersonalDetails": "Cập nhật thông tin cá nhân của bạn.",
     "avatar": "Ảnh đại diện",
-    "uploadNewPicture": "Tải ảnh mới",
-    "pNGJPGOrWebPMax5MBDragAndDropOntoTheCircleOrClickUpload": "PNG, JPG hoặc WebP. Tối đa 5 MB. Kéo và thả vào vòng tròn, hoặc nhấp vào Tải lên.",
+    "changePicture": "Change picture",
+    "undoAvatarChange": "Undo",
+    "pictureRemovalPending": "Picture removal pending",
     "cancel": "Hủy",
     "name": "Tên",
     "yourName": "Tên của bạn",
@@ -5538,8 +5594,7 @@
     "failedToFetchUserData": "Không thể lấy dữ liệu người dùng",
     "failedToLoadProfileData": "Không thể tải dữ liệu hồ sơ",
     "profileUpdatedSuccessfully": "Đã cập nhật hồ sơ thành công",
-    "avatarUpdated": "Đã cập nhật ảnh đại diện.",
-    "avatarRemoved": "Đã xóa ảnh đại diện.",
+    "avatarSavedButNameUpdateFailed": "Picture change saved, but your name could not be updated: {{error}}",
     "passwordChangedSuccessfully": "Đã thay đổi mật khẩu thành công",
     "multiFactorAuthenticationEnabledSuccessfully": "Đã bật xác thực đa yếu tố thành công",
     "multiFactorAuthenticationDisabled": "Đã tắt xác thực đa yếu tố",
@@ -5570,10 +5625,7 @@
     "fileIsEmpty": "Tệp trống.",
     "failedToRenamePasskeyHttp": "Không thể đổi tên passkey (HTTP {{status}})",
     "failedToDeletePasskeyHttp": "Không thể xóa passkey (HTTP {{status}})",
-    "removing": "Đang xóa...",
     "remove": "Xóa",
-    "uploading": "Đang tải lên...",
-    "upload": "Tải lên",
     "saving": "Đang lưu...",
     "saveChanges": "Lưu thay đổi",
     "passkey": "Passkey",
@@ -5619,7 +5671,13 @@
     "ssoReauthManageProofExpired": "Xác thực của nhà cung cấp định danh đã hết hạn. Vui lòng xác thực lại để xác nhận thay đổi này.",
     "verifyWithIdpToDeletePasskey": "Tài khoản này không có mật khẩu. Vui lòng xác thực với nhà cung cấp định danh trước khi xóa passkey.",
     "deletePasskeySsoReauth": "Xác thực danh tính để xóa passkey",
-    "deletePasskeySsoVerified": "Đã xác thực danh tính. Chọn Xóa trên passkey bạn muốn gỡ bỏ."
+    "deletePasskeySsoVerified": "Đã xác thực danh tính. Chọn Xóa trên passkey bạn muốn gỡ bỏ.",
+    "authenticatorBackupAdded": "Authenticator app added as a backup. Your recovery codes haven't changed",
+    "authenticatorAppRemoved": "Authenticator app removed. You'll sign in with your passkey",
+    "authenticatorCodeRejectedWaitForNext": "That code wasn't accepted. Each code works only once, so if you just used it, wait for the next code from your authenticator app.",
+    "passkeyConfirmationCanceled": "Passkey confirmation was canceled or timed out.",
+    "passkeyProofRejected": "Your passkey couldn't be verified. Please try again.",
+    "failedToRemoveAuthenticatorApp": "Failed to remove the authenticator app"
   },
   "roleManager": {
     "roles": "Vai trò",
@@ -6884,7 +6942,8 @@
         "pam_open_actuation": "Tổ chức sắp bị hợp nhất có các phiên truy cập đặc quyền (PAM) chưa hoàn tất dọn dẹp. Vui lòng đợi các phiên này đóng lại rồi thử hợp nhất lại.",
         "pam_evidence": "Tổ chức sắp bị hợp nhất có lịch sử truy cập đặc quyền (PAM) và việc chuyển lịch sử PAM giữa các tổ chức chưa được bật trên hệ thống này. Hãy hợp nhất theo hướng ngược lại, hoặc không hợp nhất các tổ chức này.",
         "payment_in_flight": "Thanh toán cho tổ chức sắp bị hợp nhất vẫn đang xử lý. Vui lòng đợi hoàn tất rồi thử hợp nhất lại.",
-        "lineage_depth": "Các tổ chức này đã được hợp nhất quá nhiều lần, và thao tác này sẽ vượt quá giới hạn độ sâu lịch sử hợp nhất tối đa."
+        "lineage_depth": "Các tổ chức này đã được hợp nhất quá nhiều lần, và thao tác này sẽ vượt quá giới hạn độ sâu lịch sử hợp nhất tối đa.",
+        "entra_tenant_conflict": "The organization being merged away has a proven Microsoft tenant, and the surviving organization is also linked to a Microsoft tenant. Remove one of the tenant links, then try the merge again."
       }
     },
     "archive": {
@@ -7639,6 +7698,43 @@
       "create": "Không thể thêm liên hệ.",
       "update": "Không thể lưu liên hệ.",
       "delete": "Không thể xóa liên hệ."
+    },
+    "portal": {
+      "column": "Portal",
+      "status": {
+        "none": "No access",
+        "invited": "Invited",
+        "active": "Active",
+        "disabled": "Disabled",
+        "requested": "Requested"
+      },
+      "actions": {
+        "give": "Give portal access",
+        "resend": "Resend invite",
+        "bulkGive": "Give portal access ({{count}})",
+        "selectAll": "Select all contacts on this page",
+        "selectRow": "Select {{name}}"
+      },
+      "form": {
+        "giveAccess": "Give portal access (sends an invite to this email address)",
+        "needsEmail": "Add an email address to give portal access."
+      },
+      "toasts": {
+        "invited": "Portal invite sent",
+        "inviteEmailFailed": "Portal login created, but the invite email could not be sent. Use Resend invite.",
+        "bulkSummary": "Portal access: {{details}}"
+      },
+      "outcomes": {
+        "invited": "Invited: {{count}}",
+        "already_has_access": "Already has access: {{count}}",
+        "no_email": "No email address: {{count}}",
+        "email_bound_to_other_contact": "Email used by another contact: {{count}}",
+        "duplicate_email_in_batch": "Duplicate email in selection: {{count}}"
+      },
+      "errors": {
+        "invite": "Could not give portal access.",
+        "bulkInvite": "Could not give portal access to the selected contacts."
+      }
     }
   },
   "scriptAuthoringPage": {
@@ -7817,7 +7913,8 @@
     "productDefault": "Mặc định sản phẩm ({{minutes}} phút)",
     "range": "Chọn từ {{min}} đến {{max}} phút.",
     "description": "Thời gian một lượt chạy Breeze AI trực tiếp đợi ai đó phê duyệt hành động bị chặn (Cấp 2/3) trước khi từ bỏ.",
-    "notForUnattendedNote": "Tính năng này không dành cho công việc qua đêm hoặc chạy tự động — các tác vụ dài hạn sẽ đi qua hàng đợi Phê duyệt, có thời hạn riêng."
+    "notForUnattendedNote": "Tính năng này không dành cho công việc qua đêm hoặc chạy tự động — các tác vụ dài hạn sẽ đi qua hàng đợi Phê duyệt, có thời hạn riêng.",
+    "modeDescription": "How Breeze AI asks before running gated actions in a conversation. Applies whether or not any spending cap is set."
   },
   "orgAiApprovalTimeout": {
     "title": "Thời gian chờ phê duyệt AI",
@@ -8203,5 +8300,220 @@
     "hideContent": "Ẩn nội dung",
     "conversationUnavailable": "Cuộc trò chuyện này không còn khả dụng.",
     "usersLoadFailed": "Không thể tải danh sách kỹ thuật viên."
+  },
+  "orgAiApprovalMode": {
+    "title": "AI approval mode",
+    "description": "How Breeze AI asks before running gated (Tier 2/3) actions in this organization. Applies whether or not any spending cap is set.",
+    "save": "Save"
+  },
+  "portalAccessPolicy": {
+    "title": "Sign-in & registration",
+    "orgDescription": "How people at this organization sign in to the customer portal, and how new people get browser access. A field left on Inherit follows your partner default.",
+    "partnerDescription": "The default for every customer organization. Each organization can override any field on its Customer Portal tab.",
+    "loading": "Loading sign-in settings…",
+    "readOnly": "You can view these settings but not change them. Changing the partner default needs full partner access.",
+    "save": "Save sign-in settings",
+    "sources": {
+      "partner": "Partner default",
+      "default": "Breeze default"
+    },
+    "signIn": {
+      "title": "How people sign in"
+    },
+    "newPeople": {
+      "title": "How new people get browser access"
+    },
+    "options": {
+      "on": "On",
+      "off": "Off"
+    },
+    "microsoft": {
+      "label": "Microsoft sign-in"
+    },
+    "google": {
+      "label": "Google sign-in"
+    },
+    "password": {
+      "label": "Password sign-in",
+      "allowed": "Allowed",
+      "ssoOnly": "Off — Microsoft/Google only",
+      "ssoOnlyNeedsSso": "Available once Microsoft or Google sign-in is turned on."
+    },
+    "fallback": "Password sign-in is on because no Microsoft or Google sign-in is enabled.",
+    "invites": {
+      "label": "Invites from the MSP",
+      "value": "Always on"
+    },
+    "selfRegistration": {
+      "label": "Self-registration",
+      "off": "Off",
+      "approval": "Needs approval",
+      "instant": "Instant"
+    },
+    "ssoNewPerson": {
+      "label": "First Microsoft / Google sign-in",
+      "invitedOnly": "Invited people only",
+      "approval": "Needs approval",
+      "instant": "Instant"
+    },
+    "requests": "Requests ({{count}})",
+    "errors": {
+      "load": "Couldn't load sign-in settings.",
+      "save": "Couldn't save sign-in settings.",
+      "methodUnavailable": "This sign-in method isn't available on this Breeze deployment yet.",
+      "ssoOnlyNeedsSso": "Turn on Microsoft or Google sign-in before turning off password sign-in.",
+      "tenantNotProven": "Prove this organization's Microsoft tenant before turning on Microsoft sign-in.",
+      "sessionHours": "Enter a whole number of hours from 1 to 168."
+    },
+    "toasts": {
+      "saved": "Sign-in settings saved."
+    },
+    "sessionHours": {
+      "label": "Microsoft / Google session length (hours)",
+      "help": "Microsoft and Google sign-ins end after this many hours, however active the person is. From 1 to 168."
+    },
+    "entraTenant": {
+      "title": "Microsoft tenant",
+      "loading": "Loading the Microsoft tenant…",
+      "loadError": "Couldn't load the Microsoft tenant.",
+      "status": {
+        "none": "No Microsoft tenant is linked yet. Microsoft sign-in stays off for this organization until its tenant is proven.",
+        "unproven": "Tenant {{tenantId}} is linked but not proven. Microsoft sign-in stays off for this organization until it is.",
+        "proven": "Tenant {{tenantId}} proven {{date}} via {{method}}."
+      },
+      "via": {
+        "m365_connection": "the Microsoft 365 connection",
+        "proof_run": "an admin sign-in"
+      },
+      "proveConnection": "Use Microsoft 365 connection (tenant {{tenantId}})",
+      "tenantLabel": "Tenant ID or domain",
+      "tenantHelp": "Create a link and send it to a Global Administrator or Privileged Role Administrator of the customer's tenant. The link works for 72 hours.",
+      "createLink": "Create proof link",
+      "linkLabel": "Proof link",
+      "linkExpires": "Expires {{date}}. Works only for tenant {{tenantId}}.",
+      "consentLabel": "Admin consent link",
+      "consentHelp": "The tenant's admin opens this once so everyone at the organization can sign in.",
+      "copy": "Copy",
+      "copied": "Copied",
+      "remove": "Remove tenant link",
+      "removeConfirm": {
+        "title": "Remove the Microsoft tenant link?",
+        "message": "Microsoft sign-in stops for this organization and its Microsoft sessions end. This also removes the organization's AI for Office tenant mapping, so AI for Office stops working here until a tenant is linked again."
+      },
+      "toasts": {
+        "proven": "Microsoft tenant proven.",
+        "linkCreated": "Proof link created.",
+        "removed": "Microsoft tenant link removed.",
+        "copyFailed": "Couldn't copy the link. Select it and copy it yourself."
+      },
+      "errors": {
+        "prove": "Couldn't prove the tenant from the Microsoft 365 connection.",
+        "createLink": "Couldn't create the proof link.",
+        "remove": "Couldn't remove the tenant link.",
+        "provenElsewhere": "This Microsoft tenant is already proven for another organization. Only a proof link completed by the tenant's admin can move it.",
+        "orgHasOtherTenant": "This organization is linked to a different Microsoft tenant. Remove that link first.",
+        "noVerifiedConnection": "This organization has no Microsoft 365 connection whose tenant was verified by an admin sign-in.",
+        "hintRequired": "Enter the customer's Microsoft tenant ID or one of its verified domains.",
+        "hintInvalid": "That isn't a Microsoft tenant ID or a domain verified by a Microsoft tenant.",
+        "hintLookupFailed": "Couldn't reach Microsoft to look up that domain. Try again, or enter the tenant ID.",
+        "protectedOrg": "This organization can't be linked to a Microsoft tenant."
+      }
+    },
+    "ssoOnlyConfirm": {
+      "title": "Turn off password sign-in?",
+      "intro": "Saving turns off password sign-in for the organizations below.",
+      "partnerIntro": "Saving this partner default turns off password sign-in for these organizations. Each organization's page lists the accounts that can't sign in yet.",
+      "explain": "People already connected to Microsoft lose their password and are signed out. People without a Microsoft connection can't sign in until they accept a Microsoft sign-in invite.",
+      "columns": {
+        "org": "Organization",
+        "passwordsToClear": "Passwords removed",
+        "strandedTotal": "Can't sign in yet"
+      },
+      "openOrg": "Open",
+      "strandedTitle": "Can't sign in yet",
+      "strandedMore": "and {{count}} more",
+      "strandedLoadError": "Couldn't load the names of these accounts.",
+      "sendInvites": "Send Microsoft sign-in invites to these accounts after saving",
+      "confirm": "Turn off password sign-in",
+      "changed": "The impact changed since you opened this. Review the new numbers."
+    },
+    "stranded": {
+      "title": "Can't sign in yet ({{count}})",
+      "description": "These accounts have no Microsoft connection, so they can't sign in while password sign-in is off. Send each one a Microsoft sign-in invite.",
+      "loadError": "Couldn't load the accounts that can't sign in.",
+      "invite": "Send Microsoft sign-in invite",
+      "inviteAll": "Invite all",
+      "more": "Showing {{shown}} of {{count}}.",
+      "toasts": {
+        "invited": "Sent {{count}} Microsoft sign-in invite(s).",
+        "partial": "Sent {{invited}} of {{total}} Microsoft sign-in invites. The rest were already connected or couldn't be invited.",
+        "emailFailed": "{{count}} account(s) moved to invited, but their invite email couldn't be sent. Use Resend on the portal users list."
+      },
+      "errors": {
+        "invite": "Couldn't send Microsoft sign-in invites.",
+        "unavailable": "Microsoft sign-in isn't available for this organization, so there is nothing to invite with."
+      }
+    }
+  },
+  "portalAccessRequests": {
+    "title": "Access requests",
+    "description": "People waiting for access to this organization's portal. Approve to give them access, or deny to dismiss the request.",
+    "columns": {
+      "person": "Person",
+      "source": "How they asked",
+      "requested": "Requested"
+    },
+    "sources": {
+      "self": "Self-registration",
+      "entra": "Microsoft sign-in",
+      "google": "Google sign-in",
+      "addin_user": "AI for Office add-in"
+    },
+    "selectAll": "Select all requests",
+    "selectOne": "Select the request from {{email}}",
+    "accountExists": "Already has an account — Deny to dismiss",
+    "actions": {
+      "approve": "Approve",
+      "deny": "Deny",
+      "approveSelected": "Approve selected ({{count}})",
+      "denySelected": "Deny selected ({{count}})"
+    },
+    "results": {
+      "accountExists": "Already has an account",
+      "notPending": "No longer pending",
+      "notFound": "Request not found",
+      "identityLinked": "Sign-in already linked to another account",
+      "failed": "Couldn't decide this request",
+      "entraTenantNotProven": "This organization's Microsoft tenant is no longer proven"
+    },
+    "denyDialog": {
+      "title": "Deny access request",
+      "message": "Deny the request from {{email}}? They get an email saying it was not approved.",
+      "bulkMessage_one": "Deny {{count}} request? The person gets an email saying it was not approved.",
+      "bulkMessage_other": "Deny {{count}} requests? Each person gets an email saying it was not approved."
+    },
+    "toasts": {
+      "approved": "Approved access for {{email}}.",
+      "denied": "Denied the request from {{email}}.",
+      "bulkDone_one": "{{count}} request decided.",
+      "bulkDone_other": "{{count}} requests decided.",
+      "bulkPartial": "{{succeeded}} of {{total}} requests decided. The others are marked in the list."
+    },
+    "errors": {
+      "load": "Couldn't load access requests.",
+      "action": "Couldn't update the access request.",
+      "bulk": "Couldn't decide the selected requests."
+    },
+    "summary": {
+      "title": "Pending access requests",
+      "description": "Requests waiting in your customer organizations. Open an organization to approve or deny them.",
+      "empty": "No pending requests",
+      "orgPending_one": "{{count}} pending",
+      "orgPending_other": "{{count}} pending",
+      "review": "Review requests",
+      "loadError": "Couldn't load pending access requests."
+    },
+    "refreshFailed": "Couldn't refresh the access requests, so this list may be out of date.",
+    "more": "Showing the first {{count}} requests. Decide these to see the rest."
   }
 }
