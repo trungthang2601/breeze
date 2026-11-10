@@ -89,6 +89,7 @@ const EXPECTED: Record<string, Classification> = {
   'POST /:id/reliability': 'deny',
   'PUT /:id/changes': 'deny',
   'PUT /:id/peripherals/events': 'deny',
+  'PUT /:id/file-egress/events': 'deny',
   'POST /:id/elevation-requests': 'deny',
   // Endpoint-messaging receipts (#8741): a parked device is sent no messages.
   'POST /:id/message-events': 'deny',

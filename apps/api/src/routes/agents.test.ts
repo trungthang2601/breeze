@@ -187,6 +187,7 @@ vi.mock('../db/schema', () => ({
     hardwareErrors: 'hardwareErrors',
   },
   peripheralEventTypeEnum: { enumValues: ['connected', 'disconnected', 'blocked', 'allowed'] },
+  fileEgressTypeEnum: { enumValues: ['removable', 'network_share', 'app_upload'] },
   backupJobs: {},
   patchPolicies: {},
   alertRules: {},
