@@ -850,7 +850,7 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
                             <div className="text-xs text-muted-foreground">{d.hostname}</div>
                           )}
                         </td>
-                        <td className="px-4 py-2 capitalize">{d.osType ?? d.os ?? '—'}</td>
+                        <td className="px-4 py-2">{siteDeviceOsLabel(d)}</td>
                         <td className="px-4 py-2">
                           <span className={cn(
                             'inline-flex rounded-full px-2 py-0.5 text-xs font-medium',
@@ -875,4 +875,13 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       </div>
     </div>
   );
+}
+
+/** OS cell for the site device table: the full version string when the API
+ *  sends it ("Windows Server 2019 Standard", "Debian 13.7"), else the OS type. */
+function siteDeviceOsLabel(d: { osType?: string | null; os?: string | null; osVersion?: string | null }): string {
+  const version = (d.osVersion ?? '').replace(/^Microsoft\s+/i, '').trim();
+  if (version) return version;
+  const type = d.osType ?? d.os ?? '';
+  return type ? type.charAt(0).toUpperCase() + type.slice(1) : '\u2014';
 }
