@@ -51,7 +51,7 @@ func restartSystemd() error {
 // part of the restart). If even that fails, exit and let the unit's
 // Restart= policy start the freshly installed binary.
 func restartUserSystemd() error {
-	out, err := exec.Command("systemctl", "--user", "--no-block", "restart", "breeze-agent").CombinedOutput()
+	out, err := procspawn.Command("systemctl", "--user", "--no-block", "restart", "breeze-agent").CombinedOutput()
 	if err == nil {
 		log.Info("restart queued via systemd --user")
 		return nil
