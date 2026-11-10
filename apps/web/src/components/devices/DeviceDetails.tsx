@@ -52,6 +52,7 @@ import RebootScheduledBadge from "./RebootScheduledBadge";
 import UninstallStateBadge from "./UninstallStateBadge";
 import ExportDeviceDetailButton from "./ExportDeviceDetailButton";
 import { DeviceIsolationBadge } from "./networkIsolation/IsolationBadge";
+import DeviceBackupActivityBadge from "../backup/DeviceBackupActivityBadge";
 import DeviceActions from "./DeviceActions";
 import DeviceInfoTab from "./DeviceInfoTab";
 import DeviceHardwareInventory from "./DeviceHardwareInventory";
@@ -958,6 +959,7 @@ export default function DeviceDetails({
                   status={device.status}
                 />
                 <DeviceIsolationBadge deviceId={device.id} />
+                <DeviceBackupActivityBadge deviceId={device.id} />
                 {device.pendingReboot && (
                   <span
                     data-testid="device-pending-reboot-badge"

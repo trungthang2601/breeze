@@ -380,6 +380,7 @@
         "mrr_renewals": "MRR e rinnovi",
         "quote_win_rate": "Tasso di successo dei preventivi",
         "client_profitability": "Redditività per cliente",
+        "ticket_sla_performance": "Prestazioni SLA",
         "backup_status": "Stato dei backup"
       },
       "threatDetection": {
@@ -409,6 +410,29 @@
         "noncompliant": "Non conformi",
         "notMeasured": "N/D",
         "staleEnrolments": "Registrazioni obsolete"
+      },
+      "slaPerformance": {
+        "priority": "Priorità",
+        "ticketsOpened": "Ticket aperti",
+        "firstResponse": "Prima risposta",
+        "resolution": "Risoluzione",
+        "target": "Obiettivo",
+        "measured": "Misurati",
+        "withinSla": "% entro lo SLA",
+        "median": "Mediana",
+        "mean": "Media",
+        "varies": "variabile",
+        "breaches": "Violazioni",
+        "breachCount_one": "{{count}} violazione",
+        "breachCount_other": "{{count}} violazioni",
+        "unavailable": "Non è stato possibile leggere il riepilogo SLA di questa esecuzione, quindi non può essere mostrato qui. Genera di nuovo il report.",
+        "notes": "Cosa viene misurato",
+        "priorities": {
+          "urgent": "Urgente",
+          "high": "Alta",
+          "normal": "Normale",
+          "low": "Bassa"
+        }
       },
       "identityAccess": {
         "notMeasured": "N/D",
@@ -486,6 +510,7 @@
         "mrr_renewals": "MRR e rinnovi",
         "quote_win_rate": "Tasso di successo dei preventivi",
         "client_profitability": "Redditività per cliente",
+        "ticket_sla_performance": "Prestazioni SLA",
         "backup_status": "Stato dei backup"
       },
       "runsTable": {
@@ -827,18 +852,19 @@
         },
         "devices": {
           "cpu": "CPU",
-          "gpu": "GPU",
-          "motherboard": "Scheda madre",
           "hostname": "Hostname",
           "last_seen": "Ultimo contatto",
-          "ram": "RAM",
-          "disks": "Dischi",
           "os": "OS",
           "owner": "Proprietario",
           "patch_level": "Versione agent",
+          "product_number": "Numero di prodotto",
           "serial": "Seriale",
           "site": "Sito",
-          "status": "Stato"
+          "status": "Stato",
+          "gpu": "GPU",
+          "motherboard": "Scheda madre",
+          "ram": "RAM",
+          "disks": "Dischi"
         },
         "patches": {
           "approved_at": "Approvato alle",
@@ -1070,6 +1096,7 @@
         "mrr_renewals": "MRR e rinnovi",
         "quote_win_rate": "Tasso di successo dei preventivi",
         "client_profitability": "Redditività per cliente",
+        "ticket_sla_performance": "Prestazioni SLA",
         "backup_status": "Stato dei backup"
       },
       "schedules": {
@@ -1150,6 +1177,10 @@
         "quote_win_rate": {
           "name": "Tasso di successo dei preventivi",
           "description": "La quota di preventivi inviati che sono stati vinti, contata per opportunità, così un preventivo rivisto e reinviato conta una sola volta. Il tasso principale riguarda solo le opportunità concluse, con il numero di quelle ancora aperte accanto. I valori sono al netto delle imposte, un insieme per valuta, senza conversione."
+        },
+        "ticket_sla_performance": {
+          "name": "Prestazioni SLA",
+          "description": "Tempi di risposta e risoluzione rispetto allo SLA, pronti per il cliente, per priorità e con le violazioni."
         },
         "client_profitability": {
           "name": "Redditività per cliente",
@@ -1309,6 +1340,12 @@
       "cancel": "Annulla",
       "createReport": "Crea report"
     },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Includi gli oggetti dei ticket",
+      "includeSubjectsHelp": "I report consegnati sono visibili a tutti gli utenti del portale di questa organizzazione. Lascia disattivato, a meno che ogni utente non possa vedere l’oggetto di ogni ticket.",
+      "cancel": "Annulla",
+      "createReport": "Crea report"
+    },
     "clientProfitabilityOptions": {
       "groupBy": "Raggruppa per",
       "groupByDefault": "Predefinito per l'ambito del report",
@@ -1349,8 +1386,7 @@
         "series": "Un report per organizzazione",
         "seriesHint": "Una definizione, con una copia separata per ogni organizzazione coperta, inviata ai contatti di quella organizzazione.",
         "combined": "Tutte le organizzazioni combinate",
-        "combinedHint": "Un report combinato su tutte le tue organizzazioni, per il tuo team.",
-        "seriesUnavailableType": "Questo tipo di report non può essere inviato come un report per organizzazione."
+        "combinedHint": "Un report combinato su tutte le tue organizzazioni, per il tuo team."
       },
       "schedule": {
         "label": "Frequenza di invio della copia di ogni organizzazione",

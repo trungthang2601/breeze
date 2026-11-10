@@ -29,6 +29,7 @@ import SettingsSectionNav, { type SettingsNavGroup } from './SettingsSectionNav'
 import OrgBrandingEditor from './OrgBrandingEditor';
 import OrgPortalSettingsEditor from './OrgPortalSettingsEditor';
 import OrgPortalUsersEditor from './OrgPortalUsersEditor';
+import OrgSignInRegistrationCard from './portalAccess/OrgSignInRegistrationCard';
 import OrgTicketSettingsEditor from './OrgTicketSettingsEditor';
 import OrgDefaultsEditor from './OrgDefaultsEditor';
 import type { PinnableVersions, AgentVersionPinsValue } from './AgentVersionPinSelectors';
@@ -154,17 +155,11 @@ type OrgDetails = {
   type?: string;
   maxDevices?: number;
   settings?: {
-    branding?: {
-      logoUrl?: string;
-      secondaryColor?: string;
-      theme?: 'light' | 'dark' | 'system';
-      // customCss (#5952) and primaryColor (#9962) deliberately absent — they
-      // live in portal_branding, loaded/saved by OrgBrandingEditor via
-      // /orgs/organizations/:id/portal-settings, not here. A legacy stored
-      // branding.primaryColor is dropped on the next Branding save, which
-      // replaces the whole category.
-      portalSubdomain?: string;
-    };
+    // #9673: retired. Nothing reads the org-level blob; the Branding tab lives in portal_branding
+    // (OrgBrandingEditor, /orgs/organizations/:id/portal-settings). Only the
+    // legacy logo is still looked at, to offer it to the org, and the next
+    // Branding save clears the whole category (handleBrandingSaved).
+    branding?: { logoUrl?: string } & Record<string, unknown>;
     defaults?: {
       policyDefaults?: Record<string, string>;
       deviceGroup?: string;
@@ -498,6 +493,18 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
     }
   }, [effectiveOrgId, orgDetails, isArchived, fetchOrgDetails, t]);
 
+  // #9673: the editor has already saved through portal-settings (an archived
+  // org never gets that far: saveBlockedMessage). Clearing the retired blob is
+  // the only org write left.
+  const handleBrandingSaved = useCallback(async () => {
+    const legacy = orgDetails?.settings?.branding;
+    if (legacy && Object.keys(legacy).length > 0) {
+      return handleSaveSettings('branding', {});
+    }
+    setSaveState({ hasUnsavedChanges: false, lastSavedAt: formatTime(new Date()) });
+    return true;
+  }, [orgDetails, handleSaveSettings]);
+
   const handleSaveName = useCallback(async () => {
     if (!effectiveOrgId) return;
     if (isArchived) {
@@ -643,9 +650,10 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
           <OrgBrandingEditor
             organizationName={displayOrg.name}
             orgId={effectiveOrgId}
-            branding={orgDetails?.settings?.branding}
+            legacyLogoUrl={orgDetails?.settings?.branding?.logoUrl}
             onDirty={handleDirty}
-            onSave={(data) => handleSaveSettings('branding', data)}
+            onSave={handleBrandingSaved}
+            saveBlockedMessage={isArchived ? t('orgSettingsPage.archived.saveBlocked') : undefined}
             locked={locked}
           />
         );
@@ -653,6 +661,13 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         return effectiveOrgId ? (
           <>
             <OrgPortalSettingsEditor
+              orgId={effectiveOrgId}
+              onDirty={handleDirty}
+              onSave={() => handleSave()}
+            />
+            {/* Sign-in & registration (portal registration W3): the org override of the
+                portal access policy, above the portal users list (spec §4). */}
+            <OrgSignInRegistrationCard
               orgId={effectiveOrgId}
               onDirty={handleDirty}
               onSave={() => handleSave()}
@@ -712,6 +727,10 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
             {/* AI model registry W04 (#7602): org override of the partner's per-feature model defaults (tighten-only). */}
             <OrgModelDefaultsCard orgId={effectiveOrgId} />
             <OrgAiBudgetSettings orgId={effectiveOrgId} />
+            {/* Approval mode: stored with the budget fields (PUT /ai/budget)
+                but not a budget, so it renders as its own card ahead of the
+                approval timeout. */}
+            <OrgAiBudgetSettings orgId={effectiveOrgId} section="approvals" />
             {/* #6475 — a separate card, not folded into OrgAiBudgetSettings:
                 that one saves through PUT /ai/budget with different
                 semantics (touched-fields-only, its own lock model). This

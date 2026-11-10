@@ -1,6 +1,6 @@
 import { and, eq, sql, desc, gte, lte, inArray, isNull, type SQL } from 'drizzle-orm';
 import type { AnyPgColumn } from 'drizzle-orm/pg-core';
-import { db } from '../db';
+import { db, withDbTransactionIfHeld } from '../db';
 import {
   devices,
   manualAssets,
@@ -28,6 +28,7 @@ import {
   emptyMrrRenewalsSummary,
   emptyQuoteWinRateSummary,
   emptyClientProfitabilitySummary,
+  emptyTicketSlaPerformanceSummary,
 } from '@breeze/shared';
 import {
   systemReportAuthorityFor,
@@ -103,7 +104,7 @@ export async function previousBaselineFor(
   scopeFingerprint: string,
 ): Promise<ReportResult['previous']> {
   try {
-    const [prior] = await db
+    const [prior] = await withDbTransactionIfHeld(() => db
       .select({
         summary: sql<Record<string, unknown> | null>`${reportRuns.result}->'summary'`,
         generatedAt: sql<string | null>`${reportRuns.result}->>'generatedAt'`,
@@ -116,7 +117,7 @@ export async function previousBaselineFor(
         eq(reportRuns.executionScopeFingerprint, scopeFingerprint),
       ))
       .orderBy(desc(reportRuns.completedAt))
-      .limit(1);
+      .limit(1));
     if (!prior?.summary || typeof prior.summary !== 'object') return undefined;
     // A Device Detail summary is the full per-device dataset, not a trend
     // baseline — copying it would double every snapshot for nothing.
@@ -393,6 +394,7 @@ type DeviceInventoryRow = {
   ramTotalMb: number | null;
   diskTotalGb: number | null;
   serialNumber: string | null;
+  productSku: string | null;
   gpuModel: string | null;
   motherboardManufacturer: string | null;
   motherboardProduct: string | null;
@@ -421,6 +423,7 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       ramTotalMb: deviceHardware.ramTotalMb,
       diskTotalGb: deviceHardware.diskTotalGb,
       serialNumber: deviceHardware.serialNumber,
+      productSku: deviceHardware.productSku,
       gpuModel: deviceHardware.gpuModel,
       motherboardManufacturer: deviceHardware.motherboardManufacturer,
       motherboardProduct: deviceHardware.motherboardProduct,
@@ -546,6 +549,7 @@ export async function generateDeviceInventoryReport(
         ramTotalMb: null,
         diskTotalGb: null,
         serialNumber: asset.serialNumber,
+        productSku: null,
         gpuModel: null,
         motherboardManufacturer: null,
         motherboardProduct: null,
@@ -1154,6 +1158,9 @@ function zeroSafeReport(type: ReportType, orgId: string): ReportResult {
     // Business reports phase 2 W3 (#9828): invoices and time entries have no site column.
     case 'client_profitability':
       return { rows: [], rowCount: 0, summary: emptyClientProfitabilitySummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // #11018: tickets have no site axis either, and this one reaches customers.
+    case 'ticket_sla_performance':
+      return { rows: [], rowCount: 0, summary: emptyTicketSlaPerformanceSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
     default: {
       const exhaustive: never = type;
       throw new Error(`Invalid report type: ${String(exhaustive)}`);

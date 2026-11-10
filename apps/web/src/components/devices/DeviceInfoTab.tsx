@@ -126,6 +126,7 @@ type DeviceInfo = {
   activeVpns?: VpnPresence[] | null;
   hardware?: {
     serialNumber?: string | null;
+    productSku?: string | null;
     manufacturer?: string | null;
     model?: string | null;
     biosVersion?: string | null;
@@ -893,6 +894,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
   }
 
   const hw = info?.hardware;
+  const productNumber = formatHardwareIdentityValue(hw?.productSku);
   const status = info?.status ?? "offline";
   const tags = info?.tags ?? [];
 
@@ -984,6 +986,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           label={t("deviceInfoTab.serialNumber")}
           value={formatHardwareIdentityValue(hw?.serialNumber)}
         />
+        {productNumber !== "—" && (
+          <InfoRow label={t("deviceInfoTab.productSku")} value={productNumber} />
+        )}
         <InfoRow
           label={t("deviceInfoTab.manufacturer")}
           value={formatHardwareIdentityValue(hw?.manufacturer)}

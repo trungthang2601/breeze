@@ -75,7 +75,8 @@ func enrichOSInfo(info *SystemInfo) {
 }
 
 // collectPlatformHardware queries Win32_BIOS, Win32_BaseBoard,
-// Win32_ComputerSystem, Win32_VideoController, Win32_PhysicalMemory and Win32_DiskDrive in a single PowerShell
+// Win32_ComputerSystem, Win32_ComputerSystemProduct, Win32_VideoController,
+// Win32_PhysicalMemory and Win32_DiskDrive in a single PowerShell
 // invocation (one process spawn instead of ~9) and populates hw with the
 // results. Graceful degradation: a failed or unparseable response leaves the
 // affected fields empty.
@@ -99,6 +100,7 @@ function Get-WmiSafe($ClassName) {
 $bios  = @(Get-WmiSafe 'Win32_BIOS')          | Select-Object -First 1
 $board = @(Get-WmiSafe 'Win32_BaseBoard')      | Select-Object -First 1
 $sys   = @(Get-WmiSafe 'Win32_ComputerSystem') | Select-Object -First 1
+$csp   = @(Get-WmiSafe 'Win32_ComputerSystemProduct') | Select-Object -First 1
 $gpus  = @(@(Get-WmiSafe 'Win32_VideoController') |
   Where-Object { $_ -and $_.Name } |
   Select-Object -ExpandProperty Name |
@@ -157,6 +159,8 @@ $disks = @(@(Get-WmiSafe 'Win32_DiskDrive') |
   BoardVersion      = if ($board) { ([string]$board.Version).Trim() }          else { '' }
   SysManufacturer   = if ($sys)   { ([string]$sys.Manufacturer).Trim() }       else { '' }
   SysModel          = if ($sys)   { ([string]$sys.Model).Trim() }              else { '' }
+  SysSKU            = if ($sys)   { ([string]$sys.SystemSKUNumber).Trim() }    else { '' }
+  ProductSKU        = if ($csp)   { ([string]$csp.SKUNumber).Trim() }          else { '' }
   GPUNames          = $gpus
   MemoryModules     = $mem
   PhysicalDisks     = $disks
@@ -179,6 +183,7 @@ $disks = @(@(Get-WmiSafe 'Win32_DiskDrive') |
 	}
 
 	hw.SerialNumber = firstCleanHardwareIdentityValue(parsed.BiosSerial, parsed.BoardSerial)
+	hw.ProductSKU = windowsProductSKU(parsed)
 	hw.Manufacturer = cleanHardwareIdentityValue(parsed.SysManufacturer)
 	hw.Model = cleanHardwareIdentityValue(parsed.SysModel)
 	hw.MotherboardManufacturer = cleanHardwareIdentityValue(parsed.BoardManufacturer)

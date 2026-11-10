@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { makePolicyView } from './portalAccess/viewFixture';
 
 import OrgSettingsPage, { runOrgNameSave } from './OrgSettingsPage';
 import { fetchWithAuth } from '../../stores/auth';
@@ -29,8 +30,9 @@ vi.mock('@/lib/navigation', () => ({
 
 // Stub the heavy child editors — they're unrelated to name editing, and several
 // pull in their own fetches/effects; stubbing keeps these tests focused and fast.
-const brandingProps: Array<{ onSave: (data: Record<string, unknown>) => unknown }> = [];
-vi.mock('./OrgBrandingEditor', () => ({ default: (props: { onSave: (data: Record<string, unknown>) => unknown }) => {
+type BrandingEditorProps = { onSave: () => unknown; legacyLogoUrl?: string; saveBlockedMessage?: string };
+const brandingProps: BrandingEditorProps[] = [];
+vi.mock('./OrgBrandingEditor', () => ({ default: (props: BrandingEditorProps) => {
   brandingProps.push(props);
   return <div data-testid="branding-editor" />;
 } }));
@@ -488,20 +490,73 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
     expect(screen.getByTestId('branding-editor')).not.toBeNull();
   });
 
-  it.each([true, false])('returns branding save success (%s) without an independent success toast', async (ok) => {
-    window.location.hash = '#branding';
-    fetchWithAuthMock.mockImplementation(async (url, init) => {
-      if (url.endsWith('/effective-settings')) return makeJsonResponse({ locked: [] });
-      if (init?.method === 'PATCH') return makeJsonResponse(ok ? {} : { error: 'Branding rejected' }, ok);
-      return makeJsonResponse(orgDetails);
+  // #9673: the Branding tab saves through portal-settings. All the page does is
+  // retire a legacy organizations.settings.branding blob, once.
+  describe('retiring the legacy branding settings', () => {
+    const LEGACY_LOGO = 'data:image/png;base64,T0xETE9HTw==';
+    const withLegacy = {
+      ...orgDetails,
+      settings: { ...orgDetails.settings, branding: { logoUrl: LEGACY_LOGO, theme: 'dark', portalSubdomain: 'acme' } },
+    };
+    const orgPatches = () => fetchWithAuthMock.mock.calls.filter(([, init]) => init?.method === 'PATCH');
+
+    function mockOrg(details: unknown, patchOk = true) {
+      fetchWithAuthMock.mockImplementation(async (url, init) => {
+        if (url.endsWith('/effective-settings')) return makeJsonResponse({ locked: [] });
+        if (init?.method === 'PATCH') return makeJsonResponse(patchOk ? {} : { error: 'Branding rejected' }, patchOk);
+        return makeJsonResponse(details);
+      });
+    }
+
+    it('passes the legacy logo to the editor', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      expect(brandingProps.at(-1)!.legacyLogoUrl).toBe(LEGACY_LOGO);
     });
-    render(<OrgSettingsPage orgId="org-1" />);
-    await screen.findByTestId('branding-editor');
-    let result: unknown;
-    await act(async () => { result = await brandingProps.at(-1)!.onSave({ primaryColor: '#123456' }); });
-    expect(result).toBe(ok);
-    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
-    if (!ok) expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+
+    it('clears the blob when one exists, keeping the other settings categories', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(true);
+      const patches = orgPatches();
+      expect(patches).toHaveLength(1);
+      const body = JSON.parse(String(patches[0]![1]!.body));
+      expect(body.settings.branding).toEqual({});
+      expect(Object.keys(body.settings).sort()).toEqual(Object.keys(withLegacy.settings).sort());
+      expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    });
+
+    it('reports a failed clear without an independent success toast', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy, false);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(false);
+      expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+      expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    });
+
+    it.each([
+      ['no branding key', {}],
+      ['an already-empty blob', { branding: {} }],
+    ])('writes nothing to the org when there is %s', async (_label, settings) => {
+      window.location.hash = '#branding';
+      mockOrg({ ...orgDetails, settings });
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(true);
+      expect(orgPatches()).toHaveLength(0);
+    });
   });
 
   it('deep-links the hash to the right section on mount', async () => {
@@ -538,8 +593,11 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
 
     const link = await screen.findByRole('link', { name: /^ai$/i });
     expect(link.getAttribute('aria-current')).toBe('page');
-    expect(screen.getByTestId('org-ai-budget')).not.toBeNull();
-    expect(aiBudgetProps.at(-1)).toMatchObject({ orgId: 'org-1' });
+    // Two cards from one editor: the budget card, and approval mode on its own
+    // beside the approval timeout (it is not a budget).
+    expect(screen.getAllByTestId('org-ai-budget')).toHaveLength(2);
+    expect(aiBudgetProps.some((p) => p.orgId === 'org-1' && p.section === undefined)).toBe(true);
+    expect(aiBudgetProps.some((p) => p.orgId === 'org-1' && p.section === 'approvals')).toBe(true);
     // W04 (#7602): the model-defaults override card mounts first on this tab, for this org.
     expect(screen.getByTestId('org-model-defaults-card')).not.toBeNull();
     expect(modelDefaultsProps.at(-1)).toMatchObject({ orgId: 'org-1' });
@@ -900,6 +958,13 @@ describe('OrgSettingsPage — archived organization (2026-08-28 pre-release swee
     expect(restoreLink.getAttribute('href')).toBe('/organizations#filter=archived');
   });
 
+  it('blocks the Branding save before the editor writes anything (#9673)', async () => {
+    window.location.hash = '#branding';
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('branding-editor');
+    expect(brandingProps.at(-1)!.saveBlockedMessage).toMatch(/archived/i);
+  });
+
   it('disables the name and type Save controls so the page cannot 404 on save', async () => {
     render(<OrgSettingsPage orgId="org-1" />);
 
@@ -964,5 +1029,37 @@ describe('OrgSettingsPage — archived organization (2026-08-28 pre-release swee
       expect(banner.textContent).toMatch(/2026/);
       expect(screen.getByTestId('org-archived-restore-link')).toBeInTheDocument();
     });
+  });
+});
+
+describe('OrgSettingsPage portal tab layout', () => {
+  const orgDetails = {
+    id: 'org-1', name: 'Acme Systems', slug: 'acme', status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z', settings: {}
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.location.hash = '#portal';
+    useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (url === '/orgs/organizations/org-1/portal-settings') return Promise.resolve(makeJsonResponse({ data: {} }));
+      if (url === '/orgs/organizations/org-1/portal-access-policy') return Promise.resolve(makeJsonResponse({ data: makePolicyView() }));
+      if (url === '/orgs/organizations/org-1/portal-access-requests?status=pending') return Promise.resolve(makeJsonResponse({ data: [], hasMore: false }));
+      if (url === '/orgs/organizations/org-1/portal-users') return Promise.resolve(makeJsonResponse({ data: [] }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+  });
+
+  afterEach(() => { window.location.hash = ''; });
+
+  it('renders the Sign-in & registration card between the portal settings and the portal users list', async () => {
+    render(<OrgSettingsPage orgId="org-1" />);
+    const settings = await screen.findByTestId('org-portal-settings');
+    const card = await screen.findByTestId('org-sign-in-card');
+    const users = await screen.findByTestId('portal-users-editor');
+    expect(settings.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.compareDocumentPosition(users) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

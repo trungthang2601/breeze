@@ -20,7 +20,7 @@ const namespaceDuplicateBaselines = {
     // +6: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Status" are
     // identical cognates in pt-BR; the "openrouter"/"OpenRouter" example
     // values and the example base URL are literal placeholders, not wording.
-    'admin.json': 32, // +5 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate
+    'admin.json': 34, // +5 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate · fork: +2 (ICOOL fork features)
     'ai.json': 6, // +3 W01 #10132: "Breeze AI" brand name is identical in every locale (chat door title, empty-state title); // +1 W04b #9916: wisp.title "Wisp" is a protected proper noun; +1 W08 #9921: wisp.home.needsYouCount_one "{{count}} item" is the pt-BR singular too ("itens" in _other)
     // +2 W07 (#5212, AI Operator task detail): originKind "manual"/"chat" are
     // identical cognates in pt-BR.
@@ -95,7 +95,8 @@ const namespaceDuplicateBaselines = {
     // +2 (#9610): vulnerabilities table.cve/cvss/kev are identical locale-invariant acronyms (CVE, CVSS, KEV).
     // +1 (#10190 W01): deviceInfoTab.assistStatus.label is the product name "Breeze Assist".
     // +1 (#8134 W1-D1): physicalPlacementCard.rack — "Rack" is the standard loanword in this locale.
-    'devices.json': 201, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +8 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    // +3 vendorUpdates.category (#11069): "BIOS" acronym; "Firmware" and "Drivers" are the terms this catalog uses everywhere, including this section's own sentences.
+    'devices.json': 204, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · fork: +8 (ICOOL fork features)
     'discovery.json': 17,
     // errors namespace (Task 3 of #3859): pt-BR fully translated, no cognates.
     // Wave E2b (DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND, PATH_CONFLICT,
@@ -111,7 +112,7 @@ const namespaceDuplicateBaselines = {
     'fleetDesign.json': 2,
     // Flows (#5218): 'Status', 'Webhook' (loanword) and 'Manual' are spelled identically in pt-BR.
     // +1 W04 (#5219): runs.trigger.manual — the same 'Manual' as trigger.manual.
-    'flows.json': 10, // W05 #5220: + Webhook (tab, title), 'Status' column, and three pure-interpolation strings
+    'flows.json': 11, // W05 #5220: + Webhook (tab, title), 'Status' column, and three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +3 (W03 #6011): integrationsPage.backup ("Backup" is spelled identically
     // in pt-BR), backupProviders.cove and backupProviders.namePlaceholder are
     // protected proper nouns pinned byte-identical by localeParity.
@@ -120,7 +121,8 @@ const namespaceDuplicateBaselines = {
     // match English exactly, as vendor names should.
     // +2 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 32,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 37, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): +7 on top of the pre-existing +1 —
     // "Name", "Monitor" (list/policy-tab column + label), "Hardware",
     // "System" (event-log categories), "CPU" (resource select) are identical
@@ -141,7 +143,8 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 12,
-    'reports.json': 40, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    'reports.json': 44, // +1 (#11018): reportPreview.slaPerformance.priorities.normal ("Normal" is the Portuguese word). · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
@@ -152,7 +155,7 @@ const namespaceDuplicateBaselines = {
     // "Webhooks" in both languages.
     'scripts.json': 64, // +3 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
     // +3 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 145, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only
+    'security.json': 147, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only · fork: +2 (ICOOL fork features)
     // +1: the it-IT locale's self-name is intentionally identical in every catalog.
     // +1: bulkOrgImport.preview.status — "Status" is the same cognate in pt-BR
     // (already accepted for billing.json).
@@ -187,7 +190,7 @@ const namespaceDuplicateBaselines = {
     // +1 Sites page (#9794): "Sites" (sites.page.title / siteDetailPage.breadcrumbs.sites) is the pt-BR loanword.
     // +1 Wisp memory: wispMemory.columns.status "Status" is spelled identically in pt-BR (main landed it without bumping this cap).
     // +4 ticketRouting loanwords (Portal/API/Normal/Status) from #9785.
-    'settings.json': 149,
+    'settings.json': 151, // +1 contactsCard.portal.column "Portal" (product name, identical in pt-BR) · fork: +1 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -283,7 +286,8 @@ const namespaceDuplicateBaselines = {
     // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
     // +1 (#10190 W01): deviceInfoTab.assistStatus.label is the product name "Breeze Assist".
     // +1 (#8134 W1-D1): physicalPlacementCard.rack — "Rack" is the standard loanword in this locale.
-    'devices.json': 142, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +5 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    // +2 vendorUpdates.category (#11069): "BIOS" acronym; "Firmware" is the term this catalog uses everywhere, including this section's own sentences.
+    'devices.json': 144, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · fork: +5 (ICOOL fork features)
     'discovery.json': 17,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
@@ -302,19 +306,21 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 2, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in es-419.
     'fleetDesign.json': 2,
     // Flows (#5218): 'Webhook' (loanword), 'Manual' and 'Error' are spelled identically in es-419.
     // +1 W04 (#5219): runs.trigger.manual — the same 'Manual' as trigger.manual.
-    'flows.json': 9, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings
+    'flows.json': 10, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +2 (W03 #6011): backupProviders.cove and backupProviders.namePlaceholder
     // are protected proper nouns pinned byte-identical by localeParity.
     // +2 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
     // +1 (integrations critique 10-20): integrationsPage.tdSYNNEXPricing / tdSYNNEXPriceFile
     // are now the connector product names ("TD SYNNEX EC Express", "TD SYNNEX SFTP").
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 37,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 41, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): +5 on top of the pre-existing +1 —
     // "Monitor" (label), "Hardware" (event-log category), "Error" (event-log
     // level), "CPU" (resource select), "Total" (direction select) are
@@ -334,7 +340,8 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 12,
-    'reports.json': 33, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    'reports.json': 37, // +1 (#11018): reportPreview.slaPerformance.priorities.normal ("Normal" is the Spanish word). · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
@@ -344,7 +351,7 @@ const namespaceDuplicateBaselines = {
     // in es-419.
     'scripts.json': 64, // +3 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
     // +2 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 118, // +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only; +1 (#9606): page title "CIS Benchmarks" is the product term, identical to nav
+    'security.json': 120, // +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only; +1 (#9606): page title "CIS Benchmarks" is the product term, identical to nav · fork: +2 (ICOOL fork features)
     // +1: tenantVariablesPage.title — "Variables" is identical in Spanish.
     // +1: partnerAiProvider.endpointCardTitle (#3922 W4) — "Endpoint" is the
     // standard loanword in es-419 technical UI.
@@ -372,7 +379,7 @@ const namespaceDuplicateBaselines = {
     // +1: emailTemplates.variables.total — "Total" is spelled identically in es-419.
     // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
     // +6 Plan & features (#9907): planAndFeatures.plans.{starter,community,pro,enterprise} are plan-tier product names, features.wisp.label is the Wisp product name, and noLimits is the em-dash placeholder — identical in every catalog.
-    'settings.json': 146, // +ticketRouting loanwords (Portal/API/Normal/Status)
+    'settings.json': 149, // +1 contactsCard.portal.column "Portal"; +ticketRouting loanwords (Portal/API/Normal/Status) · fork: +2 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -396,7 +403,7 @@ const namespaceDuplicateBaselines = {
     // values and the example base URL are literal placeholders, not wording.
     // W01 #7599 admin.aiModels.*: +3 identical cognates (Actions, Budget, Standard).
     // #7609 admin.aiModels.variants.*: +3 identical cognates (Conversations, Candidate, Active).
-    'admin.json': 51, // +9 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate
+    'admin.json': 52, // +9 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate · fork: +1 (ICOOL fork features)
     'ai.json': 12, // +2 W01 #10132: "Breeze AI" brand name is identical in every locale (chat door title, empty-state title); // +1 W04b #9916: wisp.title "Wisp" is a protected proper noun
     // +3 W07 (#5212, AI Operator task detail): originKind "ticket"/"chat" and
     // waitReason "information" are identical cognates in fr-FR.
@@ -472,7 +479,7 @@ const namespaceDuplicateBaselines = {
     // — "action"/"actions" are identical cognates in fr-FR.
     // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
     // +1 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'devices.json': 170, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +3 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    'devices.json': 171, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +3 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels · fork: +1 (ICOOL fork features)
     'discovery.json': 15,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
@@ -491,19 +498,21 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 6, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-FR.
     'fleetDesign.json': 3,
     // Flows (#5218): 'Webhook' (loanword), 'Validation' and 'Version {{version}}' are spelled identically in French.
-    'flows.json': 9, // W05 #5220: + Webhook (tab, title), 'Secret', three pure-interpolation strings
+    'flows.json': 10, // W05 #5220: + Webhook (tab, title), 'Secret', three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +1 (W03 #6011): backupProviders.cove is a protected proper noun pinned
     // byte-identical by localeParity.
     // +1 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
     // +1 (integrations critique 10-20): integrationsPage.tdSYNNEXPricing / tdSYNNEXPriceFile
     // are now the connector product names ("TD SYNNEX EC Express", "TD SYNNEX SFTP").
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 42,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 44, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): "Description" (field label), "Occurrences"
     // (event-log count field), "Direction" (bandwidth/disk-I/O field),
     // "Application" (event-log category), "CPU" (resource select), "Total"
@@ -516,7 +525,7 @@ const namespaceDuplicateBaselines = {
     // scripts.json made titles.scripts an intentional cognate ("Script" is the
     // standard fr-FR loanword) on top of the pre-existing ones.
     'pages.json': 16, // +2 W01 #10132: titles.wispChat and titles.aiForOffice "Breeze AI" brand names; // +1 W08 #9921 titles.wisp "Wisp" (product name); +1 titles.adminWisp "Wisp" (product name); Cognates: CIS Benchmarks, Extension, Incidents, Webhooks (x2), OneDrive, EDR, Variables, Ticket(s) (x2), Scripts, and one settings-card title (Sites).
-    'patches.json': 26, // +3 ring feature-update control: updateRingForm.featureUpdates.productWindows11/productWindows10 are product names and releasePlaceholder "25H2" is a Windows release token — identical in every locale
+    'patches.json': 27, // +1 #11074 vendorUpdates.columns.site "Site" is the fr-CA word; +3 ring feature-update control: updateRingForm.featureUpdates.productWindows11/productWindows10 are product names and releasePlaceholder "25H2" is a Windows release token — identical in every locale
     'peripherals.json': 9,
     'policies.json': 204,
     'portal.json': 4,
@@ -524,7 +533,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 18,
-    'reports.json': 48, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates)
+    'reports.json': 51, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates) · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
@@ -534,7 +543,7 @@ const namespaceDuplicateBaselines = {
     // in fr-FR.
     'scripts.json': 66, // +2 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
     // +2 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 148, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name
+    'security.json': 150, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name · fork: +2 (ICOOL fork features)
     // +1: orgDefaultsEditor.enrollment.capMinutes — "{{minutes}} minutes" is
     // spelled identically in French.
     // +2: bulkOrgImport.mapping.site + preview.site — "Site" is the same word
@@ -584,7 +593,7 @@ const namespaceDuplicateBaselines = {
     // +3 Wisp memory: wispMemory.tabs.org "Client", columns.type "Type", columns.actions "Actions" are identical in French.
     // +2 ticketRouting loanwords (Portal/API/Normal/Status) from #9785.
     // +2 Sites page (#9794): sites.page.title and siteDetailPage.breadcrumbs.sites "Sites" are the identical French word.
-    'settings.json': 200,
+    'settings.json': 201, // fork: +1 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -613,7 +622,7 @@ const namespaceDuplicateBaselines = {
     // values and the example base URL are literal placeholders, not wording.
     // W01 #7599 admin.aiModels.*: +3 identical cognates (Actions, Budget, Standard).
     // #7609 admin.aiModels.variants.*: +3 identical cognates (Conversations, Candidate, Active).
-    'admin.json': 50, // +8 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate
+    'admin.json': 51, // +8 audit.resourceTypes (#9856): cognates/brand names identical to English (Webhook, Script, Ticket, Site, ...); +2 Wisp admin page: product name "Wisp" + cognate · fork: +1 (ICOOL fork features)
     'ai.json': 12, // +2 W01 #10132: "Breeze AI" brand name is identical in every locale (chat door title, empty-state title); // +1 W04b #9916: wisp.title "Wisp" is a protected proper noun
     // +3 W07 (#5212, AI Operator task detail): originKind "ticket"/"chat" and
     // waitReason "information" are identical cognates in fr-CA.
@@ -683,7 +692,7 @@ const namespaceDuplicateBaselines = {
     // — "action"/"actions" are identical cognates in fr-CA.
     // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
     // +1 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'devices.json': 170, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +3 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    'devices.json': 171, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Interfaces" cognate · +3 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels · fork: +1 (ICOOL fork features)
     'discovery.json': 15,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
@@ -702,16 +711,18 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 6, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-CA.
     'fleetDesign.json': 3,
     // Flows (#5218): 'Webhook' (loanword), 'Validation' and 'Version {{version}}' are spelled identically in French.
-    'flows.json': 9, // W05 #5220: + Webhook (tab, title), 'Secret', three pure-interpolation strings
+    'flows.json': 10, // W05 #5220: + Webhook (tab, title), 'Secret', three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +1 (W03 #6011): backupProviders.cove is a protected proper noun pinned
     // byte-identical by localeParity.
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 42,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 44, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): "Description" (field label), "Occurrences"
     // (event-log count field), "Direction" (bandwidth/disk-I/O field),
     // "Application" (event-log category), "CPU" (resource select), "Total"
@@ -724,15 +735,15 @@ const namespaceDuplicateBaselines = {
     // here) made titles.scripts an intentional cognate ("Script" is the
     // standard loanword) on top of the pre-existing ones.
     'pages.json': 16, // +2 W01 #10132: titles.wispChat and titles.aiForOffice "Breeze AI" brand names; // +1 W08 #9921 titles.wisp "Wisp" (product name); +1 titles.adminWisp "Wisp" (product name); Cognates: CIS Benchmarks, Extension, Incidents, Webhooks (x2), OneDrive, EDR, Variables, Ticket(s) (x2), Scripts, and one settings-card title (Sites).
-    'patches.json': 26, // +3 ring feature-update control: updateRingForm.featureUpdates.productWindows11/productWindows10 are product names and releasePlaceholder "25H2" is a Windows release token — identical in every locale
+    'patches.json': 27, // +1 #11074 vendorUpdates.columns.site "Site" is the fr-FR word; +3 ring feature-update control: updateRingForm.featureUpdates.productWindows11/productWindows10 are product names and releasePlaceholder "25H2" is a Windows release token — identical in every locale
     'peripherals.json': 9,
     'policies.json': 204,
     'portal.json': 4,
     // +1: the input placeholder "XXX-XXX-XXX" is a code-shape mask, not
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
-    'remote.json': 17,
-    'reports.json': 48, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates)
+    'remote.json': 18, // +1: servicesManager.title "Services" is the French word too
+    'reports.json': 51, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates) · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
@@ -742,7 +753,7 @@ const namespaceDuplicateBaselines = {
     // in fr-CA.
     'scripts.json': 66, // +2 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
     // +2 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 148, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name
+    'security.json': 150, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name · fork: +2 (ICOOL fork features)
     // +1: orgDefaultsEditor.enrollment.capMinutes — "{{minutes}} minutes" is
     // spelled identically in French.
     // +2: bulkOrgImport.mapping.site + preview.site — "Site" is the same word
@@ -794,7 +805,7 @@ const namespaceDuplicateBaselines = {
     // +3 Wisp memory: wispMemory.tabs.org "Client", columns.type "Type", columns.actions "Actions" are identical in French.
     // +2 ticketRouting loanwords (Portal/API/Normal/Status) from #9785.
     // +2 Sites page (#9794): sites.page.title and siteDetailPage.breadcrumbs.sites "Sites" are the identical French word.
-    'settings.json': 205,
+    'settings.json': 206, // fork: +1 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -907,7 +918,8 @@ const namespaceDuplicateBaselines = {
     // +4 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
     // +1 (#10190 W01): deviceInfoTab.assistStatus.label is the product name "Breeze Assist".
     // +1 (#8134 W1-D1): physicalPlacementCard.rack — "Rack" is the standard loanword in this locale.
-    'devices.json': 188, // +1 assetCircuitCard (#8134 W1-D2): "WAN" acronym · +7 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    // +1 vendorUpdates.category (#11069): "BIOS" acronym and "Firmware", the German term; one fit the existing headroom.
+    'devices.json': 190, // +1 assetCircuitCard (#8134 W1-D2): "WAN" acronym · fork: +8 (ICOOL fork features)
     // +1 (#5213 W03): assetTypes.website — "Website" is the German word.
     // +1 (#5433): tabs.baselines — "Baselines" is the identical loanword in
     // German, matching networkBaselinesPanel.title's existing "Netzwerk-Baselines".
@@ -929,16 +941,18 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 6, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // Flows (#5218): 'Name', 'Status', 'Webhook' and 'Version {{version}}' are spelled identically in German.
     // +1 W04 (#5219): runs.columns.status — the same 'Status' as list.status.
-    'flows.json': 11, // W05 #5220: + Webhook (tab, title), 'Status' column, three pure-interpolation strings
+    'flows.json': 12, // W05 #5220: + Webhook (tab, title), 'Status' column, three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +1 (W03 #6011): backupProviders.cove is a protected proper noun pinned
     // byte-identical by localeParity.
     // +1 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 46,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 51, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): +7 on top of the pre-existing +1 —
     // "Name" (list/legacy column + field label), "Monitor" (policy-tab
     // column), "Hardware"/"System" (event-log categories), "CPU" (resource
@@ -958,7 +972,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 14,
-    'reports.json': 53,
+    'reports.json': 58, // +2 (#11018): reportPreview.slaPerformance.median and .priorities.normal ("Median", "Normal" are the German words). · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +1: automationRunHistory.scriptOutput.stderr — a stream name, not
     // wording; intentionally identical in every catalog (#3162).
@@ -970,7 +984,7 @@ const namespaceDuplicateBaselines = {
     // +1 #6263 W01: securityScansPage.scansTab — "Scans" is the standard
     // German loanword in this locale, same root cause as "Status" above.
     // +4 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 175, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +2 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" and .targeted "{{devices}} in {{orgs}}" are placeholders only
+    'security.json': 177, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +2 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" and .targeted "{{devices}} in {{orgs}}" are placeholders only · fork: +2 (ICOOL fork features)
     // +1: bulkOrgImport.preview.status — "Status" is the German word too.
     // +1: aiAgentsPage.fields.name — "Name" is the German word too.
     // +1: pre-existing 1-duplicate baseline drift from before wave 6.1 Task 4
@@ -1002,7 +1016,7 @@ const namespaceDuplicateBaselines = {
     // W04 Task 12 (#7602) de-DE: aiModels.models.details "Details" and offering.speed.standard "Standard" are spelled identically (+2).
     // +1 customer work approval (#8196): timeTrackingSettingsCard.approval.source.partner — "Partner" is the identical German term.
     // +6 Plan & features (#9907): planAndFeatures.plans.{starter,community,pro,enterprise} are plan-tier product names, features.wisp.label is the Wisp product name, and noLimits is the em-dash placeholder — identical in every catalog.
-    'settings.json': 216, // +ticketRouting loanwords (Portal/API/Normal/Status), +1 wispMemory.columns.status
+    'settings.json': 217, // +ticketRouting loanwords (Portal/API/Normal/Status), +1 wispMemory.columns.status · fork: +1 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -1084,7 +1098,8 @@ const namespaceDuplicateBaselines = {
     // +2 (#9610): vulnerabilities table.cve/cvss/kev are identical locale-invariant acronyms (CVE, CVSS, KEV).
     // +1 (#10190 W01): deviceInfoTab.assistStatus.label is the product name "Breeze Assist".
     // +1 (#8134 W1-D1): physicalPlacementCard.rack — "Rack" is the standard loanword in this locale.
-    'devices.json': 166, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Provider" cognate · +7 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    // +2 vendorUpdates.category (#11069): "BIOS" acronym; "Firmware" is the term this catalog uses everywhere, including this section's own sentences.
+    'devices.json': 168, // +2 assetCircuitCard (#8134 W1-D2): "WAN" acronym and "Provider" cognate · fork: +7 (ICOOL fork features)
     'discovery.json': 22,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
@@ -1103,18 +1118,19 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 3, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in it-IT.
     'fleetDesign.json': 2,
     // Flows (#5218): 'Trigger' (twice), 'Webhook', 'Timeout' and 'Input' are the standard Italian IT loanwords.
     // +1 W04 (#5219): runs.columns.trigger — the same 'Trigger' loanword.
-    'flows.json': 11, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings
+    'flows.json': 12, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +4 (W03 #6011): integrationsPage.backup ("Backup" is spelled identically
     // in it-IT), backupProviders.cove and backupProviders.namePlaceholder are
     // protected proper nouns, and one more backupProviders label spells
     // identically to English in it-IT.
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 86,
+    'integrations.json': 89, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): +4 on top of the pre-existing +1 —
     // "Monitor" (policy-tab column), "Info" (severity), "Hardware"
     // (event-log category), "CPU" (resource select) are identical
@@ -1133,13 +1149,13 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 14,
-    'reports.json': 51,
+    'reports.json': 54, // fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
     'scripts.json': 62, // +3 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
     // +3 (#8166 W02 PR-B): EDR provider UI labels that are identical cognates/loanwords in this locale (e.g. Status, Info, Online, Endpoints, Provider).
-    'security.json': 169, // +2 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" and .targeted "{{devices}} in {{orgs}}" are placeholders only
+    'security.json': 171, // +2 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" and .targeted "{{devices}} in {{orgs}}" are placeholders only · fork: +2 (ICOOL fork features)
     // +1: partnerAiProvider.endpointCardTitle (#3922 W4) — "Endpoint" is the
     // standard loanword in it-IT technical UI.
     // +1: pre-existing 1-duplicate baseline drift from before wave 6.1 Task 4
@@ -1167,7 +1183,7 @@ const namespaceDuplicateBaselines = {
     // W04 Task 12 (#7602) it-IT: aiModels.offering.prices.input/output ("Input"/"Output") and speed.standard "Standard" are spelled identically (+3).
     // +1 customer work approval (#8196): timeTrackingSettingsCard.approval.source.partner — "Partner" is the identical Italian term.
     // +6 Plan & features (#9907): planAndFeatures.plans.{starter,community,pro,enterprise} are plan-tier product names, features.wisp.label is the Wisp product name, and noLimits is the em-dash placeholder — identical in every catalog.
-    'settings.json': 188, // +ticketRouting loanwords (Portal/API/Normal/Status)
+    'settings.json': 190, // +ticketRouting loanwords (Portal/API/Normal/Status) · fork: +2 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -1235,7 +1251,8 @@ const namespaceDuplicateBaselines = {
     'deliverables.json': 2,
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
     // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
-    'devices.json': 102, // +1 assetCircuitCard (#8134 W1-D2): "WAN" acronym · +5 deviceGrouping (fork): CPU/RAM/PDF/CSV/Excel labels
+    // +1 vendorUpdates.category (#11069): "BIOS" acronym.
+    'devices.json': 103, // +1 assetCircuitCard (#8134 W1-D2): "WAN" acronym · fork: +5 (ICOOL fork features)
     'discovery.json': 9,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
@@ -1254,14 +1271,16 @@ const namespaceDuplicateBaselines = {
     // +1 (Part of #3859, Wave E4a): NO_UPDATES_PROVIDED added as an English placeholder too.
     // #8977: every ERROR_CODES value is translated; no exact-English duplicates allowed.
     'errors.json': 0,
+    'file-egress.json': 2, // fork: file egress i18n ("USB", "Status"-style cognates)
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // Flows (#5218): 'Webhook' is the untranslated industry loanword.
-    'flows.json': 6, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings
+    'flows.json': 7, // W05 #5220: + Webhook (tab, title) and three pure-interpolation strings · fork: +1 (ICOOL fork features)
     // +2 (W03 #6011): backupProviders.cove and backupProviders.namePlaceholder
     // are protected proper nouns pinned byte-identical by localeParity.
     // +1 W02 #10600: backupProviders.dropsuite is a product name.
-    'integrations.json': 25,
+    // +1 W02 #11271: backupProviders.axcient is a product name.
+    'integrations.json': 29, // +W3 (#7690) Deep telemetry labels identical in this locale (CPU, Uplink RX and TX, Online, Offline, Uptime are loanwords or acronyms)
     // #5289 (monitors W02 web): "CPU" (resource select) is the identical
     // acronym in tr-TR.
     'monitoring.json': 1,
@@ -1280,10 +1299,11 @@ const namespaceDuplicateBaselines = {
     'portal.json': 2,
     'quick.json': 1,
     'remote.json': 4,
-    'reports.json': 32, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
+    'reports.json': 36, // +1 (#11018): reportPreview.slaPerformance.priorities.normal ("Normal" is the Turkish word). · fork: +3 (ICOOL fork features)
     'restorePoints.json': 0,
     'scripts.json': 41, // +3 W01 #10132: script-editor panel title, empty-state title, button "Breeze AI" brand name
-    'security.json': 89, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only
+    'security.json': 91, // +1 W01 #10132: sweeps.panel.origin.ai_chat "Breeze AI" brand name; +1 #10080: sweeps.dialog.preview.org "{{org}}: {{devices}}" is placeholders only · fork: +2 (ICOOL fork features)
     // +1: pre-existing 1-duplicate baseline drift from before wave 6.1 Task 4
     // (see the pt-BR block's note above — same root cause, carried forward
     // rather than root-caused here). aiAgentsPage.runs (#3828 Task 4) itself
@@ -1302,7 +1322,7 @@ const namespaceDuplicateBaselines = {
     // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
     // #7609 aiModels.quality.groupBy.model: "Model" is the identical word in Turkish.
     // +6 Plan & features (#9907): planAndFeatures.plans.{starter,community,pro,enterprise} are plan-tier product names, features.wisp.label is the Wisp product name, and noLimits is the em-dash placeholder — identical in every catalog.
-    'settings.json': 84, // +ticketRouting loanwords (Portal/API/Normal/Status)
+    'settings.json': 86, // +1 contactsCard.portal.column "Portal"; +ticketRouting loanwords (Portal/API/Normal/Status) · fork: +1 (ICOOL fork features)
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     'tickets.json': 12,
@@ -1467,8 +1487,23 @@ describe('SaaS backup locale labels', () => {
     for (const key of ['resellerTokenLabel', 'authTokenLabel', 'baseUrlLabel', 'baseUrlHelp', 'dropsuiteCredentialsHelp', 'dropsuiteReentryHelp', 'workloads', 'unmappedWorkloads', 'unmappedWorkloadsSummary', 'workloadMappingHelp', 'deleteWorkloadsConfirm']) {
       expect(strings.get(`integrations.json:backupProviders.${key}`), key).toBeTruthy();
     }
-    for (const key of ['saasAccounts', 'saasAccountsSubtitle', 'saas', 'workloadBackup', 'sourceProvider', 'dataSource.m365_mail', 'dataSource.gws_mail', 'dataSource.gws_drive', 'dataSource.gws_shared_drive']) {
+    for (const key of ['saasAccounts', 'saasAccountsSubtitle', 'saas', 'workloadBackup', 'sourceProvider', 'dataSource.m365_mail', 'dataSource.gws_mail', 'dataSource.gws_drive', 'dataSource.gws_shared_drive', 'status.paused']) {
       expect(strings.get(`backup.json:backupHealth.${key}`), key).toBeTruthy();
+    }
+  });
+
+  it.each(['en', ...translatedLocales])('%s includes verified-bootable labels', (locale) => {
+    const strings = readLocale(locale);
+    for (const key of ['dataSource.image', 'external.bootCheck', 'table.verifiedBootable', 'verifiedBootable.passed', 'verifiedBootable.failed', 'verifiedBootable.never_run', 'verifiedBootable.not_applicable']) {
+      expect(strings.get(`backup.json:backupHealth.${key}`), key).toBeTruthy();
+    }
+  });
+
+  it.each(['en', ...translatedLocales])('%s includes Axcient setup labels', (locale) => {
+    const strings = readLocale(locale);
+    expect(strings.get('integrations.json:backupProviders.axcient')).toBe('Axcient x360Recover');
+    for (const key of ['namePlaceholderAxcient', 'apiKeyLabel', 'axcientCredentialsHelp', 'axcientReentryHelp']) {
+      expect(strings.get(`integrations.json:backupProviders.${key}`), key).toBeTruthy();
     }
   });
 });

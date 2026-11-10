@@ -51,6 +51,7 @@ import {
   type EndpointManagementSummary,
   type VulnerabilityManagementSummary,
   type IdentityAccessSummary,
+  type TicketSlaPerformanceSummary,
   type TicketSlaSummary,
   type TechnicianTimeSummary,
   type AiUsageByClientSummary,
@@ -526,6 +527,8 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
             | QuoteWinRateSummary
             // #9828 — Client profitability.
             | ClientProfitabilitySummary
+            // #11018 — SLA performance.
+            | TicketSlaPerformanceSummary
             | undefined,
           // Drives the scorecard trend chip ("79, up from 74 last month")
           // when the stored run snapshot captured a prior baseline.
