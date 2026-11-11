@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { csvRow } from '../../lib/csvExport';
-import { buildDevicesCsv, devicesCsvFilename, exportColumns, formatAttentionForCsv } from './deviceCsvExport';
+import { buildDevicesCsv, buildDevicesTable, devicesCsvFilename, exportColumns, formatAttentionForCsv } from './deviceCsvExport';
 import type { ColumnId } from './columnVisibility';
 import type { Device } from './DeviceList';
 
@@ -148,5 +148,33 @@ describe('deviceCsvExport (#9726)', () => {
 
   it('names the file by date', () => {
     expect(devicesCsvFilename(new Date('2026-10-22T23:59:00Z'))).toBe('devices-2026-10-22.csv');
+  });
+});
+
+// Fork: the PDF export passes a translator; CSV / Excel never do.
+describe('buildDevicesTable translate (fork)', () => {
+  const device = {
+    id: 'd1', deviceClass: 'manual', hostname: 'CCY-01', os: 'linux', osVersion: '13', status: 'online',
+    cpuPercent: 0, ramPercent: 0, lastSeen: '', orgId: 'o', orgName: 'Acme', siteId: 's', siteName: 'ICOOL CẦU CHỮ Y',
+    agentVersion: '', tags: [], pendingReboot: true,
+  } as unknown as Parameters<typeof buildDevicesTable>[0]['devices'][number];
+  const input = {
+    devices: [device],
+    columns: ['hostname', 'class', 'site', 'pendingReboot', 'ramTotal'] as const,
+    customFieldDefs: [{ fieldKey: 'k', name: 'Phòng', type: 'text' }],
+    statusLabel: () => 'Online',
+  };
+  const vi: Record<string, string> = { Device: 'Thiết bị', Class: 'Phân loại', 'Pending Reboot': 'Chờ khởi động lại', 'RAM (MB)': 'RAM (MB)', Yes: 'Có', Manual: 'Thủ công' };
+
+  it('translates headers and fixed words but never data or custom-field names', () => {
+    const table = buildDevicesTable({ ...input, translate: (s) => vi[s] ?? s });
+    expect(table.header).toEqual(['Thiết bị', 'Phân loại', 'Site', 'Chờ khởi động lại', 'RAM (MB)', 'Phòng']);
+    expect(table.rows[0]).toEqual(['CCY-01', 'Thủ công', 'ICOOL CẦU CHỮ Y', 'Có', '', '']);
+  });
+
+  it('keeps the stable English headers without a translator', () => {
+    const table = buildDevicesTable(input);
+    expect(table.header).toEqual(['Device', 'Class', 'Site', 'Pending Reboot', 'RAM (MB)', 'Phòng']);
+    expect(table.rows[0]!.slice(0, 4)).toEqual(['CCY-01', 'Manual', 'ICOOL CẦU CHỮ Y', 'Yes']);
   });
 });

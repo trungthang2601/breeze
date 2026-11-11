@@ -1,6 +1,7 @@
 export { buildReportPdf, buildDeviceListPdf, parseHexColor, pdfSafeText } from './reportPdf';
 export type { DeviceListPdfInput, DeviceListPdfSection } from './reportPdf';
-export type { ReportBranding, BuildOpts } from './reportPdf';
+export type { ReportBranding, BuildOpts, PdfFont } from './reportPdf';
+export { PDF_TRANSLATIONS, pdfTranslator, type PdfTranslator } from './pdfLabels';
 export { renderThreatDetectionReport } from './threatDetectionPdf';
 export type { ThreatDetectionPdfOpts } from './threatDetectionPdf';
 export { renderEndpointManagementReport } from './endpointManagementPdf';

@@ -44,6 +44,12 @@ export type DevicesCsvInput = {
    * hostname so a spreadsheet can filter / pivot by the same groups.
    */
   groupColumns?: ReadonlyArray<{ header: string; value: (device: Device) => string }>;
+  /**
+   * Fork: translates the English column headers and fixed words (Yes / No /
+   * Manual / …). Only the PDF export passes it — CSV and Excel keep the stable
+   * English headers so files diff and script the same in every locale.
+   */
+  translate?: (english: string) => string;
 };
 
 const OS_LABELS: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
@@ -164,18 +170,23 @@ const EXPORT_HEADER_OVERRIDES: Partial<Record<ColumnId, string>> = {
   power: 'Power (%)',
 };
 
+// Fixed English words columnCell emits; anything else is data and is never translated.
+const TRANSLATABLE_CELLS: ReadonlySet<string> = new Set(['Yes', 'No', 'Manual', 'Network', 'Agent', 'unavailable']);
+
 /** Header + body cells, shared by the CSV, Excel and PDF exports. */
 export function buildDevicesTable(input: DevicesCsvInput): { header: string[]; rows: Array<Array<string | number>> } {
   const columns = exportColumns(input.columns);
   const groups = input.groupColumns ?? [];
   const [first, ...rest] = columns;
+  const tr = input.translate ?? ((s: string) => s);
   const header = [
-    EXPORT_HEADER_OVERRIDES[first] ?? COLUMN_LABELS[first],
+    tr(EXPORT_HEADER_OVERRIDES[first] ?? COLUMN_LABELS[first]),
     ...groups.map((g) => g.header),
-    ...rest.map((c) => EXPORT_HEADER_OVERRIDES[c] ?? COLUMN_LABELS[c]),
+    ...rest.map((c) => tr(EXPORT_HEADER_OVERRIDES[c] ?? COLUMN_LABELS[c])),
     ...input.customFieldDefs.map((d) => d.name),
   ];
-  const cell = (v: string | number | null | undefined): string | number => (v === null || v === undefined ? '' : v);
+  const cell = (v: string | number | null | undefined): string | number =>
+    v === null || v === undefined ? '' : typeof v === 'string' && TRANSLATABLE_CELLS.has(v) ? tr(v) : v;
   const rows = input.devices.map((d) => [
     cell(columnCell(first, d, input)),
     ...groups.map((g) => g.value(d)),

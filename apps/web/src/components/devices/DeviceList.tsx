@@ -1825,9 +1825,9 @@ export default function DeviceList({
           devicesCsvFilename(new Date(), "xlsx"),
         );
       } else {
-        const { buildDeviceListPdfBlob } = await import("./deviceListPdf");
+        const { buildDeviceListPdfBlob, deviceListPdfTranslator } = await import("./deviceListPdf");
         const blob = await buildDeviceListPdfBlob({
-          table: buildDevicesTable(tableInput),
+          table: buildDevicesTable({ ...tableInput, translate: deviceListPdfTranslator() }),
           devices: rows,
           grouping: fleetView && isGrouping(grouping) ? grouping : null,
           unknownLabel: t("deviceGrouping.unknown"),

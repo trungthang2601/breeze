@@ -15,6 +15,7 @@ import { isTicketSlaPerformanceSummary, rowsToXlsx, sheetsToXlsx, ticketSlaPerfo
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { escapeCsvCell, escapeTsvCell, neutralizeSpreadsheetFormula, rowsToCsv, withUtf8Bom } from '@/lib/csvExport';
 import { downloadBlob } from '@/lib/downloadBlob';
+import { loadPdfFont, pdfLocale } from '@/lib/pdfFont';
 import { sanitizeImageSrc } from '@/lib/safeImageSrc';
 import { fetchWithAuth } from '../../stores/auth';
 import { buildReportPdf, parseHexColor, type ReportBranding } from '@breeze/shared/reportPdf';
@@ -121,7 +122,9 @@ export async function exportReport(
     timeStyle: 'short',
   });
   const branding = opts.branding ?? (await loadPartnerBranding());
-  const doc = buildReportPdf(rows, { reportType, generatedAt, timezone, summary, previous, branding });
+  // Fork: embed the Unicode font (diacritics) and write the translated strings in the UI language.
+  const font = await loadPdfFont();
+  const doc = buildReportPdf(rows, { reportType, generatedAt, timezone, summary, previous, branding, font, locale: pdfLocale() });
   downloadBlob(doc.output('blob'), `${baseFilename}.pdf`);
 }
 

@@ -1,6 +1,7 @@
 // Fork: PDF export of the Devices & Assets list, split into the groups the
 // list is showing. Loaded on demand (jsPDF is heavy).
-import { buildDeviceListPdf, type DeviceListPdfSection } from '@breeze/shared/reportPdf';
+import { buildDeviceListPdf, pdfTranslator, type DeviceListPdfSection, type PdfTranslator } from '@breeze/shared/reportPdf';
+import { loadPdfFont, pdfLocale } from '@/lib/pdfFont';
 import { loadPartnerBranding } from '../reports/reportExport';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import type { Device } from './DeviceList';
@@ -20,9 +21,20 @@ type Input = {
   dimensionLabel: (d: GroupDimension) => string;
   title: string;
   timezone?: string;
+  /** UI language; defaults to the current one. */
+  locale?: string;
 };
 
+/** Translator for the PDF's column headers, in the current UI language. */
+export function deviceListPdfTranslator(): PdfTranslator {
+  return pdfTranslator(pdfLocale());
+}
+
+const countsLabel = (T: PdfTranslator, count: number, online: number, sep: string): string =>
+  `${T(count === 1 ? '{count} device' : '{count} devices', { count })}${sep}${T('{count} online', { count: online })}`;
+
 export function buildDeviceListPdfSections(input: Input): DeviceListPdfSection[] {
+  const T = pdfTranslator(input.locale ?? pdfLocale());
   const rowById = new Map<string, string[]>();
   input.devices.forEach((d, i) => rowById.set(d.id, (input.table.rows[i] ?? []).map((c) => String(c ?? ''))));
   if (!input.grouping) {
@@ -35,7 +47,7 @@ export function buildDeviceListPdfSections(input: Input): DeviceListPdfSection[]
     if (item.type === 'header') {
       const h = item.header;
       current = {
-        title: `${label(h.values)}   ·   ${h.count} device${h.count === 1 ? '' : 's'}, ${h.online} online`,
+        title: `${label(h.values)}   ·   ${countsLabel(T, h.count, h.online, ', ')}`,
         level: h.level,
         rows: [],
       };
@@ -49,17 +61,20 @@ export function buildDeviceListPdfSections(input: Input): DeviceListPdfSection[]
 
 export async function buildDeviceListPdfBlob(input: Input): Promise<Blob> {
   const branding = await loadPartnerBranding().catch(() => undefined);
+  const locale = input.locale ?? pdfLocale();
+  const T = pdfTranslator(locale);
+  const font = await loadPdfFont();
   const timezone = input.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   const g = input.grouping;
   const groupedBy = g
     ? [...(g.bySite ? (['site'] as const) : []), ...g.hardware].map((d) => input.dimensionLabel(d)).join(' + ')
     : '';
   const online = input.devices.filter((d) => d.status === 'online').length;
-  const meta = `${input.devices.length} device${input.devices.length === 1 ? '' : 's'}   ·   ${online} online`
-    + (groupedBy ? `   ·   grouped by ${groupedBy}` : '');
+  const meta = countsLabel(T, input.devices.length, online, '   ·   ')
+    + (groupedBy ? `   ·   ${T('grouped by {groups}', { groups: groupedBy })}` : '');
   const doc = buildDeviceListPdf(
     { title: input.title, meta, columns: input.table.header, sections: buildDeviceListPdfSections(input) },
-    { generatedAt: formatDateTime(new Date(), { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }), timezone, branding },
+    { generatedAt: formatDateTime(new Date(), { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }), timezone, branding, font, locale },
   );
   return doc.output('blob');
 }
