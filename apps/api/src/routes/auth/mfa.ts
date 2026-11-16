@@ -186,7 +186,7 @@ mfaRoutes.get('/mfa/enrollment-options', authMiddleware, async (c) => {
 
   const auth = c.get('auth');
   const [user] = await db
-    .select({ phoneNumber: users.phoneNumber, phoneVerified: users.phoneVerified })
+    .select({ phoneNumber: users.phoneNumber, phoneVerified: users.phoneVerified, mfaEnabled: users.mfaEnabled })
     .from(users)
     .where(eq(users.id, auth.user.id))
     .limit(1);
@@ -207,8 +207,11 @@ mfaRoutes.get('/mfa/enrollment-options', authMiddleware, async (c) => {
     // grace window is open, and it is what the dashboard banner nudges from.
     // `mfaEnrollmentRequired` is the live verdict for an unenrolled user, so a
     // client can tell "must enrol now" from "must enrol by <date>".
-    mfaEnrollmentRequired: policy.required,
-    mfaGraceEndsAt: policy.pendingEnrollment?.deadline ?? null,
+    // Same verdict as login.ts: a user who already has MFA enabled is never
+    // "required to enrol", otherwise the web client loops them back to the
+    // setup page while /mfa/setup answers "MFA is already enabled".
+    mfaEnrollmentRequired: !user.mfaEnabled && policy.required,
+    mfaGraceEndsAt: user.mfaEnabled ? null : (policy.pendingEnrollment?.deadline ?? null),
   });
 });
 
