@@ -8,6 +8,8 @@
 # the file to container_file_t so SELinux (enforcing) permits the read —
 # shared label since both redis and api mount the same host file.
 services:
+  postgres:
+    shm_size: 512mb
   # Fork uses a locally-built binaries image (ghcr push needs a PAT this
   # host lacks). pull_policy: never uses the local podman image store so
   # binaries-init seeds /data/binaries with the FORK agent binaries
