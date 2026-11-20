@@ -25,6 +25,8 @@ services:
       dockerfile: docker/Dockerfile.api
       args:
         APP_VERSION: ${BREEZE_VERSION:-dev}
+    environment:
+      APP_VERSION: ${BREEZE_VERSION:-dev}
 
   worker:
     image: breeze-api:selfbuild

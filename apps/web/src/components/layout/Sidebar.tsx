@@ -1353,7 +1353,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
       {showLabels && (
         <div className="border-t px-4 py-2 text-[11px] text-muted-foreground">
           <p>
-            Web <VersionSpan version={WEB_VERSION} latest={latestVersion} component="Web" />
+            Web <VersionSpan version={apiVersion && apiVersion !== 'unavailable' ? apiVersion : WEB_VERSION} latest={latestVersion} component="Web" />
             {apiVersion && apiVersion !== 'unavailable' && (
               <>
                 {' · '}API <VersionSpan version={apiVersion} latest={latestVersion} component="API" />
