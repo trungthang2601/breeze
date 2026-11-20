@@ -5692,7 +5692,7 @@ func (h *Heartbeat) sendHeartbeat() {
 	payload.HelperCapabilities = h.callerHelperCapabilities()
 
 	// Compute uptime from boot time
-	if bootTime, err := host.BootTime(); err != nil {
+	if bootTime, err := effectiveBootTime(); err != nil {
 		log.Warn("failed to read boot time for uptime calculation", "error", err.Error())
 	} else if bootTime > 0 {
 		payload.UptimeSeconds = time.Now().Unix() - int64(bootTime)
