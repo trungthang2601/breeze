@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, useCallback } from 'react'
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { MAX_DISCOVERY_SUBNET_HOSTS, findOversizedDiscoverySubnet } from '@breeze/shared';
+import TimezoneSelect from '@/components/shared/TimezoneSelect';
 
 export type DiscoverySchedule = {
   cadence: 'hourly' | 'interval' | 'daily' | 'weekly' | 'monthly';
@@ -148,7 +149,7 @@ const defaultValues: DiscoveryProfileFormValues = {
     time: '02:00',
     dayOfWeek: 'Monday',
     dayOfMonth: '1',
-    timezone: 'UTC'
+    timezone: 'Asia/Ho_Chi_Minh'
   },
   snmp: {
     version: 'v2c',
@@ -517,23 +518,21 @@ export default function DiscoveryProfileForm({
                 />
               </div>
               <div>
-                <label className="text-sm font-medium">{t('discoveryProfileForm.fields.timezone')}</label>
-                <select
-                  value={formValues.schedule.timezone}
-                  onChange={event =>
-                    setFormValues(prev => ({
-                      ...prev,
-                      schedule: { ...prev.schedule, timezone: event.target.value }
-                    }))
-                  }
-                  className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-                >
-                  <option value="UTC">UTC</option>
-                  <option value="America/New_York">America/New_York</option>
-                  <option value="America/Chicago">America/Chicago</option>
-                  <option value="America/Denver">America/Denver</option>
-                  <option value="America/Los_Angeles">America/Los_Angeles</option>
-                </select>
+                <label htmlFor="discovery-schedule-timezone" className="text-sm font-medium">{t('discoveryProfileForm.fields.timezone')}</label>
+                <div className="mt-2">
+                  <TimezoneSelect
+                    id="discovery-schedule-timezone"
+                    label={t('discoveryProfileForm.fields.timezone')}
+                    value={formValues.schedule.timezone}
+                    onChange={timezone =>
+                      setFormValues(prev => ({
+                        ...prev,
+                        schedule: { ...prev.schedule, timezone }
+                      }))
+                    }
+                    testId="discovery-schedule-timezone"
+                  />
+                </div>
               </div>
             </>
           )}
