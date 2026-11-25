@@ -177,7 +177,10 @@
       "expandAria": "Show findings on {{deviceName}}",
       "collapseAria": "Hide findings on {{deviceName}}",
       "loading": "Loading findings…",
-      "loadError": "Failed to load device findings"
+      "loadError": "Failed to load device findings",
+      "online": "Online now",
+      "lastSeen": "Last seen {{when}}",
+      "version": "Version {{versions}}"
     }
   },
   "softwareGroupTable": {

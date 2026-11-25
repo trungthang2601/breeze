@@ -177,7 +177,10 @@
       "expandAria": "Hiển thị phát hiện trên {{deviceName}}",
       "collapseAria": "Ẩn phát hiện trên {{deviceName}}",
       "loading": "Đang tải phát hiện…",
-      "loadError": "Không thể tải phát hiện của thiết bị"
+      "loadError": "Không thể tải phát hiện của thiết bị",
+      "online": "Đang online",
+      "lastSeen": "Thấy lần cuối {{when}}",
+      "version": "Phiên bản {{versions}}"
     }
   },
   "softwareGroupTable": {

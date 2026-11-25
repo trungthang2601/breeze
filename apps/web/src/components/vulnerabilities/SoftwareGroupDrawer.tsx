@@ -205,10 +205,25 @@ export function SoftwareGroupDrawer({
     t('softwareGroupDrawer.titleFallback')
   );
 
+  // Line 1: where the machine is and whether it is reachable.
+  const deviceWhere = (d: GroupDevice): string =>
+    [
+      d.siteName ?? d.orgName,
+      d.deviceStatus === 'online'
+        ? t('softwareGroupDrawer.device.online')
+        : d.lastSeenAt
+          ? t('softwareGroupDrawer.device.lastSeen', { when: new Date(d.lastSeenAt).toLocaleString() })
+          : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+  // Line 2: installed version and finding counts.
   const deviceMeta = (d: GroupDevice): string =>
     [
-      d.orgName,
-      d.installedVersions.join(', ') || null,
+      d.installedVersions.length > 0
+        ? t('softwareGroupDrawer.device.version', { versions: d.installedVersions.join(', ') })
+        : null,
       t('softwareGroupDrawer.device.openOf', { open: d.openFindingCount, count: d.cveCount }),
       d.acceptedFindingCount > 0 ? t('softwareGroupDrawer.device.accepted', { count: d.acceptedFindingCount }) : null,
       d.mitigatedFindingCount > 0 ? t('softwareGroupDrawer.device.mitigated', { count: d.mitigatedFindingCount }) : null,
@@ -218,7 +233,7 @@ export function SoftwareGroupDrawer({
       .join(' · ');
 
   return (
-    <Drawer open onClose={onClose} title={title} width="max-w-xl" dataTestId="vuln-software-drawer" closeDisabled={busy !== null}>
+    <Drawer open onClose={onClose} title={title} width="max-w-2xl" dataTestId="vuln-software-drawer" closeDisabled={busy !== null}>
       <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
         {error && (
           <div
@@ -321,8 +336,17 @@ export function SoftwareGroupDrawer({
                             className="h-4 w-4 rounded border disabled:opacity-40"
                           />
                           <span className="min-w-0 flex-1">
-                            <span className="block truncate font-medium">{d.deviceName}</span>
-                            <span className="block truncate text-xs text-muted-foreground">{deviceMeta(d)}</span>
+                            <span className="flex items-center gap-1.5 font-medium">
+                              <span
+                                aria-hidden
+                                className={`inline-block h-2 w-2 shrink-0 rounded-full ${d.deviceStatus === 'online' ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`}
+                              />
+                              <span className="break-all">{d.deviceName}</span>
+                            </span>
+                            {deviceWhere(d) && (
+                              <span className="block break-words text-xs text-muted-foreground">{deviceWhere(d)}</span>
+                            )}
+                            <span className="block break-words text-xs text-muted-foreground">{deviceMeta(d)}</span>
                           </span>
                           {d.worstOpenSeverity && <SeverityBadge severity={d.worstOpenSeverity} />}
                           {d.patchReadyFindingCount > 0 && (
