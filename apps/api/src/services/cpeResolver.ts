@@ -317,6 +317,12 @@ export function resolve(
 
   if (!best) return NONE;
   if (best.score <= runnerUp) return NONE;
+  // A single shared word is not the same product: "Chrome Remote Desktop
+  // Host" (vendor Google) matched the Chrome browser on "chrome" alone and
+  // inherited ~2,500 browser CVEs per device. Require the matched words to be
+  // at least half of the name's distinctive words.
+  const distinctive = [...queryWords].filter((w) => !STOPWORDS.has(w)).length;
+  if (best.score * 2 < distinctive) return NONE;
 
   const m = index.meta.get(best.id);
   if (!m) return NONE;

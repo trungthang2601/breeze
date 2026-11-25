@@ -280,6 +280,13 @@ describe('resolve - Layer B (token) + guardrails', () => {
     expect(r.confidence).toBe('none');
   });
 
+  it('GUARDRAIL: one shared word with the vendor agreeing is not the same product', () => {
+    // Chrome Remote Desktop Host (Google LLC) must not inherit the Chrome browser's CVEs.
+    const r = resolve('Chrome Remote Desktop Host', 'Google LLC', buildCatalogIndex([CATALOG[0]!]), new Map());
+    expect(r.productId).toBeNull();
+    expect(r.confidence).toBe('none');
+  });
+
   it('GUARDRAIL: missing vendor -> Layer B withholds', () => {
     const noExactIdx = buildCatalogIndex([
       {
