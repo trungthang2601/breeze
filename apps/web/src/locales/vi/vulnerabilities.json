@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Vá lỗi {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Kẻ tấn công có thể làm gì",
+      "pathLabel": "Cách khai thác",
+      "impact": {
+        "takeover": "Chiếm toàn quyền điều khiển: đọc, sửa dữ liệu và chạy lệnh trên máy",
+        "readWrite": "Đọc và sửa dữ liệu trên máy",
+        "dataLeak": "Đánh cắp dữ liệu nhạy cảm",
+        "tamper": "Sửa đổi hoặc giả mạo dữ liệu",
+        "dos": "Làm treo hoặc sập phần mềm (từ chối dịch vụ)",
+        "limited": "Ảnh hưởng hạn chế"
+      },
+      "scopeChanged": "— có thể lan ra ngoài phần mềm bị lỗi",
+      "access": {
+        "network": "từ xa qua mạng",
+        "adjacent": "từ cùng mạng nội bộ (LAN)",
+        "local": "phải có quyền truy cập trên máy",
+        "physical": "phải tiếp cận trực tiếp máy"
+      },
+      "privileges": {
+        "none": "không cần đăng nhập",
+        "low": "cần tài khoản người dùng thường",
+        "high": "cần tài khoản quản trị"
+      },
+      "noUser": "không cần người dùng thao tác",
+      "userNeeded": "cần người dùng mở file hoặc bấm vào liên kết"
     }
   },
   "findingStatus": {

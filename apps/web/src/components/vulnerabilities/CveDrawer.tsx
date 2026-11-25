@@ -6,6 +6,7 @@ import '@/lib/i18n';
 import { SeverityBadge } from './SeverityBadge';
 import { KevBadge } from './KevBadge';
 import { CVSS_EXPLANATION, EPSS_EXPLANATION } from './vulnExplanations';
+import { summarizeCvss } from './cvssSummary';
 import { FindingStatus } from './FindingStatus';
 import { VulnBulkActionModal } from './VulnBulkActionModal';
 import { CreateVulnTicketModal } from './CreateVulnTicketModal';
@@ -182,6 +183,34 @@ export function CveDrawer({
           <>
             <section data-testid="vuln-cve-meta" className="space-y-2 text-sm">
               <p>{payload.cve.description}</p>
+              {(() => {
+                const s = summarizeCvss(payload.cve.cvssVector);
+                if (!s) return null;
+                const path = [
+                  s.access ? t(`cveDrawer.summary.access.${s.access}`) : null,
+                  s.privileges ? t(`cveDrawer.summary.privileges.${s.privileges}`) : null,
+                  s.userInteraction === null ? null : t(s.userInteraction ? 'cveDrawer.summary.userNeeded' : 'cveDrawer.summary.noUser'),
+                ].filter(Boolean).join(', ');
+                const danger = s.impact === 'takeover' || s.impact === 'readWrite';
+                return (
+                  <div
+                    data-testid="vuln-cve-summary"
+                    className={`rounded-md border px-3 py-2 ${danger ? 'border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-900/20' : 'bg-muted/40'}`}
+                  >
+                    <p className="text-xs text-muted-foreground">{t('cveDrawer.summary.impactLabel')}</p>
+                    <p className={`font-semibold ${danger ? 'text-red-700 dark:text-red-300' : ''}`}>
+                      {t(`cveDrawer.summary.impact.${s.impact}`)}
+                      {s.scopeChanged ? ` ${t('cveDrawer.summary.scopeChanged')}` : ''}
+                    </p>
+                    {path && (
+                      <>
+                        <p className="mt-1.5 text-xs text-muted-foreground">{t('cveDrawer.summary.pathLabel')}</p>
+                        <p>{path}</p>
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
               <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                 <dt className="text-muted-foreground" title={CVSS_EXPLANATION}>
                   {t('cveDrawer.meta.cvss', { version: payload.cve.cvssVersion ?? '' })}

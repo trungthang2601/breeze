@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Remediate {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "What an attacker can do",
+      "pathLabel": "How it is exploited",
+      "impact": {
+        "takeover": "Full takeover: read and change data and run code on the device",
+        "readWrite": "Read and change data on the device",
+        "dataLeak": "Steal sensitive data",
+        "tamper": "Change or forge data",
+        "dos": "Crash or freeze the software (denial of service)",
+        "limited": "Limited impact"
+      },
+      "scopeChanged": "— can spread beyond the affected software",
+      "access": {
+        "network": "remotely over the network",
+        "adjacent": "from the same local network",
+        "local": "needs access on the device itself",
+        "physical": "needs physical access to the device"
+      },
+      "privileges": {
+        "none": "no login needed",
+        "low": "needs a normal user account",
+        "high": "needs an admin account"
+      },
+      "noUser": "no user action needed",
+      "userNeeded": "a user must open a file or click something"
     }
   },
   "findingStatus": {
