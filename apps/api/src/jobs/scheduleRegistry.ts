@@ -134,6 +134,9 @@ export const JOB_SCHEDULES = {
   'intent-outbox-retention': '33 7 * * *',
   'metric-anomaly-incident-retention': '53 7 * * *',
   'ip-history-retention': '3 8 * * *',
+  // Prunes old agent health / software inventory observations that no
+  // current-state pointer references (jobs/observationRetention.ts).
+  'observation-retention': '33 8 * * *',
   'ml-output-retention': '23 8 * * *',
   'user-risk-retention': '43 8 * * *',
   'vulnerability-msrc-sync': '3 9 * * *',

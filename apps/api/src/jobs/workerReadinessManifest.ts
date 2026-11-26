@@ -98,6 +98,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('helperScreenshotRetentionWorker', ['helperScreenshotRetention']),
   consumers('endpointMessageRetention'),
   consumers('ipHistoryRetention'),
+  consumers('observationRetention'),
   consumers('reliabilityRetention'),
   consumers('processSampleRetention'),
   consumers('deviceMetricsRetention'),

@@ -629,6 +629,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'observationRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/observationRetention');
+      return { init: m.initializeObservationRetention, shutdown: m.shutdownObservationRetention };
+    },
+  },
+  {
     name: 'reliabilityRetention',
     placement: 'global',
     load: async () => {
