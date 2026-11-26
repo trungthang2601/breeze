@@ -25,6 +25,7 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
   AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
   AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_HEALTH_OBSERVATION_RETENTION_DAYS: 'data retention window',
   AGENT_LOG_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
   AGENT_LOG_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
   AGENT_LOG_MAX_ROWS_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
@@ -405,6 +406,9 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   OAUTH_AUTH_EPOCH_ENFORCE_AFTER: 'OAuth rollout cutoff',
   OAUTH_CLEANUP_ENABLED: 'cleanup job toggle',
   OAUTH_DEBUG: 'debug logging flag',
+  // OBSERVATION_RETENTION_*
+  OBSERVATION_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  OBSERVATION_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
   // OFFBOARDING_*
   OFFBOARDING_DRAIN_WINDOW_HOURS: 'timing knob',
   // OEM_UPDATES_*
@@ -563,6 +567,7 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   // SOFTWARE_*
   SOFTWARE_INSTALL_REMEDIATION_MAX_ATTEMPTS: 'remediation retry limit',
   SOFTWARE_INSTALL_REMEDIATION_MAX_PER_PASS: 'worker throughput knob',
+  SOFTWARE_INVENTORY_OBSERVATION_RETENTION_DAYS: 'data retention window',
   SOFTWARE_REMEDIATION_REQUEST_CLEANUP_ENABLED: 'cleanup job toggle',
   SOFTWARE_REMEDIATION_REQUEST_RETENTION_HOURS: 'data retention window',
   SOFTWARE_UPLOAD_SESSION_CLEANUP_ENABLED: 'cleanup job toggle',
