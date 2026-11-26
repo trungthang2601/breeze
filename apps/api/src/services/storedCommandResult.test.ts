@@ -24,6 +24,23 @@ describe('buildStoredCommandResult', () => {
     expect('errorCode' in stored && stored.errorCode !== undefined).toBe(false);
   });
 
+  it.each(['file_read', 'file_read_chunk'])(
+    'stores %s stdout byte-for-byte — redaction would corrupt the base64 file bytes',
+    (type) => {
+      // A 2MB base64 chunk of random bytes holds ~1–2 case-insensitive AKIA
+      // hits on average; any one of them used to break the download's SHA-256.
+      const stdout = JSON.stringify({ content: 'QUJD+akiaBCDEFGHIJ0123456/xyz==', size: 23 });
+      const stored = buildStoredCommandResult(type, { status: 'completed', stderr: 'AKIABCDEFGHIJ0123456' }, stdout);
+      expect(stored.stdout).toBe(stdout);
+      expect(stored.stderr).not.toContain('AKIABCDEFGHIJ0123456');
+    },
+  );
+
+  it('still redacts stdout of ordinary commands', () => {
+    const stored = buildStoredCommandResult('script', { status: 'completed' }, 'key AKIABCDEFGHIJ0123456');
+    expect(stored.stdout).not.toContain('AKIABCDEFGHIJ0123456');
+  });
+
   it('keeps the existing redaction and timeout-collapse behaviour', () => {
     const pem = '-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----';
     const stored = buildStoredCommandResult('script', { status: 'timeout', stderr: pem }, `out ${pem}`);

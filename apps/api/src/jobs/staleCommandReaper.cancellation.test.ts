@@ -398,6 +398,11 @@ describe('reapStaleCancellations (#3525 closer 5)', () => {
     expect(captureExceptionMock).toHaveBeenCalled();
   });
 
+  it('registers the File Browser stdout eraser as the last domain', () => {
+    const names = REAPER_DOMAINS.map(([name]) => name);
+    expect(names[names.length - 1]).toBe('transientResults');
+  });
+
   it('is registered as a reaper domain, after scriptExecutions', () => {
     const names = REAPER_DOMAINS.map(([name]) => name);
     expect(names).toContain('scriptCancellations');

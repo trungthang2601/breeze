@@ -27,6 +27,7 @@ import { refreshClaimedPayloadForPush } from './commandDelivery';
 import { cancelledCommandError } from './commandCancelMessage';
 import { BACKUP_WRITE_CREDENTIAL_COMMAND_TYPES } from './backupCommandCredentials';
 import { commandAuditDetails } from './commandAudit';
+import { eraseDeliveredCommandStdout, isTransientStdoutCommandType } from './transientCommandResult';
 import {
   AGENT_BINARY_UPDATE_COMMAND_TYPES,
   agentBinaryUpdateDispatchRefusal,
@@ -1737,6 +1738,11 @@ async function dispatchPreparedCommand(
       status: 'failed' as const,
       error: 'Command did not complete',
     };
+    // File Browser reads: the caller now holds the file bytes, so drop the
+    // stored copy (services/transientCommandResult.ts). Best-effort, never throws.
+    if (isTransientStdoutCommandType(type)) {
+      await eraseDeliveredCommandStdout(command.id, type);
+    }
     return { ...finalResult, commandId: command.id };
   });
 }

@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import { parseRestorePointOutcome, type commandResultSchema } from '../routes/agents/schemas';
 import { redactSecretsFromOutput } from './secretRedaction';
-import { isRawStdoutArtifactCommand } from './commandAudit';
+import { isStdoutRedactionExempt } from './commandAudit';
 import { collapseAgentReportedTimeoutStatus } from './commandResultAcceptance';
 import { installerSecretsFromPayload, scrubInstallerSecrets } from './installerSecretScrub';
 
@@ -36,7 +36,10 @@ export function buildStoredCommandResult(
   // Exception: artifact-bearing stdout (capture_pprof base64 profiles) must be
   // stored byte-for-byte -- the redaction patterns statistically fire inside
   // megabytes of random base64 and would silently corrupt the artifact (#2401).
-  const skipStdoutRedaction = isRawStdoutArtifactCommand(commandType);
+  // File Browser reads (file_read / file_read_chunk) carry base64 file bytes
+  // and are exempt for the same reason; their stored stdout is erased once
+  // delivered (services/transientCommandResult.ts).
+  const skipStdoutRedaction = isStdoutRedactionExempt(commandType);
   return {
     // See collapseAgentReportedTimeoutStatus: an agent-reported 'timeout'
     // must never be stored verbatim — that literal string doubles as the

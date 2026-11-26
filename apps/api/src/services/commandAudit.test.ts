@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { commandAuditDetails, sanitizeCommandForHistory } from './commandAudit';
+import { commandAuditDetails, isStdoutRedactionExempt, sanitizeCommandForHistory } from './commandAudit';
 
 describe('commandAudit', () => {
   it('redacts file-write content while preserving metadata', () => {
@@ -148,6 +148,30 @@ describe('commandAudit', () => {
 
       expect((command.result as { stdout: string }).stdout).toContain('stdout omitted');
       expect(JSON.stringify(command)).not.toContain('abc123');
+    });
+
+    it.each(['file_read', 'file_read_chunk'])(
+      'stores %s stdout unredacted at ingest but never passes it through history',
+      (type) => {
+        expect(isStdoutRedactionExempt(type)).toBe(true);
+        const command = sanitizeCommandForHistory(
+          {
+            id: 'cmd-7',
+            type,
+            payload: { path: '/etc/app.conf' },
+            result: { status: 'completed', stdout: '{"content":"dG9rZW49YWJjMTIz"}' },
+          },
+          { allowRawStdout: true },
+        );
+
+        expect((command.result as { stdout: string }).stdout).toContain('stdout omitted');
+        expect(JSON.stringify(command)).not.toContain('dG9rZW49YWJjMTIz');
+      },
+    );
+
+    it('keeps stdout redaction for ordinary command types', () => {
+      expect(isStdoutRedactionExempt('script')).toBe(false);
+      expect(isStdoutRedactionExempt('capture_pprof')).toBe(true);
     });
   });
 
