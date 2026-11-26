@@ -107,6 +107,10 @@ const WRITE_ROUTES: Array<[string, string, unknown]> = [
   ['copy', '/files/copy', { items: [{ sourcePath: '/tmp/report.txt', destPath: '/tmp/report-copy.txt' }] }],
   ['move', '/files/move', { items: [{ sourcePath: '/tmp/report.txt', destPath: '/tmp/archive/report.txt' }] }],
   ['mkdir', '/files/mkdir', { path: '/tmp/archive' }],
+  ['upload-chunk', '/files/upload-chunk', {
+    path: '/tmp/big.bin', transferId: 'aaaaaaaa-bbbb', offset: 0, totalSize: 5, content: 'aGVsbG8=',
+  }],
+  ['upload-abort', '/files/upload-abort', { path: '/tmp/big.bin', transferId: 'aaaaaaaa-bbbb' }],
 ];
 
 beforeEach(() => {

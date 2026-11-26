@@ -263,11 +263,16 @@
       "delete": "Fehler beim Löschen",
       "download": "Download fehlgeschlagen",
       "downloadTooLarge": "Zu groß für den Download ({{size}}). Der Dateibrowser überträgt Dateien bis {{max}}.",
+      "agentUpdateRequired": "Der Agent auf diesem Gerät muss aktualisiert werden, um Dateien größer als {{max}} zu übertragen.",
+      "checksumMismatch": "Die übertragene Datei stimmte nicht mit ihrer Prüfsumme überein und wurde verworfen. Bitte versuchen Sie es erneut.",
+      "fileChanged": "Die Datei wurde während des Downloads auf dem Gerät geändert. Bitte versuchen Sie es erneut.",
+      "secureContextRequired": "Große Dateiübertragungen erfordern eine sichere (HTTPS-)Verbindung.",
       "loadDirectory": "Das Verzeichnis konnte nicht geladen werden",
       "move": "Fehler beim Verschieben",
       "readFile": "Datei konnte nicht gelesen werden",
       "upload": "Hochladen fehlgeschlagen",
-      "uploadTimeout": "Zeitüberschreitung beim Hochladen nach 2 Minuten. Möglicherweise wird die Datei noch auf das Gerät geschrieben – aktualisieren Sie sie zur Überprüfung."
+      "uploadTimeout": "Zeitüberschreitung beim Hochladen nach 2 Minuten. Möglicherweise wird die Datei noch auf das Gerät geschrieben – aktualisieren Sie sie zur Überprüfung.",
+      "uploadTooLarge": "Zu groß für den Upload ({{size}}). Der Dateibrowser überträgt Dateien bis {{max}}."
     },
     "freeOf": "{{free}} frei von {{total}}",
     "goUp": "Übergeordneten Ordner öffnen",

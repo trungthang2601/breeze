@@ -21,8 +21,8 @@
  * `MAX_COMMAND_RESULT_BYTES` (5,000,000) in
  * `apps/api/src/routes/agents/schemas.ts`. 1 MB decoded is ~1.4 MB encoded and
  * fits; anything past ~3.6 MB decoded does not, and the agent's SendResult
- * sheds only the `result` field on overflow, never `stdout`. Lifting this cap
- * requires a chunked transfer path first.
+ * sheds only the `result` field on overflow, never `stdout`. Larger files use
+ * the chunked path below instead of a bigger single-shot cap.
  */
 
 /**
@@ -31,3 +31,25 @@
  * agent fails the command with `file too large: <size> bytes (max <cap> bytes)`.
  */
 export const AGENT_MAX_FILE_READ_BYTES = 1024 * 1024;
+
+/**
+ * Largest decoded file_write payload the agent accepts in ONE command
+ * (`MaxFileWriteSize` in fileops.go; the API mirrors it as
+ * `AGENT_MAX_FILE_WRITE_BYTES` in apps/api/src/routes/systemTools/schemas.ts).
+ * The File Browser uploads files up to this size single-shot, which every
+ * agent version supports, and switches to the chunked path above it.
+ */
+export const AGENT_SINGLE_SHOT_WRITE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Chunked transfer (`file_write_chunk` / `file_read_chunk`,
+ * agent/internal/remote/tools/fileops_chunked.go): the largest file the File
+ * Browser moves in either direction, and the decoded size of each chunk.
+ * Pinned from Go by `TestChunkedTransferConstantsMatchShared`.
+ *
+ * Agents that predate the chunked commands answer `unknown command type`; the
+ * API turns that into a 409 `agent_update_required`, and the UI says to update
+ * the agent. Files at or under the single-shot caps never take this path.
+ */
+export const AGENT_MAX_CHUNKED_TRANSFER_BYTES = 100 * 1024 * 1024;
+export const AGENT_FILE_CHUNK_BYTES = 2 * 1024 * 1024;

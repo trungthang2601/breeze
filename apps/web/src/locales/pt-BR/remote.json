@@ -263,11 +263,16 @@
       "delete": "Falha ao excluir",
       "download": "Falha ao baixar",
       "downloadTooLarge": "Muito grande para baixar ({{size}}). O navegador de arquivos transfere arquivos de até {{max}}.",
+      "agentUpdateRequired": "O agente deste dispositivo precisa ser atualizado para transferir arquivos maiores que {{max}}.",
+      "checksumMismatch": "O arquivo transferido não correspondeu à soma de verificação e foi descartado. Tente novamente.",
+      "fileChanged": "O arquivo foi alterado no dispositivo durante o download. Tente novamente.",
+      "secureContextRequired": "Transferências de arquivos grandes exigem uma conexão segura (HTTPS).",
       "loadDirectory": "Falha ao carregar a pasta",
       "move": "Falha ao mover",
       "readFile": "Falha ao ler o arquivo",
       "upload": "Falha ao enviar",
-      "uploadTimeout": "O envio expirou após 2 minutos. O arquivo ainda pode ser gravado no dispositivo — atualize para verificar."
+      "uploadTimeout": "O envio expirou após 2 minutos. O arquivo ainda pode ser gravado no dispositivo — atualize para verificar.",
+      "uploadTooLarge": "Muito grande para enviar ({{size}}). O navegador de arquivos transfere arquivos de até {{max}}."
     },
     "freeOf": "{{free}} livres de {{total}}",
     "goUp": "Subir",

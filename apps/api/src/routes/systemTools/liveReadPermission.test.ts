@@ -107,7 +107,7 @@ function app() {
  * route added later is covered without editing this list.
  */
 function registeredGetPaths(): string[] {
-  const files = ['processes.ts', 'services.ts', 'registry.ts', 'eventLogs.ts', 'scheduledTasks.ts', 'fileBrowser.ts'];
+  const files = ['processes.ts', 'services.ts', 'registry.ts', 'eventLogs.ts', 'scheduledTasks.ts', 'fileBrowser.ts', 'fileBrowserChunked.ts'];
   const paths = new Set<string>();
   for (const file of files) {
     const src = readFileSync(join(__dirname, file), 'utf8');

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AGENT_FILE_CHUNK_BYTES, AGENT_MAX_CHUNKED_TRANSFER_BYTES } from '@breeze/shared';
 
 export const deviceIdParamSchema = z.object({
   deviceId: z.string().guid()
@@ -174,3 +175,45 @@ export const fileUploadBodySchema = z
       });
     }
   });
+
+// Chunked File Browser transfers (fileBrowserChunked.ts). The agent caps each
+// chunk at AGENT_FILE_CHUNK_BYTES decoded and the whole file at
+// AGENT_MAX_CHUNKED_TRANSFER_BYTES (fileops_chunked.go); the bounds here are the
+// same, so the API never dispatches a chunk the agent would refuse.
+export const AGENT_FILE_CHUNK_BASE64_CHARS = Math.ceil(AGENT_FILE_CHUNK_BYTES / 3) * 4;
+
+const transferIdString = z.string().regex(/^[A-Za-z0-9-]{8,64}$/, 'Invalid transferId');
+const base64String = z
+  .string()
+  .max(AGENT_FILE_CHUNK_BASE64_CHARS, { message: `Chunk too large (max ${AGENT_FILE_CHUNK_BYTES / (1024 * 1024)}MB)` })
+  .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/, 'Invalid base64 content');
+
+export const fileUploadChunkBodySchema = z
+  .object({
+    path: filePathString,
+    transferId: transferIdString,
+    offset: z.number().int().min(0).max(AGENT_MAX_CHUNKED_TRANSFER_BYTES),
+    totalSize: z.number().int().min(0).max(AGENT_MAX_CHUNKED_TRANSFER_BYTES, {
+      message: `File too large (max ${AGENT_MAX_CHUNKED_TRANSFER_BYTES / (1024 * 1024)}MB)`,
+    }),
+    content: base64String,
+    final: z.boolean().optional().default(false),
+    sha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
+  })
+  .superRefine((body, ctx) => {
+    if (body.final && !body.sha256) {
+      ctx.addIssue({ code: 'custom', path: ['sha256'], message: 'sha256 is required on the final chunk' });
+    }
+  });
+
+export const fileUploadAbortBodySchema = z.object({
+  path: filePathString,
+  transferId: transferIdString,
+});
+
+export const fileDownloadChunkQuerySchema = z.object({
+  path: filePathString,
+  offset: z.coerce.number().int().min(0).max(AGENT_MAX_CHUNKED_TRANSFER_BYTES),
+  length: z.coerce.number().int().min(1).max(AGENT_FILE_CHUNK_BYTES).optional(),
+  withHash: z.enum(['true', 'false']).optional().transform((v) => v === 'true'),
+});

@@ -88,6 +88,12 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
   if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/)) {
     return { rule: 'file-upload', maxSize: 8 * 1024 * 1024, error: 'File too large (max 4MB)' };
   }
+  // Chunked File Browser uploads: one base64 chunk of at most 2MB decoded
+  // (~2.8MB encoded, AGENT_FILE_CHUNK_BYTES) plus the JSON envelope. 4MB
+  // headroom lets the route's schema answer with its specific message.
+  if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload-chunk$/)) {
+    return { rule: 'file-upload-chunk', maxSize: 4 * 1024 * 1024, error: 'Chunk too large (max 2MB)' };
+  }
   // Chunked software package uploads (#2951): each chunk is a raw
   // application/octet-stream body of at most 8MB (client UPLOAD_CHUNK_SIZE,
   // server-validated chunk_size cap). 9MB headroom lets the route's own

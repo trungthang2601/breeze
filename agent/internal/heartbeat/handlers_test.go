@@ -38,6 +38,7 @@ var allCommandTypes = []string{
 	tools.CmdCollectReliabilityMetrics,
 	tools.CmdCollectAuditPolicy, tools.CmdApplyAuditPolicyBaseline,
 	tools.CmdFileList, tools.CmdFileRead, tools.CmdFileWrite,
+	tools.CmdFileWriteChunk, tools.CmdFileReadChunk,
 	tools.CmdFileDelete, tools.CmdFileMkdir, tools.CmdFileRename,
 	tools.CmdFileCopy, tools.CmdFileListDrives,
 	tools.CmdDiagFileList, tools.CmdDiagFileRead,

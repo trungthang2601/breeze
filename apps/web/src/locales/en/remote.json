@@ -263,11 +263,16 @@
       "delete": "Failed to delete",
       "download": "Failed to download",
       "downloadTooLarge": "Too large to download ({{size}}). The file browser transfers files up to {{max}}.",
+      "agentUpdateRequired": "The agent on this device must be updated to transfer files larger than {{max}}.",
+      "checksumMismatch": "The transferred file did not match its checksum and was discarded. Please try again.",
+      "fileChanged": "The file changed on the device during the download. Please try again.",
+      "secureContextRequired": "Large file transfers need a secure (HTTPS) connection.",
       "loadDirectory": "Failed to load directory",
       "move": "Failed to move",
       "readFile": "Failed to read file",
       "upload": "Failed to upload",
-      "uploadTimeout": "Upload timed out after 2 minutes. The file may still be written on the device — refresh to verify."
+      "uploadTimeout": "Upload timed out after 2 minutes. The file may still be written on the device — refresh to verify.",
+      "uploadTooLarge": "Too large to upload ({{size}}). The file browser transfers files up to {{max}}."
     },
     "freeOf": "{{free}} free of {{total}}",
     "goUp": "Go Up",

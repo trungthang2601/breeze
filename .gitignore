@@ -44,6 +44,27 @@ coverage/
 # Database
 *.db
 *.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+# Database dumps and backups (pg_dump / pg_dumpall / mysqldump output).
+# Plain *.sql is NOT ignored: migrations and scripts are .sql.
+*.dump
+*.pgdump
+*.backup
+*.bak
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.sql.zst
+*.sql.zip
+# Root-anchored: apps/portal/src/pages/backups/ is source code.
+# (/backups/ itself is listed further down.)
+/db-backups/
+/dumps/
+pgdata/
+pg_data/
 
 # Go
 agent/breeze-agent

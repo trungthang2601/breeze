@@ -263,11 +263,16 @@
       "delete": "Impossibile eliminare",
       "download": "Impossibile scaricare",
       "downloadTooLarge": "Troppo grande per il download ({{size}}). Il browser file trasferisce file fino a {{max}}.",
+      "agentUpdateRequired": "L'agent su questo dispositivo deve essere aggiornato per trasferire file più grandi di {{max}}.",
+      "checksumMismatch": "Il file trasferito non corrispondeva al relativo checksum ed è stato scartato. Riprova.",
+      "fileChanged": "Il file è stato modificato sul dispositivo durante il download. Riprova.",
+      "secureContextRequired": "I trasferimenti di file di grandi dimensioni richiedono una connessione sicura (HTTPS).",
       "loadDirectory": "Impossibile caricare la directory",
       "move": "Impossibile spostare",
       "readFile": "Impossibile leggere il file",
       "upload": "Impossibile caricare",
-      "uploadTimeout": "Il caricamento è scaduto dopo 2 minuti. Il file potrebbe essere stato comunque scritto sul dispositivo: aggiorna la pagina per verificare."
+      "uploadTimeout": "Il caricamento è scaduto dopo 2 minuti. Il file potrebbe essere stato comunque scritto sul dispositivo: aggiorna la pagina per verificare.",
+      "uploadTooLarge": "Troppo grande per il caricamento ({{size}}). Il browser file trasferisce file fino a {{max}}."
     },
     "freeOf": "{{free}} liberi di {{total}}",
     "goUp": "Vai al livello superiore",

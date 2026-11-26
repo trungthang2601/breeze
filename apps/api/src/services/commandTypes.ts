@@ -55,6 +55,11 @@ export const CommandTypes = {
   DIAG_FILE_LIST: 'diag_file_list',
   DIAG_FILE_READ: 'diag_file_read',
   FILE_WRITE: 'file_write',
+  // Chunked File Browser transfers above the single-shot caps
+  // (routes/systemTools/fileBrowserChunked.ts). An agent that predates them
+  // answers `unknown command type`, which the route maps to a 409.
+  FILE_WRITE_CHUNK: 'file_write_chunk',
+  FILE_READ_CHUNK: 'file_read_chunk',
   FILE_DELETE: 'file_delete',
   FILE_MKDIR: 'file_mkdir',
   FILE_RENAME: 'file_rename',

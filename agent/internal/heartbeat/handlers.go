@@ -81,6 +81,8 @@ var handlerRegistry = map[string]CommandHandler{
 	tools.CmdDiagFileList:       handleDiagFileList,
 	tools.CmdDiagFileRead:       handleDiagFileRead,
 	tools.CmdFileWrite:          handleFileWrite,
+	tools.CmdFileWriteChunk:     handleFileWriteChunk,
+	tools.CmdFileReadChunk:      handleFileReadChunk,
 	tools.CmdFileDelete:         handleFileDelete,
 	tools.CmdFileMkdir:          handleFileMkdir,
 	tools.CmdFileRename:         handleFileRename,
@@ -401,6 +403,14 @@ func handleDiagFileRead(h *Heartbeat, cmd Command) tools.CommandResult {
 
 func handleFileWrite(_ *Heartbeat, cmd Command) tools.CommandResult {
 	return tools.WriteFile(cmd.Payload)
+}
+
+func handleFileWriteChunk(_ *Heartbeat, cmd Command) tools.CommandResult {
+	return tools.WriteFileChunk(cmd.Payload)
+}
+
+func handleFileReadChunk(_ *Heartbeat, cmd Command) tools.CommandResult {
+	return tools.ReadFileChunk(cmd.Payload)
 }
 
 func handleFileDelete(_ *Heartbeat, cmd Command) tools.CommandResult {

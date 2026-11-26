@@ -5,6 +5,7 @@ import { installerSecretsFromPayload } from './installerSecretScrub';
 
 const REDACTED = '[REDACTED]';
 const FILE_WRITE = 'file_write';
+const FILE_WRITE_CHUNK = 'file_write_chunk';
 const SCRIPT = 'script';
 const SOFTWARE_INSTALL = 'software_install';
 const INSTALL_SCRIPT_KEYS = ['preInstallScript', 'postInstallScript'] as const;
@@ -54,6 +55,18 @@ export function sanitizeCommandPayloadForAudit(type: string, rawPayload: Command
   const payload = type === SOFTWARE_INSTALL && installerSecretsFromPayload(redacted)
     ? { ...redacted, downloadUrl: '[installer]', fileName: '[installer]' }
     : redacted;
+
+  if (type === FILE_WRITE_CHUNK) {
+    return {
+      path: sanitizeAuditPayload(payload.path),
+      transferId: sanitizeAuditPayload(payload.transferId),
+      offset: payload.offset,
+      totalSize: payload.totalSize,
+      final: payload.final,
+      abort: payload.abort,
+      content: contentMetadata(payload.content),
+    };
+  }
 
   if (type === FILE_WRITE) {
     return {

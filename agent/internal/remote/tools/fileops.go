@@ -837,45 +837,12 @@ func ReadFile(payload map[string]any) CommandResult {
 		return NewErrorResult(errorCodef(wire.ErrCodeUnsupportedEncoding, "unsupported encoding: %s", encoding), time.Since(start).Milliseconds())
 	}
 
-	// Normalize path separators
-	cleanPath := filepath.Clean(path)
-
-	// Defense-in-depth: never read a credential store, even symlinked.
-	if err := enforceReadContainment(cleanPath); err != nil {
-		return NewErrorResult(err, time.Since(start).Milliseconds())
-	}
-
-	// Downloading a macOS Finder alias should deliver the file it points at, not
-	// the bookmark blob (issue #3344). Containment is re-checked against the
-	// target because an alias can point anywhere, including at a credential
-	// store that filepath.EvalSymlinks would never have surfaced.
-	if target, ok := resolveMacAliasPath(cleanPath); ok {
-		if err := enforceReadContainment(target); err != nil {
-			return NewErrorResult(err, time.Since(start).Milliseconds())
-		}
-		cleanPath = target
-	}
-
-	// Open once; the containment check, the stat and the read all use this
-	// handle, so the file that is checked is the file that is read.
-	afterPathCheck(cleanPath)
-	f, err := os.Open(cleanPath)
+	// Containment, macOS alias resolution, open and stat (fileops_chunked.go).
+	f, cleanPath, info, err := openFileForRead(path)
 	if err != nil {
-		return NewErrorResult(fmt.Errorf("failed to stat file: %w", err), time.Since(start).Milliseconds())
+		return NewErrorResult(err, time.Since(start).Milliseconds())
 	}
 	defer func() { _ = f.Close() }()
-	if err := checkOpenedForContainment("read", cleanPath, f); err != nil {
-		return NewErrorResult(err, time.Since(start).Milliseconds())
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		return NewErrorResult(fmt.Errorf("failed to stat file: %w", err), time.Since(start).Milliseconds())
-	}
-
-	if info.IsDir() {
-		return NewErrorResult(errorCodef(wire.ErrCodePathIsDirectory, "path is a directory, not a file"), time.Since(start).Milliseconds())
-	}
 
 	// Check file size
 	if info.Size() > maxFileReadSize {
