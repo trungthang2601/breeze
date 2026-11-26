@@ -107,11 +107,14 @@ export const GATED_COMMAND_TYPES = [
   'file_list_drives',
   'file_mkdir',
   'file_read',
+  // Chunked File Browser transfers: same gating as file_read / file_write.
+  'file_read_chunk',
   'file_rename',
   'file_trash_list',
   'file_trash_purge',
   'file_trash_restore',
   'file_write',
+  'file_write_chunk',
   'filesystem_analysis',
   // #8729: operator-directed, disruptive (force-closes apps).
   'force_reboot',

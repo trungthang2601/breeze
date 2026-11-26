@@ -263,11 +263,16 @@
       "delete": "Impossible de supprimer",
       "download": "Impossible de télécharger",
       "downloadTooLarge": "Trop volumineux pour être téléchargé ({{size}}). L’explorateur de fichiers transfère des fichiers jusqu’à {{max}}.",
+      "agentUpdateRequired": "L’agent de cet appareil doit être mis à jour pour transférer des fichiers de plus de {{max}}.",
+      "checksumMismatch": "Le fichier transféré ne correspondait pas à sa somme de contrôle et a été supprimé. Veuillez réessayer.",
+      "fileChanged": "Le fichier a été modifié sur l’appareil pendant le téléchargement. Veuillez réessayer.",
+      "secureContextRequired": "Les transferts de fichiers volumineux nécessitent une connexion sécurisée (HTTPS).",
       "loadDirectory": "Impossible de charger le répertoire",
       "move": "Impossible de déplacer l’élément",
       "readFile": "Impossible de lire le fichier",
       "upload": "Impossible de téléverser",
-      "uploadTimeout": "Le téléchargement expirait après 2 minutes. Le fichier peut toujours être écrit sur l’appareil — rafraîchir pour vérifier."
+      "uploadTimeout": "Le téléchargement expirait après 2 minutes. Le fichier peut toujours être écrit sur l’appareil — rafraîchir pour vérifier.",
+      "uploadTooLarge": "Trop volumineux pour être envoyé ({{size}}). L’explorateur de fichiers transfère des fichiers jusqu’à {{max}}."
     },
     "freeOf": "{{free}} libre de {{total}}",
     "goUp": "Monte",

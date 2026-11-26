@@ -375,6 +375,40 @@ Maximum file write size is 4 MB (decoded). Larger content is rejected.
 
 Parent directories are created automatically. Files are written with `0644` permissions.
 
+### `file_write_chunk`
+
+Writes one piece of a large file (up to 100 MB). The File Browser uses it for uploads over 4 MB.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | Required | Destination file path |
+| `transferId` | string | Required | 8–64 characters of `A-Z`, `a-z`, `0-9`, `-`; the same for every chunk of one upload |
+| `offset` | int | Required | Byte offset of this chunk. It must equal the number of bytes already received. |
+| `totalSize` | int | Required | Size of the whole file, at most 100 MB |
+| `content` | string | `""` | Base64 chunk data, at most 2 MB decoded |
+| `final` | bool | `false` | `true` on the last chunk |
+| `sha256` | string | Required when `final` | SHA-256 (hex) of the whole file |
+| `abort` | bool | `false` | `true` discards the partial upload; no other field but `path` and `transferId` is read |
+
+Chunks are written to a hidden temp file (`.<name>.<transferId>.breeze-upload`) next to the destination. On the final chunk the agent hashes the temp file and renames it over the destination only if the hash matches; otherwise it deletes the temp file. The destination is never left half-written. Abandoned temp files older than 24 hours are removed when a new upload starts in the same directory.
+
+### `file_read_chunk`
+
+Reads one piece of a file up to 100 MB. The File Browser uses it for downloads over 1 MB.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `path` | string | Required | File path to read |
+| `offset` | int | `0` | Byte offset to read from |
+| `length` | int | `2097152` | Bytes to read, at most 2 MB |
+| `withHash` | bool | `false` | Also return the SHA-256 of the whole file |
+
+Returns `size`, `offset`, `length`, `content` (base64), `modified`, `eof` and, when requested, `sha256`. The File Browser checks that `size` and `modified` stay the same across chunks and verifies the hash before saving.
+
+<Aside>
+Agents that predate these two commands answer `unknown command type`. The API reports this as `409 agent_update_required`, and the File Browser asks you to update the agent. Files under the single-command limits still transfer on any agent version.
+</Aside>
+
 ### `file_delete`
 
 | Param | Type | Default | Description |

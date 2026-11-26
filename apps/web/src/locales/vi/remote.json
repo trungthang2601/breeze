@@ -263,11 +263,16 @@
       "delete": "Không thể xóa",
       "download": "Không thể tải xuống",
       "downloadTooLarge": "Tệp quá lớn để tải xuống ({{size}}). Trình duyệt tệp hỗ trợ truyền tệp tối đa {{max}}.",
+      "agentUpdateRequired": "Cần cập nhật agent trên thiết bị này để truyền tệp lớn hơn {{max}}.",
+      "checksumMismatch": "Tệp đã truyền không khớp mã kiểm tra nên đã bị loại bỏ. Vui lòng thử lại.",
+      "fileChanged": "Tệp đã thay đổi trên thiết bị trong lúc tải xuống. Vui lòng thử lại.",
+      "secureContextRequired": "Truyền tệp lớn cần kết nối bảo mật (HTTPS).",
       "loadDirectory": "Không thể tải thư mục",
       "move": "Không thể di chuyển",
       "readFile": "Không thể đọc tệp",
       "upload": "Không thể tải lên",
-      "uploadTimeout": "Quá thời gian tải lên sau 2 phút. Tệp có thể đã được ghi vào thiết bị — hãy làm mới để xác minh."
+      "uploadTimeout": "Quá thời gian tải lên sau 2 phút. Tệp có thể đã được ghi vào thiết bị — hãy làm mới để xác minh.",
+      "uploadTooLarge": "Tệp quá lớn để tải lên ({{size}}). Trình duyệt tệp hỗ trợ truyền tệp tối đa {{max}}."
     },
     "freeOf": "{{free}} trống trong tổng số {{total}}",
     "goUp": "Lên trên",

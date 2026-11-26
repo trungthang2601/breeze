@@ -42,6 +42,7 @@ import {
   summarizeBulkResults,
   UnverifiedOperationError,
 } from './fileOperations';
+import { ChunkedTransferError, downloadFileChunked, uploadFileChunked } from './chunkedTransfer';
 import FolderPickerDialog from './FolderPickerDialog';
 import DeleteConfirmDialog from './DeleteConfirmDialog';
 import NewFolderDialog from './NewFolderDialog';
@@ -49,7 +50,13 @@ import TrashView from './TrashView';
 import FileActivityPanel from './FileActivityPanel';
 import type { FileActivity } from './FileActivityPanel';
 import { useTranslation } from 'react-i18next';
-import { AGENT_MAX_FILE_READ_BYTES, ERROR_CODES } from '@breeze/shared';
+import {
+  AGENT_FILE_CHUNK_BYTES,
+  AGENT_MAX_CHUNKED_TRANSFER_BYTES,
+  AGENT_MAX_FILE_READ_BYTES,
+  AGENT_SINGLE_SHOT_WRITE_BYTES,
+  ERROR_CODES,
+} from '@breeze/shared';
 import { i18n } from '@/lib/i18n';
 import '@/lib/i18n';
 
@@ -77,7 +84,17 @@ export type TransferItem = {
   progress: number;
   size: number;
   error?: string;
+  /** Moved in chunks (fileops_chunked.go): a cancelled upload is discarded on
+   * the device, never half-written. */
+  chunked?: boolean;
 };
+
+const CHUNKED_ERROR_KEYS = {
+  agent_update_required: 'fileManager.errors.agentUpdateRequired',
+  checksum_mismatch: 'fileManager.errors.checksumMismatch',
+  file_changed: 'fileManager.errors.fileChanged',
+  secure_context_required: 'fileManager.errors.secureContextRequired',
+} as const;
 
 export type DriveInfo = {
   letter?: string;
@@ -215,6 +232,15 @@ export default function FileManager({
   // One AbortController per in-flight transfer so Cancel actually aborts the
   // browser-side request instead of just hiding the row (issue #2396).
   const transferControllersRef = useRef<Map<string, AbortController>>(new Map());
+
+  // Localized copy for the chunked path's own stop reasons; anything else
+  // keeps the server's message.
+  const chunkedErrorMessage = (error: unknown): string | undefined => {
+    if (!(error instanceof ChunkedTransferError)) return undefined;
+    return t(CHUNKED_ERROR_KEYS[error.code], {
+      max: formatSize(error.code === 'agent_update_required' ? AGENT_SINGLE_SHOT_WRITE_BYTES : AGENT_MAX_CHUNKED_TRANSFER_BYTES),
+    });
+  };
   // Ids the user cancelled — lets the catch paths tell an intentional abort
   // apart from a real failure (e.g. the upload watchdog timeout, which aborts
   // the same controller but is NOT a user cancel).
@@ -329,21 +355,26 @@ export default function FileManager({
     // whose `size` describes the alias file and not the target the agent
     // resolves and reads. The agent enforces the real cap regardless; this guard
     // exists to save a doomed round trip, not to be the enforcement point.
-    if (!entry.isAlias && typeof entry.size === 'number' && entry.size > AGENT_MAX_FILE_READ_BYTES) {
+    //
+    // Above the 1MB single-shot cap the file moves in chunks (up to
+    // AGENT_MAX_CHUNKED_TRANSFER_BYTES); only beyond that is it refused here.
+    const knownSize = !entry.isAlias && typeof entry.size === 'number' ? entry.size : undefined;
+    if (knownSize !== undefined && knownSize > AGENT_MAX_CHUNKED_TRANSFER_BYTES) {
       setTransfers(prev => [...prev, {
         id: transferId,
         filename: entry.name,
         direction: 'download',
         status: 'failed',
         progress: 0,
-        size: entry.size ?? 0,
+        size: knownSize,
         error: t('fileManager.errors.downloadTooLarge', {
-          size: formatSize(entry.size),
-          max: formatSize(AGENT_MAX_FILE_READ_BYTES),
+          size: formatSize(knownSize),
+          max: formatSize(AGENT_MAX_CHUNKED_TRANSFER_BYTES),
         }),
       }]);
       return;
     }
+    const chunked = knownSize !== undefined && knownSize > AGENT_MAX_FILE_READ_BYTES;
 
     const controller = new AbortController();
     transferControllersRef.current.set(transferId, controller);
@@ -354,28 +385,42 @@ export default function FileManager({
       direction: 'download',
       status: 'pending',
       progress: 0,
-      size: entry.size || 0
+      size: entry.size || 0,
+      chunked,
     }]);
 
     try {
       setTransfers(prev => prev.map(t =>
-        t.id === transferId ? { ...t, status: 'transferring', progress: 25 } : t
+        t.id === transferId ? { ...t, status: 'transferring', progress: chunked ? 0 : 25 } : t
       ));
 
-      const params = new URLSearchParams({ path: entry.path });
-      const response = await fetchWithAuth(`/system-tools/devices/${deviceId}/files/download?${params}`, {
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: t('fileManager.errors.download') }));
-        throw new Error(err.error || t('fileManager.errors.download'));
+      let blob: Blob;
+      if (chunked) {
+        blob = await downloadFileChunked(deviceId, entry.path, {
+          chunkSize: AGENT_FILE_CHUNK_BYTES,
+          signal: controller.signal,
+          onProgress: (done, total) => {
+            // Reserve the last few percent for the checksum check.
+            const progress = total > 0 ? Math.min(95, Math.floor((done / total) * 95)) : 95;
+            setTransfers(prev => prev.map(t => t.id === transferId ? { ...t, progress } : t));
+          },
+        });
+      } else {
+        const params = new URLSearchParams({ path: entry.path });
+        const response = await fetchWithAuth(`/system-tools/devices/${deviceId}/files/download?${params}`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({ error: t('fileManager.errors.download') }));
+          throw new Error(err.error || t('fileManager.errors.download'));
+        }
+
+        setTransfers(prev => prev.map(t =>
+          t.id === transferId ? { ...t, progress: 80 } : t
+        ));
+
+        blob = await response.blob();
       }
-
-      setTransfers(prev => prev.map(t =>
-        t.id === transferId ? { ...t, progress: 80 } : t
-      ));
-
-      const blob = await response.blob();
       const downloadUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = downloadUrl;
@@ -403,7 +448,7 @@ export default function FileManager({
         transfer.id === transferId ? {
           ...transfer,
           status: 'failed',
-          error: error instanceof Error ? error.message : t('fileManager.errors.download')
+          error: chunkedErrorMessage(error) ?? (error instanceof Error ? error.message : t('fileManager.errors.download'))
         } : transfer
       ));
     } finally {
@@ -423,6 +468,26 @@ export default function FileManager({
   const handleUpload = useCallback(async (files: FileList) => {
     for (const file of Array.from(files)) {
       const transferId = crypto.randomUUID();
+
+      if (file.size > AGENT_MAX_CHUNKED_TRANSFER_BYTES) {
+        setTransfers(prev => [...prev, {
+          id: transferId,
+          filename: file.name,
+          direction: 'upload',
+          status: 'failed',
+          progress: 0,
+          size: file.size,
+          error: t('fileManager.errors.uploadTooLarge', {
+            size: formatSize(file.size),
+            max: formatSize(AGENT_MAX_CHUNKED_TRANSFER_BYTES),
+          }),
+        }]);
+        continue;
+      }
+      // Up to the single-shot cap every agent version accepts one file_write;
+      // above it the file moves in verified chunks.
+      const chunked = file.size > AGENT_SINGLE_SHOT_WRITE_BYTES;
+
       const controller = new AbortController();
       transferControllersRef.current.set(transferId, controller);
 
@@ -432,10 +497,30 @@ export default function FileManager({
         direction: 'upload',
         status: 'pending',
         progress: 0,
-        size: file.size
+        size: file.size,
+        chunked,
       }]);
 
       try {
+        if (chunked) {
+          setTransfers(prev => prev.map(t =>
+            t.id === transferId ? { ...t, status: 'transferring', progress: 0 } : t
+          ));
+          await uploadFileChunked(deviceId, file, joinRemotePath(currentPath, file.name), {
+            chunkSize: AGENT_FILE_CHUNK_BYTES,
+            signal: controller.signal,
+            onProgress: (done, total) => {
+              const progress = total > 0 ? Math.min(99, Math.floor((done / total) * 100)) : 99;
+              setTransfers(prev => prev.map(t => t.id === transferId ? { ...t, progress } : t));
+            },
+          });
+          setTransfers(prev => prev.map(t =>
+            t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+          ));
+          fetchDirectory(currentPath);
+          continue;
+        }
+
         // Read file content as base64
         setTransfers(prev => prev.map(t =>
           t.id === transferId ? { ...t, status: 'transferring', progress: 10 } : t
@@ -510,7 +595,8 @@ export default function FileManager({
           ));
           continue;
         }
-        const message = error instanceof Error ? error.message : t('fileManager.errors.upload');
+        const message = chunkedErrorMessage(error)
+          ?? (error instanceof Error ? error.message : t('fileManager.errors.upload'));
         const status: TransferItem['status'] =
           error instanceof UnverifiedOperationError ? 'unverified' : 'failed';
         setTransfers(prev => prev.map(t =>
@@ -562,7 +648,9 @@ export default function FileManager({
       if (item.status !== 'pending' && item.status !== 'transferring') return item;
       // Progress hits 40 right before the upload request is dispatched — from
       // then on the device may still write the file even though we aborted.
-      const note = item.direction === 'upload' && item.progress >= 40
+      // A chunked upload is discarded on the device instead (upload-abort),
+      // so it carries no such note.
+      const note = item.direction === 'upload' && !item.chunked && item.progress >= 40
         ? t('fileManager.cancelledUploadNote')
         : undefined;
       return { ...item, status: 'cancelled', error: note };

@@ -184,6 +184,10 @@ export const TYPE_SCOPED_TERMINAL_STRIP_KEYS: Readonly<Record<string, readonly s
   // in endpoint_conversation_messages, never here.
   [CommandTypes.CHAT_OPEN]: ['message'],
   [CommandTypes.CHAT_MESSAGE]: ['message'],
+  // Chunked File Browser upload: `content` is up to 2MB of file data per
+  // chunk, ~50 rows for one 100MB upload. It has no use once the command is
+  // terminal; path / transferId / offset / totalSize survive for forensics.
+  [CommandTypes.FILE_WRITE_CHUNK]: ['content'],
 };
 
 /**

@@ -504,6 +504,8 @@ const INTERACTIVE_COMMAND_TYPES: Set<string> = new Set([
   CommandTypes.DIAG_FILE_LIST,
   CommandTypes.DIAG_FILE_READ,
   CommandTypes.FILE_WRITE,
+  CommandTypes.FILE_WRITE_CHUNK,
+  CommandTypes.FILE_READ_CHUNK,
   CommandTypes.FILE_DELETE,
   CommandTypes.FILE_MKDIR,
   CommandTypes.FILE_RENAME,

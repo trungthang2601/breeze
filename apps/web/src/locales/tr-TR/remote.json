@@ -263,11 +263,16 @@
       "delete": "Silinemedi",
       "download": "İndirilemedi",
       "downloadTooLarge": "İndirilemeyecek kadar büyük ({{size}}). Dosya tarayıcısı en fazla {{max}} boyutunda dosya aktarır.",
+      "agentUpdateRequired": "Bu cihazdaki aracının {{max}} boyutundan büyük dosyaları aktarabilmesi için güncellenmesi gerekir.",
+      "checksumMismatch": "Aktarılan dosya sağlama toplamıyla eşleşmediği için silindi. Lütfen tekrar deneyin.",
+      "fileChanged": "Dosya indirme sırasında cihazda değişti. Lütfen tekrar deneyin.",
+      "secureContextRequired": "Büyük dosya aktarımları güvenli (HTTPS) bağlantı gerektirir.",
       "loadDirectory": "Dizin yüklenemedi",
       "move": "Taşınamadı",
       "readFile": "Dosya okunamadı",
       "upload": "Yükleme başarısız oldu",
-      "uploadTimeout": "Yükleme 2 dakika sonra zaman aşımına uğradı. Dosya hâlâ cihazda yazılı olabilir; doğrulamak için yenileyin."
+      "uploadTimeout": "Yükleme 2 dakika sonra zaman aşımına uğradı. Dosya hâlâ cihazda yazılı olabilir; doğrulamak için yenileyin.",
+      "uploadTooLarge": "Yüklenemeyecek kadar büyük ({{size}}). Dosya tarayıcısı en fazla {{max}} boyutunda dosya aktarır."
     },
     "freeOf": "{{free}} ücretsiz {{total}}",
     "goUp": "Yukarı Git",

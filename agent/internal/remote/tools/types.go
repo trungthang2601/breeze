@@ -160,6 +160,12 @@ const (
 	CmdFilesystemAnalysis = "filesystem_analysis"
 	CmdFileListDrives     = "file_list_drives"
 
+	// Chunked transfer for files larger than the single-shot caps
+	// (fileops_chunked.go). Separate types so an agent that predates them
+	// refuses as an unknown command instead of mis-handling a chunk.
+	CmdFileWriteChunk = "file_write_chunk"
+	CmdFileReadChunk  = "file_read_chunk"
+
 	// Administrator-approved diagnostic reads (diagaccess_*.go). Separate
 	// command types so an authorization can never be dropped silently into the
 	// legacy file_list/file_read path, and so an agent that predates them
