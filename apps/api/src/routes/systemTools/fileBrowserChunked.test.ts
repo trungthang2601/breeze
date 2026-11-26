@@ -32,9 +32,13 @@ vi.mock('../../middleware/auth', () => ({
   requirePermission: () => async (_c: unknown, next: () => Promise<void>) => next(),
 }));
 
+// The failure classifier in fileBrowserHelpers reads DEVICE_UNREACHABLE_ERROR,
+// so it must exist on the mock or every failure-path test answers 500.
 vi.mock('../../services/commandQueue', () => ({
   executeCommand: executeCommandMock,
   CommandTypes: { FILE_WRITE_CHUNK: 'file_write_chunk', FILE_READ_CHUNK: 'file_read_chunk' },
+  DEVICE_UNREACHABLE_ERROR:
+    'Device is not currently reachable over the live connection. Please try again in a moment.',
 }));
 
 vi.mock('../../services/auditService', () => ({ createAuditLog: createAuditLogMock }));
