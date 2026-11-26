@@ -54,6 +54,7 @@ import { SERVER_TIMEOUT_RESULT_STATUS } from '../services/commandResultAcceptanc
 import { createAuditLogAsync } from '../services/auditService';
 import { ANONYMOUS_ACTOR_ID } from '../services/auditEvents';
 import { recordCancelUnconfirmed } from '../services/scriptCancellationMetrics';
+import { eraseStaleTransientStdout } from '../services/transientCommandResult';
 const QUEUE_NAME = 'stale-command-reaper';
 const REAP_INTERVAL_MS = 2 * 60 * 1000; // every 2 minutes
 // Per-run cap (env-tunable). Was a hardcoded 200 which silently truncated the
@@ -1869,6 +1870,10 @@ export const REAPER_DOMAINS = [
   ['remoteSessions', reapStaleRemoteSessions],
   ['backupJobs', reapStaleBackupJobs],
   ['commandlessRestores', reapCommandlessPendingRestores],
+  // Not a reap: erases File Browser read results' stored file bytes once
+  // delivered or orphaned (services/transientCommandResult.ts). Last, so a
+  // failure here never delays an actual reap.
+  ['transientResults', eraseStaleTransientStdout],
 ] as const;
 
 /**

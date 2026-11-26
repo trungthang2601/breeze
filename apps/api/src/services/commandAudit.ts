@@ -161,6 +161,27 @@ export function isRawStdoutArtifactCommand(type: string): boolean {
   return RAW_STDOUT_COMMAND_TYPES.has(type);
 }
 
+/**
+ * File Browser reads: stdout is JSON carrying the file's bytes as base64. The
+ * secret patterns fire inside base64 of any binary or compressed file (a 2MB
+ * chunk of random bytes holds ~1–2 case-insensitive `AKIA…` hits on average),
+ * so redacting it corrupts the download and the browser's SHA-256 check
+ * fails. Unlike RAW_STDOUT_COMMAND_TYPES this is tenant content, so it does
+ * NOT get raw pass-through in command history; and the stored copy is erased
+ * once the caller has it (services/transientCommandResult.ts).
+ *
+ * String literals for the same import-cycle reason as above.
+ */
+const FILE_CONTENT_STDOUT_COMMAND_TYPES = new Set(['file_read', 'file_read_chunk']);
+
+/**
+ * True when stdout must be stored byte-for-byte rather than passed through
+ * `redactSecretsFromOutput` at ingest. stderr/error redaction is never skipped.
+ */
+export function isStdoutRedactionExempt(type: string): boolean {
+  return RAW_STDOUT_COMMAND_TYPES.has(type) || FILE_CONTENT_STDOUT_COMMAND_TYPES.has(type);
+}
+
 export function sanitizeCommandResultForHistory(
   result: CommandResult | null | undefined,
   opts: { keepRawStdout?: boolean } = {},
