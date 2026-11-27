@@ -1185,6 +1185,8 @@ services:
     network_mode: host
     secrets:
       - turn_secret
+    environment:
+      TURN_ALLOWED_PEER_IPS: ${TURN_ALLOWED_PEER_IPS:-}
     volumes:
       # #6163 — TURN over TLS is opt-in. coturn skips the 5349 listener SILENTLY
       # when it has no --cert/--pkey, so the flags were advertised but dead. A
@@ -1226,6 +1228,19 @@ services:
         else
           echo 'coturn: no readable certificate at /etc/coturn/tls — TURNS (5349) is disabled; only 3478 will listen.' >&2
           echo 'Set TURN_TLS_DIR to a directory holding cert.pem + privkey.pem readable by uid 65534 (nobody). See /deploy/turn-server/.' >&2
+        fi
+        # TURN_ALLOWED_PEER_IPS — opt-in, comma-separated addresses/ranges that
+        # override the --denied-peer-ip list below. For a relay behind NAT whose
+        # own address is private (e.g. 10.x): when BOTH peers are relayed here,
+        # relay-to-relay permissions resolve to that private address and the
+        # 10.0.0.0/8 deny refuses them (403 Forbidden IP), leaving no path for
+        # peers whose NATs block the direct one. Set it to the relay's OWN
+        # address(es) only — never a whole private range.
+        if [ -n "$${TURN_ALLOWED_PEER_IPS:-}" ]; then
+          for ip in $$(echo "$$TURN_ALLOWED_PEER_IPS" | tr ',' ' '); do
+            set -- "$$@" --allowed-peer-ip="$$ip"
+          done
+          echo "coturn: exempting own relay address(es) from the peer deny list: $$TURN_ALLOWED_PEER_IPS" >&2
         fi
         exec turnserver -c /tmp/turn-secret.conf "$$@"
       - turnserver
