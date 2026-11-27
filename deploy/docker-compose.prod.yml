@@ -317,6 +317,7 @@ x-api-env: &api-env
   TURN_CREDENTIAL_TTL_SECONDS: ${TURN_CREDENTIAL_TTL_SECONDS:-600}
   TURN_TLS_HOST: ${TURN_TLS_HOST:-}
   TURN_TLS_PORT: ${TURN_TLS_PORT:-5349}
+  DESKTOP_FORCE_RELAY_DEVICE_IDS: ${DESKTOP_FORCE_RELAY_DEVICE_IDS:-}
   # Built-in extensions ship inside the API image but load only when the
   # deployment switches them on (default off, and value-strict: only the
   # exact string "true"). Workspace additionally requires pgvector to be
