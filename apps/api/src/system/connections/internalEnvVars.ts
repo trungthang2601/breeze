@@ -197,6 +197,8 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   DB_WEDGED_BACKEND_SCAN_INTERVAL_MS: 'database pool/watchdog tuning',
   // DEPLOYMENT_*
   DEPLOYMENT_ENV: 'hosted topology label',
+  // DESKTOP_*
+  DESKTOP_FORCE_RELAY_DEVICE_IDS: 'remote desktop relay-only device override',
   // DEVICE_*
   DEVICE_COMMAND_QUEUE_LIVE_ONLY_TTL_MINUTES: 'timing knob',
   DEVICE_COMMAND_QUEUE_POWER_STATE_TTL_HOURS: 'timing knob',
