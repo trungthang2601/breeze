@@ -11,6 +11,18 @@ type DesktopIcePlan =
   };
 
 /**
+ * DESKTOP_FORCE_RELAY_DEVICE_IDS: comma-separated device ids whose remote
+ * desktop always runs relay-only through TURN. Read per call so a .env change
+ * needs only a container restart, not a rebuild.
+ */
+export function isForcedRelayDevice(deviceId: string): boolean {
+  const raw = process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS;
+  if (!raw) return false;
+  const wanted = deviceId.toLowerCase();
+  return raw.split(',').some((id) => id.trim().toLowerCase() === wanted);
+}
+
+/**
  * OD9: resolve inside the caller's DB access context; unreadable isolation fails closed.
  *
  * Relay-only holds for every episode outside the shared resolved-terminal set, so a state
@@ -29,6 +41,14 @@ export async function resolveDesktopIcePlan(
   const { findUnresolvedEpisode } = await import('../../services/networkIsolation/episodeStore');
   const episode = await db.transaction((tx) => findUnresolvedEpisode(tx, deviceId));
   if (!episode || isResolvedTerminalIsolationState(episode.state)) {
+    // Operator override for a device whose network defeats direct WebRTC
+    // (CGNAT, per-VLAN UDP filtering): confine it to the TURN relay, which
+    // only needs outbound TCP/TLS to the relay. Best-effort — without a TURN
+    // server configured it keeps the normal plan rather than refusing.
+    if (isForcedRelayDevice(deviceId)) {
+      const relayServers = getIceServers(scope, { relayOnly: true });
+      if (relayServers.length > 0) return { ok: true, relayOnly: true, iceServers: relayServers };
+    }
     return { ok: true, relayOnly: false, iceServers: getIceServers(scope) };
   }
   if (!episode.remoteRelay) {

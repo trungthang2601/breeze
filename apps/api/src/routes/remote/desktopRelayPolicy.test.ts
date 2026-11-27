@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RESOLVED_TERMINAL_STATES } from '@breeze/shared';
 
 const { findEpisode, iceServers, transaction, tx } = vi.hoisted(() => {
@@ -51,6 +51,33 @@ describe('resolveDesktopIcePlan', () => {
     expect(await resolveDesktopIcePlan('device', scope)).toEqual({ ok: true, relayOnly: false, iceServers: legacy });
     expect(iceServers).toHaveBeenCalledWith(scope);
   });
+  describe('DESKTOP_FORCE_RELAY_DEVICE_IDS', () => {
+    afterEach(() => { delete process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS; });
+
+    it('confines a listed device to the TURN relay', async () => {
+      process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS = 'other, DEVICE ';
+      expect(await resolveDesktopIcePlan('device', scope)).toEqual({ ok: true, relayOnly: true, iceServers: turn });
+      expect(iceServers).toHaveBeenCalledWith(scope, { relayOnly: true });
+    });
+
+    it('leaves unlisted devices on the normal plan', async () => {
+      process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS = 'other';
+      expect(await resolveDesktopIcePlan('device', scope)).toEqual({ ok: true, relayOnly: false, iceServers: legacy });
+    });
+
+    it('keeps the normal plan when no TURN relay is configured', async () => {
+      process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS = 'device';
+      iceServers.mockImplementation((_scope, opts) => opts?.relayOnly ? [] : legacy);
+      expect(await resolveDesktopIcePlan('device', scope)).toEqual({ ok: true, relayOnly: false, iceServers: legacy });
+    });
+
+    it('does not loosen isolation: an isolated device without relay permission is still refused', async () => {
+      process.env.DESKTOP_FORCE_RELAY_DEVICE_IDS = 'device';
+      findEpisode.mockResolvedValue({ state: 'applied', remoteRelay: false });
+      expect((await resolveDesktopIcePlan('device', scope)).ok).toBe(false);
+    });
+  });
+
   it('propagates database failures without minting ICE credentials', async () => {
     findEpisode.mockRejectedValue(new Error('database unavailable'));
     await expect(resolveDesktopIcePlan('device', scope)).rejects.toThrow('database unavailable');
