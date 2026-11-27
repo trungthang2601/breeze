@@ -95,7 +95,11 @@ export async function eraseDeliveredCommandStdout(commandId: string, type: strin
  * than the grace period. Runs inside the reaper's system context.
  */
 export async function eraseStaleTransientStdout(): Promise<number> {
-  const cutoff = new Date(Date.now() - TRANSIENT_STDOUT_GRACE_MS);
+  // An ISO string, not a Date: inside a raw `sql` fragment there is no column
+  // to map the value through, and postgres.js refuses a bare Date parameter
+  // (ERR_INVALID_ARG_TYPE). completed_at is a UTC `timestamp`, so the ISO
+  // string compares correctly.
+  const cutoff = new Date(Date.now() - TRANSIENT_STDOUT_GRACE_MS).toISOString();
   const rows = await db
     .update(deviceCommands)
     .set({ result: erasedResult() })

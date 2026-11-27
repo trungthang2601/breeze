@@ -90,7 +90,10 @@ describe('eraseStaleTransientStdout', () => {
     expect(where.sql).toContain('completed_at <');
     expect(where.sql).toContain('LIMIT');
     expect(where.params).toContain(TRANSIENT_STDOUT_SWEEP_BATCH);
-    const cutoff = where.params.find((p) => p instanceof Date || typeof p === 'string' && /^\d{4}-/.test(p));
+    // Must be a string: postgres.js rejects a bare Date bound through a raw
+    // sql fragment (ERR_INVALID_ARG_TYPE), which broke the sweep in production.
+    expect(where.params.some((p) => p instanceof Date)).toBe(false);
+    const cutoff = where.params.find((p) => typeof p === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(p));
     expect(cutoff).toBeDefined();
   });
 });
