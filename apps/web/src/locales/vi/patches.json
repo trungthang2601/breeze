@@ -577,7 +577,7 @@
     },
     "approvalPolicy": {
       "title": "Chính sách phê duyệt",
-      "description": "Những gì được tự động phê duyệt trong vòng này và thời gian giữ lại bản vá sau khi nhà供应商 phát hành. Mặc định áp dụng cho mọi danh mục; thêm tùy chọn ghi đè để xử lý khác đi.",
+      "description": "Những gì được tự động phê duyệt trong vòng này và thời gian giữ lại bản vá sau khi nhà cung cấp phát hành. Mặc định áp dụng cho mọi danh mục; thêm tùy chọn ghi đè để xử lý khác đi.",
       "allCategories": "Tất cả danh mục",
       "default": "Mặc định",
       "severityNote": "Mức độ nghiêm trọng chỉ áp dụng cho các bản cập nhật HĐH. Các bản cập nhật ứng dụng bên thứ ba được điều khiển bằng công tắc bên dưới — chúng không bị chi phối bởi mức độ nghiêm trọng.",

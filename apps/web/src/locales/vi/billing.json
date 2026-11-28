@@ -1670,7 +1670,7 @@
         "attached": "Đã đính kèm bằng chứng.",
         "attachError": "Không thể đính kèm tệp bằng chứng.",
         "downloadError": "Không thể tải xuống tệp bằng chứng.",
-        "tooLarge": "Tệp này lớn hơn 10 MB. Vوي lòng chọn tệp nhỏ hơn."
+        "tooLarge": "Tệp này lớn hơn 10 MB. Vui lòng chọn tệp nhỏ hơn."
       },
       "generatedContracts": {
         "title_one": "Báo giá này đã tạo {{count}} hợp đồng",

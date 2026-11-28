@@ -2232,7 +2232,7 @@
       "serial": "Số sê-ri",
       "target": "Mục tiêu",
       "type": "Loại",
-      "vendor": "Nhà供应"
+      "vendor": "Nhà cung cấp"
     }
   },
   "devicePlaybookHistory": {
@@ -3110,7 +3110,7 @@
         "installed": "Đã cài đặt phần mềm",
         "notInstalled": "Thiếu phần mềm",
         "version": "Phiên bản phần mềm",
-        "vendor": "Nhà供应 phần mềm"
+        "vendor": "Nhà cung cấp phần mềm"
       },
       "logShippingFailing": "Gửi nhật ký thất bại",
       "networkIsolation": {

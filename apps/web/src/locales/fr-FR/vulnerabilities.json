@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Remédier {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Ce qu’un attaquant peut faire",
+      "pathLabel": "Comment la faille est exploitée",
+      "impact": {
+        "takeover": "Prise de contrôle totale : lire et modifier les données et exécuter du code sur l’appareil",
+        "readWrite": "Lire et modifier les données sur l’appareil",
+        "dataLeak": "Voler des données sensibles",
+        "tamper": "Modifier ou falsifier des données",
+        "dos": "Faire planter ou bloquer le logiciel (déni de service)",
+        "limited": "Impact limité"
+      },
+      "scopeChanged": "— peut se propager au-delà du logiciel concerné",
+      "access": {
+        "network": "à distance via le réseau",
+        "adjacent": "depuis le même réseau local",
+        "local": "nécessite un accès sur l’appareil lui-même",
+        "physical": "nécessite un accès physique à l’appareil"
+      },
+      "privileges": {
+        "none": "aucune connexion requise",
+        "low": "nécessite un compte utilisateur standard",
+        "high": "nécessite un compte administrateur"
+      },
+      "noUser": "aucune action de l’utilisateur requise",
+      "userNeeded": "un utilisateur doit ouvrir un fichier ou cliquer sur quelque chose"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "Afficher les constats sur {{deviceName}}",
       "collapseAria": "Masquer les constats sur {{deviceName}}",
       "loading": "Chargement des constats…",
-      "loadError": "Impossible de charger les constats de l’appareil"
+      "loadError": "Impossible de charger les constats de l’appareil",
+      "online": "En ligne actuellement",
+      "lastSeen": "Vu pour la dernière fois {{when}}",
+      "version": "Version installée : {{versions}}"
     }
   },
   "softwareGroupTable": {

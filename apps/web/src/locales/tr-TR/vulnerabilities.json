@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Düzeltin {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Bir saldırganın yapabilecekleri",
+      "pathLabel": "Nasıl istismar edilir",
+      "impact": {
+        "takeover": "Tam ele geçirme: cihazdaki verileri okuma, değiştirme ve kod çalıştırma",
+        "readWrite": "Cihazdaki verileri okuma ve değiştirme",
+        "dataLeak": "Hassas verileri çalma",
+        "tamper": "Verileri değiştirme veya sahteleme",
+        "dos": "Yazılımı çökertme veya dondurma (hizmet reddi)",
+        "limited": "Sınırlı etki"
+      },
+      "scopeChanged": "— etkilenen yazılımın ötesine yayılabilir",
+      "access": {
+        "network": "ağ üzerinden uzaktan",
+        "adjacent": "aynı yerel ağdan",
+        "local": "cihazın kendisinde erişim gerektirir",
+        "physical": "cihaza fiziksel erişim gerektirir"
+      },
+      "privileges": {
+        "none": "oturum açma gerekmez",
+        "low": "normal bir kullanıcı hesabı gerektirir",
+        "high": "yönetici hesabı gerektirir"
+      },
+      "noUser": "kullanıcı eylemi gerekmez",
+      "userNeeded": "bir kullanıcının dosya açması veya bir şeye tıklaması gerekir"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "{{deviceName}} üzerindeki bulguları göster",
       "collapseAria": "{{deviceName}} üzerindeki bulguları gizle",
       "loading": "Bulgular yükleniyor…",
-      "loadError": "Cihaz bulguları yüklenemedi"
+      "loadError": "Cihaz bulguları yüklenemedi",
+      "online": "Şu anda çevrimiçi",
+      "lastSeen": "Son görülme {{when}}",
+      "version": "Sürüm {{versions}}"
     }
   },
   "softwareGroupTable": {

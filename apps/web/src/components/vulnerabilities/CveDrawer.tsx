@@ -187,9 +187,11 @@ export function CveDrawer({
                 const s = summarizeCvss(payload.cve.cvssVector);
                 if (!s) return null;
                 const path = [
-                  s.access ? t(`cveDrawer.summary.access.${s.access}`) : null,
-                  s.privileges ? t(`cveDrawer.summary.privileges.${s.privileges}`) : null,
-                  s.userInteraction === null ? null : t(s.userInteraction ? 'cveDrawer.summary.userNeeded' : 'cveDrawer.summary.noUser'),
+                  s.access ? t(/* i18n-dynamic */ `cveDrawer.summary.access.${s.access}`) : null,
+                  s.privileges ? t(/* i18n-dynamic */ `cveDrawer.summary.privileges.${s.privileges}`) : null,
+                  s.userInteraction === null
+                    ? null
+                    : s.userInteraction ? t('cveDrawer.summary.userNeeded') : t('cveDrawer.summary.noUser'),
                 ].filter(Boolean).join(', ');
                 const danger = s.impact === 'takeover' || s.impact === 'readWrite';
                 return (
@@ -199,7 +201,7 @@ export function CveDrawer({
                   >
                     <p className="text-xs text-muted-foreground">{t('cveDrawer.summary.impactLabel')}</p>
                     <p className={`font-semibold ${danger ? 'text-red-700 dark:text-red-300' : ''}`}>
-                      {t(`cveDrawer.summary.impact.${s.impact}`)}
+                      {t(/* i18n-dynamic */ `cveDrawer.summary.impact.${s.impact}`)}
                       {s.scopeChanged ? ` ${t('cveDrawer.summary.scopeChanged')}` : ''}
                     </p>
                     {path && (

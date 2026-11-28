@@ -778,7 +778,7 @@
             }
           },
           "vendor": {
-            "label": "Nhà供应商",
+            "label": "Nhà cung cấp",
             "options": {
               "all": "Tất cả nhà cung cấp",
               "apple": "Apple",
@@ -1087,7 +1087,7 @@
         "performance": "Báo cáo hiệu suất",
         "security_compliance_posture": "Trạng thái bảo mật & tuân thủ",
         "software_inventory": "Kiểm kê phần mềm",
-        "threat_detection_review": "Đánh giá phát hiện mối威胁",
+        "threat_detection_review": "Đánh giá phát hiện mối đe dọa",
         "endpoint_management_review": "Đánh giá quản lý thiết bị đầu cuối",
         "ticket_sla_attainment": "Đạt SLA phiếu hỗ trợ",
         "technician_time_billability": "Thời gian kỹ thuật viên & tính phí được",
