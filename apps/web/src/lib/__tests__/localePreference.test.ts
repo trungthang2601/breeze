@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, vi, afterEach } from 'vitest';
+import { SUPPORTED_LOCALES } from '@breeze/shared';
 import {
   LOCALE_OPTIONS,
   LOCALE_COOKIE_NAME,
@@ -34,11 +35,13 @@ describe('locale preference', () => {
   });
 
   it('exposes exactly the supported locales', () => {
-    expect(LOCALE_OPTIONS).toEqual(['en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR']);
+    expect(LOCALE_OPTIONS).toEqual(['en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR', 'vi']);
+    // The web picker and the shared server-side list must never drift apart.
+    expect([...LOCALE_OPTIONS]).toEqual([...SUPPORTED_LOCALES]);
   });
 
   it('validates locales', () => {
-    for (const locale of ['en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR']) {
+    for (const locale of SUPPORTED_LOCALES) {
       expect(isValidLocale(locale)).toBe(true);
       expect(normalizeLocale(locale)).toBe(locale);
     }

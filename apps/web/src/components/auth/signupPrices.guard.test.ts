@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { SUPPORTED_LOCALES } from '@breeze/shared';
 
 const files = ['components/auth/PartnerRegisterForm.tsx', 'components/auth/PartnerRegisterPage.tsx', 'lib/signupOffer.ts'];
 // A dollar amount, or a bare figure such as 9900 or 19900 (cents) or 100000.
@@ -17,8 +18,8 @@ describe('register page holds no price', () => {
     expect(source).not.toMatch(PRICE);
   });
 
-  it('checks all eight locales', () => {
-    expect(locales).toHaveLength(8);
+  it('checks every supported locale', () => {
+    expect([...locales].sort()).toEqual([...SUPPORTED_LOCALES].sort());
   });
 
   it.each(locales)('%s partnerRegister.purchase strings hold no price figure', (locale) => {

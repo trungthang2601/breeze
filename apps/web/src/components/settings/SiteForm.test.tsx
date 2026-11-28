@@ -30,16 +30,16 @@ describe('SiteForm timezone', () => {
     });
   });
 
-  it('defaults to UTC and submits it unchanged when the user picks nothing', async () => {
+  it('defaults to Asia/Ho_Chi_Minh and submits it unchanged when the user picks nothing', async () => {
     const onSubmit = vi.fn();
     render(<SiteForm onSubmit={onSubmit} />);
 
-    expect(screen.getByTestId('site-timezone-trigger')).toHaveTextContent('UTC');
+    expect(screen.getByTestId('site-timezone-trigger')).toHaveTextContent('Asia/Ho_Chi_Minh');
     fireEvent.change(screen.getByLabelText('Site name'), { target: { value: 'HQ' } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
-    expect(onSubmit.mock.calls[0]?.[0]).toMatchObject({ timezone: 'UTC' });
+    expect(onSubmit.mock.calls[0]?.[0]).toMatchObject({ timezone: 'Asia/Ho_Chi_Minh' });
   });
 
   it('renders and preserves a defaultValue zone the old list did not contain', async () => {
