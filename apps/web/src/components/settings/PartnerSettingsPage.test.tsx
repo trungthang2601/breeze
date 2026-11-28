@@ -193,7 +193,7 @@ describe('PartnerSettingsPage language control', () => {
     const languageSelect = screen.getByLabelText('Language') as HTMLSelectElement;
     expect(languageSelect.value).toBe('en');
     expect(Array.from(languageSelect.options).map(option => option.value)).toEqual([
-      'en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR',
+      'en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR', 'vi',
     ]);
     expect(screen.getByText('Default language for partner settings.')).not.toBeNull();
   });

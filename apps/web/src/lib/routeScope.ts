@@ -133,6 +133,7 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   { pattern: /^\/vulnerabilities$/, kind: 'org-or-all' },
   { pattern: /^\/security(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/sensitive-data(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/file-egress(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/peripherals(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/pam$/, kind: 'org-or-all' },
   { pattern: /^\/ai-risk$/, kind: 'org-or-all' },

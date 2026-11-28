@@ -68,7 +68,7 @@ export default function SiteForm({
       contactPhone: '',
       ...defaultValues,
       // After the spread, so an explicitly-undefined/empty incoming timezone
-      // cannot leave the form value diverging from the 'UTC' the picker shows.
+      // cannot leave the form value diverging from the default zone the picker shows.
       timezone: defaultValues?.timezone || 'Asia/Ho_Chi_Minh'
     }
   });

@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { OAUTH_ERROR_PAGE_PATH, OAUTH_ERROR_PAGE_REASONS } from '@breeze/shared';
+import { OAUTH_ERROR_PAGE_PATH, OAUTH_ERROR_PAGE_REASONS, SUPPORTED_LOCALES } from '@breeze/shared';
 import { oauthErrorCopy, resolveOauthErrorView } from './oauthErrorPage';
 
 const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,7 +43,7 @@ describe('oauthErrorCopy', () => {
     const localesDir = join(srcDir, 'locales');
     const problems: string[] = [];
     const locales = readdirSync(localesDir).filter((entry) => statSync(join(localesDir, entry)).isDirectory());
-    expect(locales).toHaveLength(8);
+    expect([...locales].sort()).toEqual([...SUPPORTED_LOCALES].sort());
     for (const locale of locales) {
       const bundle = JSON.parse(readFileSync(join(localesDir, locale, 'pages.json'), 'utf8'));
       for (const view of views) {

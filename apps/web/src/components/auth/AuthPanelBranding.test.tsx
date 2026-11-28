@@ -35,10 +35,9 @@ describe('AuthPanelBranding', () => {
     expect(screen.getByText('10,000+ endpoints')).toBeInTheDocument();
     expect(screen.queryByTestId('partner-logo')).not.toBeInTheDocument();
 
-    // The stock Breeze mark keeps its original size (only partner logos grew).
-    const stockMark = screen.getByText('Breeze').previousElementSibling as SVGElement;
-    expect(stockMark.tagName.toLowerCase()).toBe('svg');
-    expect(stockMark.getAttribute('class')).toBe('h-8 w-8');
+    // The stock panel shows the deployment's own /branding.png mark, not a partner logo.
+    const stockMark = document.querySelector('img[src="/branding.png"]');
+    expect(stockMark).not.toBeNull();
   });
 
   it('renders partner branding and drops marketing copy when branding is present', async () => {

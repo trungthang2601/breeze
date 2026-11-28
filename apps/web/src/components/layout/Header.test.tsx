@@ -51,6 +51,7 @@ vi.mock('../../stores/helpStore', () => ({ useHelpStore: () => ({ isOpen: false,
 vi.mock('../../stores/uiStore', () => ({ useUiStore: () => ({ toggleMobileMenu: vi.fn() }) }));
 vi.mock('./OrgSwitcher', () => ({ default: () => null }));
 vi.mock('./NotificationCenter', () => ({ default: () => null }));
+vi.mock('./LanguageToggle', () => ({ default: () => null }));
 vi.mock('../time/TimerWidget', () => ({ default: () => null }));
 vi.mock('./CommandPalette', () => ({ default: () => null }));
 vi.mock('../support/SupportModal', () => ({ default: () => null }));
