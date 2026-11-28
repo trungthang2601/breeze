@@ -237,7 +237,7 @@ export default function FileManager({
   // keeps the server's message.
   const chunkedErrorMessage = (error: unknown): string | undefined => {
     if (!(error instanceof ChunkedTransferError)) return undefined;
-    return t(CHUNKED_ERROR_KEYS[error.code], {
+    return t(/* i18n-dynamic */ CHUNKED_ERROR_KEYS[error.code], {
       max: formatSize(error.code === 'agent_update_required' ? AGENT_SINGLE_SHOT_WRITE_BYTES : AGENT_MAX_CHUNKED_TRANSFER_BYTES),
     });
   };
