@@ -85,11 +85,12 @@ describe('FileManager downloads', () => {
   });
 
   describe('over-cap pre-flight', () => {
-    // The agent refuses any file_read over 1MB. The listing already knows each
-    // entry's size, so these assert the UI never spends a doomed round trip —
-    // and, just as importantly, that it never blocks a transfer the agent WOULD
-    // have served.
-    const OVER_CAP = 2 * 1024 * 1024;
+    // Files above the 1MB single-shot read move in chunks, up to
+    // AGENT_MAX_CHUNKED_TRANSFER_BYTES (100MB); only beyond that is a download
+    // refused. The listing already knows each entry's size, so these assert the
+    // UI never spends a doomed round trip — and, just as importantly, that it
+    // never blocks a transfer the agent WOULD have served.
+    const OVER_CAP = 101 * 1024 * 1024;
     const AT_CAP = 1024 * 1024;
 
     function renderWithEntry(entry: Record<string, unknown>) {
@@ -129,7 +130,7 @@ describe('FileManager downloads', () => {
 
       await waitFor(() => {
         expect(
-          screen.getByText('Too large to download (2.0 MB). The file browser transfers files up to 1.0 MB.')
+          screen.getByText('Too large to download (101.0 MB). The file browser transfers files up to 100.0 MB.')
         ).toBeInTheDocument();
       });
       // The point of the guard: no round trip at all.

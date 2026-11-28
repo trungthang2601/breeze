@@ -20,7 +20,7 @@
       "policy_override": "Ghi đè chính sách"
     },
     "peripheralType": "Loại thiết bị ngoại vi",
-    "vendor": "Nhà供应",
+    "vendor": "Nhà cung cấp",
     "empty": "Không tìm thấy hoạt động thiết bị ngoại vi nào.",
     "columns": {
       "occurredAt": "Thời gian xảy ra",

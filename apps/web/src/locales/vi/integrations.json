@@ -832,7 +832,7 @@
     "test": "Kiểm tra",
     "syncOptions": "Tùy chọn đồng bộ",
     "mapping": "Ánh xạ",
-    "psaConnectionWizard": "Trình向 dẫn kết nối PSA",
+    "psaConnectionWizard": "Trình hướng dẫn kết nối PSA",
     "completeTheStepsToSyncTicketsAssetsAnd": "Hoàn thành các bước để đồng bộ phiếu hỗ trợ, tài sản và quy trình làm việc. ",
     "selectPSAProvider": "Chọn nhà cung cấp PSA ",
     "enterCredentials": "Nhập thông tin xác thực ",

@@ -2254,7 +2254,7 @@
         },
         "enableSoftwareInventory": {
           "label": "Kho phần mềm",
-          "description": "Hiển thị tên phần mềm, phiên bản, nhà供应商, ngày cài đặt và lần cuối nhìn thấy cho các thiết bị của khách hàng."
+          "description": "Hiển thị tên phần mềm, phiên bản, nhà cung cấp, ngày cài đặt và lần cuối nhìn thấy cho các thiết bị của khách hàng."
         },
         "enableNetworkVisibility": {
           "label": "Khả năng hiển thị mạng",
@@ -2703,7 +2703,7 @@
       "enabled": "Đã bật",
       "actMode": {
         "label": "Chế độ hành động",
-        "hint": "Khi được kích hoạt, lịch trình này có thể áp dụng tự động một số bản修正 thay vì chờ phê duyệt.",
+        "hint": "Khi được kích hoạt, lịch trình này có thể áp dụng tự động một số bản sửa lỗi thay vì chờ phê duyệt.",
         "deploymentDisabledHint": "Chế độ hành động không khả dụng vì BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED đang tắt đối với bản triển khai này. Liên hệ quản trị viên của bạn để bật tính năng này.",
         "disabledHint": "Kích hoạt chế độ hành động yêu cầu quyền truy cập toàn diện của đối tác vào tất cả tổ chức.",
         "scopeNote": "Các bản sửa lỗi tự động chỉ giới hạn ở việc khởi động lại dịch vụ bị dừng và chỉ trên các thiết bị có tổ chức đã được cấp quyền manage_services:restart. Mọi thứ khác vẫn phải chờ phê duyệt.",
@@ -6009,7 +6009,7 @@
     "testConnection": "Kiểm tra kết nối",
     "searching": "Đang tìm kiếm.",
     "searchProducts": "Tìm kiếm sản phẩm",
-    "unknownVendor": "Nhà供应商 không xác định",
+    "unknownVendor": "Nhà cung cấp không xác định",
     "nA": "N/A",
     "uSD": "USD",
     "importing": "Đang nhập.",
@@ -7617,7 +7617,7 @@
     "errors": {
       "previewFailed": "Không thể đối chiếu tệp với các liên hệ hiện có.",
       "importFailed": "Không thể nhập các liên hệ đã chọn.",
-      "fileRead": "Không thể đọc tệp đó. Vوi lòng chọn lại.",
+      "fileRead": "Không thể đọc tệp đó. Vui lòng chọn lại.",
       "noColumns": "Tệp đó không có hàng tiêu đề, nên không thể ánh xạ."
     }
   },
