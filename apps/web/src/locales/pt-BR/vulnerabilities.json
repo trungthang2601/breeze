@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Remediar {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "O que um invasor pode fazer",
+      "pathLabel": "Como é explorada",
+      "impact": {
+        "takeover": "Controle total: ler e alterar dados e executar código no dispositivo",
+        "readWrite": "Ler e alterar dados no dispositivo",
+        "dataLeak": "Roubar dados confidenciais",
+        "tamper": "Alterar ou falsificar dados",
+        "dos": "Travar ou congelar o software (negação de serviço)",
+        "limited": "Impacto limitado"
+      },
+      "scopeChanged": "— pode se espalhar além do software afetado",
+      "access": {
+        "network": "remotamente pela rede",
+        "adjacent": "a partir da mesma rede local",
+        "local": "requer acesso no próprio dispositivo",
+        "physical": "requer acesso físico ao dispositivo"
+      },
+      "privileges": {
+        "none": "não requer login",
+        "low": "requer uma conta de usuário comum",
+        "high": "requer uma conta de administrador"
+      },
+      "noUser": "nenhuma ação do usuário necessária",
+      "userNeeded": "um usuário precisa abrir um arquivo ou clicar em algo"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "Mostrar achados em {{deviceName}}",
       "collapseAria": "Ocultar achados em {{deviceName}}",
       "loading": "Carregando achados…",
-      "loadError": "Falha ao carregar achados do dispositivo"
+      "loadError": "Falha ao carregar achados do dispositivo",
+      "online": "Online agora",
+      "lastSeen": "Visto pela última vez {{when}}",
+      "version": "Versão {{versions}}"
     }
   },
   "softwareGroupTable": {

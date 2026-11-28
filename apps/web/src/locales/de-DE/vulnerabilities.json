@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Beheben Sie {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Was ein Angreifer tun kann",
+      "pathLabel": "Wie die Schwachstelle ausgenutzt wird",
+      "impact": {
+        "takeover": "Vollständige Übernahme: Daten lesen und ändern sowie Code auf dem Gerät ausführen",
+        "readWrite": "Daten auf dem Gerät lesen und ändern",
+        "dataLeak": "Sensible Daten stehlen",
+        "tamper": "Daten ändern oder fälschen",
+        "dos": "Die Software zum Absturz bringen oder einfrieren (Denial of Service)",
+        "limited": "Begrenzte Auswirkungen"
+      },
+      "scopeChanged": "— kann sich über die betroffene Software hinaus ausbreiten",
+      "access": {
+        "network": "aus der Ferne über das Netzwerk",
+        "adjacent": "aus demselben lokalen Netzwerk",
+        "local": "erfordert Zugriff auf das Gerät selbst",
+        "physical": "erfordert physischen Zugriff auf das Gerät"
+      },
+      "privileges": {
+        "none": "keine Anmeldung erforderlich",
+        "low": "erfordert ein normales Benutzerkonto",
+        "high": "erfordert ein Administratorkonto"
+      },
+      "noUser": "keine Benutzeraktion erforderlich",
+      "userNeeded": "ein Benutzer muss eine Datei öffnen oder auf etwas klicken"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "Befunde auf {{deviceName}} anzeigen",
       "collapseAria": "Befunde auf {{deviceName}} ausblenden",
       "loading": "Befunde werden geladen…",
-      "loadError": "Gerätebefunde konnten nicht geladen werden"
+      "loadError": "Gerätebefunde konnten nicht geladen werden",
+      "online": "Jetzt online",
+      "lastSeen": "Zuletzt gesehen {{when}}",
+      "version": "Installierte Version {{versions}}"
     }
   },
   "softwareGroupTable": {

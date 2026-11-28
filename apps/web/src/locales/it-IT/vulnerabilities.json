@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Correggi {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Cosa può fare un aggressore",
+      "pathLabel": "Come viene sfruttata",
+      "impact": {
+        "takeover": "Controllo completo: leggere e modificare i dati ed eseguire codice sul dispositivo",
+        "readWrite": "Leggere e modificare i dati sul dispositivo",
+        "dataLeak": "Rubare dati sensibili",
+        "tamper": "Modificare o falsificare i dati",
+        "dos": "Bloccare o mandare in crash il software (denial of service)",
+        "limited": "Impatto limitato"
+      },
+      "scopeChanged": "— può estendersi oltre il software interessato",
+      "access": {
+        "network": "da remoto tramite la rete",
+        "adjacent": "dalla stessa rete locale",
+        "local": "richiede l'accesso al dispositivo stesso",
+        "physical": "richiede l'accesso fisico al dispositivo"
+      },
+      "privileges": {
+        "none": "nessun login richiesto",
+        "low": "richiede un normale account utente",
+        "high": "richiede un account amministratore"
+      },
+      "noUser": "nessuna azione dell'utente richiesta",
+      "userNeeded": "un utente deve aprire un file o fare clic su qualcosa"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "Mostra i rilevamenti su {{deviceName}}",
       "collapseAria": "Nascondi i rilevamenti su {{deviceName}}",
       "loading": "Caricamento rilevamenti…",
-      "loadError": "Impossibile caricare i rilevamenti del dispositivo"
+      "loadError": "Impossibile caricare i rilevamenti del dispositivo",
+      "online": "Online ora",
+      "lastSeen": "Visto l'ultima volta {{when}}",
+      "version": "Versione {{versions}}"
     }
   },
   "softwareGroupTable": {

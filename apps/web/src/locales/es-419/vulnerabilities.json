@@ -75,6 +75,32 @@
     },
     "ticket": {
       "defaultTitle": "Remediar {{cveId}}"
+    },
+    "summary": {
+      "impactLabel": "Lo que puede hacer un atacante",
+      "pathLabel": "Cómo se explota",
+      "impact": {
+        "takeover": "Control total: leer y modificar datos y ejecutar código en el dispositivo",
+        "readWrite": "Leer y modificar datos en el dispositivo",
+        "dataLeak": "Robar datos confidenciales",
+        "tamper": "Modificar o falsificar datos",
+        "dos": "Bloquear o congelar el software (denegación de servicio)",
+        "limited": "Impacto limitado"
+      },
+      "scopeChanged": "— puede propagarse más allá del software afectado",
+      "access": {
+        "network": "de forma remota a través de la red",
+        "adjacent": "desde la misma red local",
+        "local": "requiere acceso en el propio dispositivo",
+        "physical": "requiere acceso físico al dispositivo"
+      },
+      "privileges": {
+        "none": "no requiere inicio de sesión",
+        "low": "requiere una cuenta de usuario normal",
+        "high": "requiere una cuenta de administrador"
+      },
+      "noUser": "no requiere acción del usuario",
+      "userNeeded": "un usuario debe abrir un archivo o hacer clic en algo"
     }
   },
   "findingStatus": {
@@ -177,7 +203,10 @@
       "expandAria": "Mostrar hallazgos en {{deviceName}}",
       "collapseAria": "Ocultar hallazgos en {{deviceName}}",
       "loading": "Cargando hallazgos…",
-      "loadError": "No se pudieron cargar los hallazgos del dispositivo"
+      "loadError": "No se pudieron cargar los hallazgos del dispositivo",
+      "online": "En línea ahora",
+      "lastSeen": "Visto por última vez {{when}}",
+      "version": "Versión {{versions}}"
     }
   },
   "softwareGroupTable": {
